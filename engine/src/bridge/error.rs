@@ -1,0 +1,99 @@
+//! JSON-RPC 2.0 error envelopes.
+//!
+//! Codes per the JSON-RPC spec (https://www.jsonrpc.org/specification):
+//!
+//! * `-32700` Parse error      — invalid JSON received.
+//! * `-32600` Invalid request  — payload is not a valid JSON-RPC request.
+//! * `-32601` Method not found — method does not exist.
+//! * `-32602` Invalid params   — method exists but params shape is wrong.
+//! * `-32603` Internal error   — server-side reducer / state failure.
+//!
+//! Application-defined codes live in `-32000..=-32099` (reserved by spec).
+//! We currently use `-32001` for "auth required / rejected".
+
+use serde::{Deserialize, Serialize};
+
+pub const PARSE_ERROR: i32 = -32700;
+pub const INVALID_REQUEST: i32 = -32600;
+pub const METHOD_NOT_FOUND: i32 = -32601;
+pub const INVALID_PARAMS: i32 = -32602;
+pub const INTERNAL_ERROR: i32 = -32603;
+/// Application-defined: bearer-token auth missing or wrong.
+pub const AUTH_REJECTED: i32 = -32001;
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RpcError {
+    pub code: i32,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub data: Option<serde_json::Value>,
+}
+
+impl RpcError {
+    pub fn new(code: i32, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    pub fn parse_error(detail: impl Into<String>) -> Self {
+        Self::new(PARSE_ERROR, "Parse error").with_data(detail.into())
+    }
+
+    pub fn invalid_request(detail: impl Into<String>) -> Self {
+        Self::new(INVALID_REQUEST, "Invalid Request").with_data(detail.into())
+    }
+
+    pub fn method_not_found(method: impl Into<String>) -> Self {
+        Self::new(METHOD_NOT_FOUND, "Method not found").with_data(method.into())
+    }
+
+    pub fn invalid_params(detail: impl Into<String>) -> Self {
+        Self::new(INVALID_PARAMS, "Invalid params").with_data(detail.into())
+    }
+
+    pub fn internal(detail: impl Into<String>) -> Self {
+        Self::new(INTERNAL_ERROR, "Internal error").with_data(detail.into())
+    }
+
+    pub fn auth_rejected(detail: impl Into<String>) -> Self {
+        Self::new(AUTH_REJECTED, "Authentication rejected").with_data(detail.into())
+    }
+
+    fn with_data(mut self, data: String) -> Self {
+        self.data = Some(serde_json::Value::String(data));
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_codes_match_spec() {
+        assert_eq!(PARSE_ERROR, -32700);
+        assert_eq!(INVALID_REQUEST, -32600);
+        assert_eq!(METHOD_NOT_FOUND, -32601);
+        assert_eq!(INVALID_PARAMS, -32602);
+        assert_eq!(INTERNAL_ERROR, -32603);
+    }
+
+    #[test]
+    fn invalid_request_serializes_with_data() {
+        let e = RpcError::invalid_request("missing id");
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("-32600"));
+        assert!(s.contains("Invalid Request"));
+        assert!(s.contains("missing id"));
+    }
+
+    #[test]
+    fn error_without_data_omits_data_field() {
+        let e = RpcError::new(INTERNAL_ERROR, "boom");
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(!s.contains("\"data\""));
+    }
+}

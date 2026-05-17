@@ -10,6 +10,7 @@
 //! * `bridge`   — WebSocket to UI + JSON-RPC to copilot.
 
 pub mod audio;
+pub mod bridge;
 pub mod midi;
 pub mod state;
 

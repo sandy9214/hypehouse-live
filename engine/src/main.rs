@@ -2,25 +2,31 @@
 //!
 //! Boots:
 //!   1. Audio device (cpal default output, ADR-004).
-//!   2. Control-thread loop that pulls `Event`s from a placeholder
-//!      channel feed, folds them into `EngineState`, and emits
-//!      `AudioCommand`s onto the SPSC ring.
-//!   3. MIDI input listener (midir) — separate PR.
-//!   4. WebSocket bridge to the UI (tokio-tungstenite) — separate PR.
+//!   2. Control-thread loop that pulls `Event`s from the event channel,
+//!      folds them into `EngineState`, and emits `AudioCommand`s onto
+//!      the SPSC ring.
+//!   3. WebSocket bridge to the UI + copilot (tokio-tungstenite).
+//!   4. MIDI input listener (midir) — wired in a later PR.
 //!
 //! Real work lives in `lib.rs` so we can unit-test it without spinning up cpal.
+//!
+//! The WS bridge is wired here. The audio thread + MIDI listener share
+//! the same `EngineHandle` so events from any source fan out as
+//! `engine.state_changed` notifications to every connected client.
 
 use anyhow::Result;
-use crossbeam::channel::{self, Receiver};
+use crossbeam::channel::{self, Receiver, Sender};
 use hypehouse_engine::audio::{
     event_to_commands, io::spawn_audio_thread, AudioProducer, AudioRing, EngineClock,
     StubDecodeService,
 };
+use hypehouse_engine::bridge::{self, EngineHandle};
 use hypehouse_engine::state::{EngineState, Event};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -49,12 +55,31 @@ fn main() -> Result<()> {
         "audio thread up — cpal stream playing"
     );
 
-    // Placeholder event source. Real MIDI / WS / co-pilot lands in
-    // future PRs; for this PR we accept events via a crossbeam channel
-    // so smoke-tests can drive the engine programmatically.
-    let (_event_tx, event_rx) = channel::unbounded::<Event>();
+    // Event channel — fed by WS bridge / MIDI / co-pilot, drained by
+    // the control-thread loop.
+    let (event_tx, event_rx) = channel::unbounded::<Event>();
 
-    control_loop(event_rx, producer, clock, stream.sample_rate);
+    // Control-thread loop runs on a dedicated OS thread so it doesn't
+    // block the async runtime.
+    let sample_rate = stream.sample_rate;
+    std::thread::spawn(move || control_loop(event_rx, producer, clock, sample_rate));
+
+    let engine = EngineHandle::new();
+    let config = bridge::BridgeConfig::from_env();
+    let server = bridge::spawn(config, engine).await?;
+    info!(addr = %server.local_addr, "ws bridge ready");
+
+    // Keep event_tx alive so the control loop doesn't exit while the
+    // bridge is still running. Future PRs will wire bridge → event_tx
+    // so UI/copilot RPC calls flow into the engine.
+    let _event_tx: Sender<Event> = event_tx;
+
+    // Graceful shutdown on SIGINT (Ctrl-C) or SIGTERM. The accept loop
+    // selects on the cancel oneshot, drains in-flight client tasks, and
+    // returns; we then await the server task and exit zero.
+    shutdown_signal().await;
+    info!("shutdown signal received — closing bridge");
+    server.shutdown().await?;
 
     Ok(())
 }
@@ -85,4 +110,20 @@ fn control_loop(
         state = next;
     }
     info!("control loop: event channel closed — shutting down");
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    tokio::select! {
+        _ = sigterm.recv() => info!("got SIGTERM"),
+        _ = sigint.recv() => info!("got SIGINT"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c().await.ok();
 }
