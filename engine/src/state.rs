@@ -35,7 +35,18 @@ pub struct TrackRef {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum EventKind {
-    DeckLoad { deck: DeckId, track: TrackRef },
+    DeckLoad {
+        deck: DeckId,
+        track: TrackRef,
+        /// Pre-analyzed BPM + beat-grid anchor; sourced from the copilot
+        /// analyzer service (HypeHouse v1 carry-over). Required for
+        /// beat-matching. ADR-002 council review (Codex).
+        bpm: f32,
+        beat_grid_anchor_ms: u64,
+    },
+    /// ADR review Groq: explicit DeckUnload so the engine can free buffers
+    /// and clear state cleanly (vs. relying on DeckLoad implicit replace).
+    DeckUnload { deck: DeckId },
     DeckPlay { deck: DeckId },
     DeckPause { deck: DeckId },
     DeckCue { deck: DeckId, position_ms: u64 },
@@ -47,8 +58,19 @@ pub enum EventKind {
     LoopOut { deck: DeckId },
     LoopExit { deck: DeckId },
     PitchBend { deck: DeckId, semitones: f32 },
+    /// Phase nudge — apply manual offset to deck's beat grid for sync (ADR-007).
+    PhaseNudge { deck: DeckId, delta_ms: i32 },
+    /// Effects (ADR-006).
+    EffectAssign { deck: DeckId, slot: u8, effect_id: u32 },
+    EffectClear { deck: DeckId, slot: u8 },
+    EffectParam { deck: DeckId, slot: u8, param: String, value: f32 },
+    EffectWetDry { deck: DeckId, slot: u8, value: f32 },
+    EffectEnable { deck: DeckId, slot: u8, enabled: bool },
     CopilotEngage { deck: DeckId },
     CopilotDisengage { deck: DeckId },
+    /// User pre-empts the AI mid-transition. ADR-005 defines a bounded
+    /// 1-bar handoff envelope; the audio thread continues AI automation
+    /// for that window while ramping user inputs in.
     TakeOver { deck: DeckId },
     SessionStart,
     SessionEnd,
@@ -76,6 +98,27 @@ pub struct Deck {
     pub loop_active: bool,
     pub hot_cues: [Option<u64>; 8],
     pub copilot_engaged: bool,
+    /// Council ADR-002 review (Codex): live mixing needs beatgrid + tempo
+    /// + phase on the deck or beat-matching can't be reasoned about.
+    pub bpm: f32,
+    pub beat_grid_anchor_ms: u64,  // ms of beat 0 in the track
+    pub beat_period_ms: f32,       // milliseconds per beat (= 60_000 / bpm)
+    pub phase_offset_ms: i32,      // user-applied phase nudge (±)
+    /// Effects chain (ADR-006). 3 slots per deck.
+    pub effects: [EffectSlot; 3],
+    /// Co-pilot takeover handoff window end (ADR-005). 0 = no handoff active.
+    pub handoff_until_frame: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct EffectSlot {
+    /// Effect-registry ID. 0 = empty slot.
+    pub effect_id: u32,
+    /// Param name → value. BTreeMap for deterministic ordering across forks.
+    pub params: std::collections::BTreeMap<String, f32>,
+    /// 0.0 = dry, 1.0 = full wet.
+    pub wet_dry: f32,
+    pub enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -106,11 +149,48 @@ impl EngineState {
         match &ev.kind {
             EventKind::SessionStart => next.session_active = true,
             EventKind::SessionEnd => next.session_active = false,
-            EventKind::DeckLoad { deck: id, track } => {
+            EventKind::DeckLoad { deck: id, track, bpm, beat_grid_anchor_ms } => {
                 let d = next.deck_mut(*id);
                 d.loaded = Some(track.clone());
                 d.position_ms = 0;
                 d.playing = false;
+                let safe_bpm = if bpm.is_finite() && *bpm > 0.0 { *bpm } else { 120.0 };
+                d.bpm = safe_bpm;
+                d.beat_grid_anchor_ms = *beat_grid_anchor_ms;
+                d.beat_period_ms = 60_000.0 / safe_bpm;
+                d.phase_offset_ms = 0;
+            }
+            EventKind::DeckUnload { deck: id } => {
+                *next.deck_mut(*id) = Deck::default();
+            }
+            EventKind::PhaseNudge { deck: id, delta_ms } => {
+                let d = next.deck_mut(*id);
+                d.phase_offset_ms = d.phase_offset_ms.saturating_add(*delta_ms);
+            }
+            EventKind::EffectAssign { deck: id, slot, effect_id } => {
+                if let Some(s) = next.deck_mut(*id).effects.get_mut(*slot as usize) {
+                    *s = EffectSlot { effect_id: *effect_id, params: Default::default(), wet_dry: 0.5, enabled: true };
+                }
+            }
+            EventKind::EffectClear { deck: id, slot } => {
+                if let Some(s) = next.deck_mut(*id).effects.get_mut(*slot as usize) {
+                    *s = EffectSlot::default();
+                }
+            }
+            EventKind::EffectParam { deck: id, slot, param, value } => {
+                if let Some(s) = next.deck_mut(*id).effects.get_mut(*slot as usize) {
+                    s.params.insert(param.clone(), *value);
+                }
+            }
+            EventKind::EffectWetDry { deck: id, slot, value } => {
+                if let Some(s) = next.deck_mut(*id).effects.get_mut(*slot as usize) {
+                    s.wet_dry = value.clamp(0.0, 1.0);
+                }
+            }
+            EventKind::EffectEnable { deck: id, slot, enabled } => {
+                if let Some(s) = next.deck_mut(*id).effects.get_mut(*slot as usize) {
+                    s.enabled = *enabled;
+                }
             }
             EventKind::DeckPlay { deck: id } => {
                 next.deck_mut(*id).playing = true;
@@ -299,5 +379,92 @@ mod tests {
         let _ = s.apply(&ev(1, EventKind::DeckPlay { deck: DeckId::A }));
         // Original must be untouched (clone semantics).
         assert!(!s.deck_a.playing);
+    }
+
+    #[test]
+    fn deck_load_sets_beatgrid_and_tempo() {
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::DeckLoad {
+                deck: DeckId::A,
+                track: TrackRef {
+                    id: "t1".into(),
+                    path: "/tracks/x.mp3".into(),
+                },
+                bpm: 128.0,
+                beat_grid_anchor_ms: 220,
+            },
+        ));
+        assert_eq!(s.deck_a.bpm, 128.0);
+        assert_eq!(s.deck_a.beat_grid_anchor_ms, 220);
+        assert!((s.deck_a.beat_period_ms - (60_000.0 / 128.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn deck_load_clamps_invalid_bpm_to_default() {
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::DeckLoad {
+                deck: DeckId::A,
+                track: TrackRef { id: "t".into(), path: "/p".into() },
+                bpm: f32::NAN,
+                beat_grid_anchor_ms: 0,
+            },
+        ));
+        assert_eq!(s.deck_a.bpm, 120.0);
+    }
+
+    #[test]
+    fn deck_unload_clears_state() {
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::DeckLoad {
+                deck: DeckId::A,
+                track: TrackRef { id: "t".into(), path: "/p".into() },
+                bpm: 120.0,
+                beat_grid_anchor_ms: 0,
+            },
+        ));
+        let s = s.apply(&ev(2, EventKind::DeckPlay { deck: DeckId::A }));
+        assert!(s.deck_a.loaded.is_some());
+        let s = s.apply(&ev(3, EventKind::DeckUnload { deck: DeckId::A }));
+        assert!(s.deck_a.loaded.is_none());
+        assert!(!s.deck_a.playing);
+    }
+
+    #[test]
+    fn phase_nudge_accumulates() {
+        let s = EngineState::default();
+        let s = s.apply(&ev(1, EventKind::PhaseNudge { deck: DeckId::A, delta_ms: 10 }));
+        let s = s.apply(&ev(2, EventKind::PhaseNudge { deck: DeckId::A, delta_ms: -3 }));
+        assert_eq!(s.deck_a.phase_offset_ms, 7);
+    }
+
+    #[test]
+    fn effect_assign_and_param_clamp_wet_dry() {
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::EffectAssign { deck: DeckId::A, slot: 0, effect_id: 1 },
+        ));
+        let s = s.apply(&ev(
+            2,
+            EventKind::EffectParam {
+                deck: DeckId::A,
+                slot: 0,
+                param: "cutoff_hz".into(),
+                value: 500.0,
+            },
+        ));
+        let s = s.apply(&ev(
+            3,
+            EventKind::EffectWetDry { deck: DeckId::A, slot: 0, value: 2.5 },
+        ));
+        assert_eq!(s.deck_a.effects[0].effect_id, 1);
+        assert_eq!(s.deck_a.effects[0].params.get("cutoff_hz"), Some(&500.0));
+        assert_eq!(s.deck_a.effects[0].wet_dry, 1.0); // clamped
     }
 }
