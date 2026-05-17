@@ -1,0 +1,137 @@
+"""Library / catalog tests.
+
+Cover the BPM + Camelot gate logic in ``TrackLibrary.pick_compatible_for``,
+plus the small util functions that back it.
+"""
+from __future__ import annotations
+
+import pytest
+
+from copilot.library import (
+    TrackLibrary,
+    TrackRef,
+    bpm_stretch_ratio,
+    camelot_distance,
+)
+
+
+# -------- camelot_distance: unit --------
+
+
+@pytest.mark.parametrize(
+    "a,b,expected",
+    [
+        ("8B", "8B", 0),       # identical
+        ("8B", "9B", 1),       # adjacent number, same letter
+        ("8B", "8A", 1),       # same number, different letter (relative)
+        ("8B", "10B", 2),      # two steps on the wheel
+        ("8B", "11B", 3),      # three steps — too far
+        ("12B", "1B", 1),      # wraparound
+        ("1B", "12B", 1),
+        ("8B", "??", 99),      # malformed → big sentinel
+        ("", "8B", 99),
+    ],
+)
+def test_camelot_distance(a: str, b: str, expected: int):
+    assert camelot_distance(a, b) == expected
+
+
+def test_bpm_stretch_ratio_rejects_nonpositive():
+    assert bpm_stretch_ratio(0.0, 124.0) == float("inf")
+    assert bpm_stretch_ratio(124.0, -5.0) == float("inf")
+
+
+def test_bpm_stretch_ratio_symmetric_relative_to_playing():
+    # 4% stretch in either direction.
+    assert abs(bpm_stretch_ratio(124.0, 129.0) - (5.0 / 124.0)) < 1e-9
+
+
+# -------- TrackLibrary CRUD --------
+
+
+def test_library_round_trip(library: TrackLibrary):
+    ref = TrackRef("a", "/a.mp3", 120.0, "8B", 0.2, 200.0)
+    library.add_track(ref)
+    fetched = library.get("a")
+    assert fetched == ref
+
+
+def test_library_replace_on_conflict(library: TrackLibrary):
+    library.add_track(TrackRef("a", "/old.mp3", 120.0, "8B", 0.2, 200.0))
+    library.add_track(TrackRef("a", "/new.mp3", 125.0, "9B", 0.3, 210.0))
+    fetched = library.get("a")
+    assert fetched is not None
+    assert fetched.path == "/new.mp3"
+    assert fetched.bpm == 125.0
+
+
+# -------- pick_compatible_for: the gate logic --------
+
+
+def _seed_five_tracks(lib: TrackLibrary) -> None:
+    """Same fixture seeding as in ``populated_library``, inlined so this test
+    file is self-contained and the asserts read alongside the data."""
+    lib.add_track(TrackRef("playing", "/p.mp3", 124.0, "8B", 0.20, 210.0))
+    lib.add_track(TrackRef("close",   "/a.mp3", 125.0, "8B", 0.22, 220.0))
+    lib.add_track(TrackRef("far_bpm", "/b.mp3", 148.0, "8B", 0.30, 200.0))  # 19% stretch — out
+    lib.add_track(TrackRef("far_key", "/c.mp3", 124.5, "3A", 0.21, 240.0))  # too far on wheel
+    lib.add_track(TrackRef("border",  "/d.mp3", 122.0, "9B", 0.16, 215.0))  # OK, runner-up
+
+
+def test_pick_compatible_filters_bpm_and_key(library: TrackLibrary):
+    _seed_five_tracks(library)
+    out = library.pick_compatible_for(
+        playing_bpm=124.0,
+        playing_camelot="8B",
+        exclude_ids={"playing"},
+    )
+    ids = [t.track_id for t in out]
+    # Both gates work:
+    assert "far_bpm" not in ids
+    assert "far_key" not in ids
+    # And the two valid candidates are returned, with the BPM-closer + key-
+    # closer one ranked first.
+    assert ids[0] == "close"
+    assert "border" in ids
+
+
+def test_pick_compatible_respects_exclude(library: TrackLibrary):
+    _seed_five_tracks(library)
+    out = library.pick_compatible_for(
+        playing_bpm=124.0, playing_camelot="8B", exclude_ids={"playing", "close"},
+    )
+    ids = [t.track_id for t in out]
+    assert "close" not in ids
+    assert "border" in ids
+
+
+def test_pick_compatible_top_k_cap(library: TrackLibrary):
+    """Top-K cap is respected even when many tracks pass the gates."""
+    # Insert 10 near-identical tracks.
+    for i in range(10):
+        library.add_track(
+            TrackRef(f"t{i}", f"/t{i}.mp3", 124.0 + 0.1 * i, "8B", 0.20, 200.0)
+        )
+    out = library.pick_compatible_for(
+        playing_bpm=124.0, playing_camelot="8B", exclude_ids=set(), top_k=3,
+    )
+    assert len(out) == 3
+
+
+def test_pick_compatible_empty_library(library: TrackLibrary):
+    out = library.pick_compatible_for(playing_bpm=124.0, playing_camelot="8B")
+    assert out == []
+
+
+def test_pick_compatible_widening_stretch_unlocks_more(library: TrackLibrary):
+    """Loosening the BPM window must let previously-rejected tracks through."""
+    _seed_five_tracks(library)
+    # With the relaxed window, the 148-BPM "far_bpm" track passes.
+    out = library.pick_compatible_for(
+        playing_bpm=124.0,
+        playing_camelot="8B",
+        max_bpm_stretch=0.25,  # ±25%
+        exclude_ids={"playing"},
+    )
+    ids = [t.track_id for t in out]
+    assert "far_bpm" in ids
