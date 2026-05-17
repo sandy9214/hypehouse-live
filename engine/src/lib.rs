@@ -10,6 +10,7 @@
 //! * `bridge`   — WebSocket to UI + JSON-RPC to copilot.
 
 pub mod audio;
+pub mod midi;
 pub mod state;
 
 pub use state::{Deck, DeckId, EngineState, Event, EventKind, EventSource};
