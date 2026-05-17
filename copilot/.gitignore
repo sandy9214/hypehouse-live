@@ -1,0 +1,16 @@
+# Local virtualenvs (any common name)
+.venv/
+venv/
+env/
+
+# Bytecode + caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Editable-install metadata
+build/
+dist/

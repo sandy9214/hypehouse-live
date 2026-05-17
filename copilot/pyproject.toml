@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hypehouse-copilot"
+version = "0.1.0"
+description = "HypeHouse Live AI co-pilot — JSON-RPC service that picks next tracks and plans transitions for the Rust engine."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "Proprietary" }
+authors = [{ name = "Sandeep Gorai" }]
+keywords = ["dj", "audio", "mixing", "ai", "co-pilot", "hypehouse"]
+
+dependencies = [
+    # Audio analysis stack — vendored v1 analyzer.py and mashup.py drive these.
+    "librosa>=0.10.1",
+    "numpy>=1.26,<3",
+    "scipy>=1.11",
+    "pydub>=0.25.1",
+    "pyloudnorm>=0.1.1",
+    # Network — JSON-RPC WebSocket client to the Rust engine.
+    "aiohttp>=3.9",
+    # Envelope validation. pydantic v2 — engine ships matching schema in
+    # `engine/src/state.rs` via serde_json so we validate the wire shape here.
+    "pydantic>=2.5,<3",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+# Stems / mashup rendering — only needed if/when the co-pilot ever runs
+# v1's smart_mashup locally instead of delegating render to the engine.
+# Today's service stays import-clean without these.
+mashup = [
+    "pyrubberband>=0.3.0",
+    "soundfile>=0.12.1",
+    "demucs>=4.0",
+]
+
+[project.scripts]
+hypehouse-copilot = "copilot.main:main"
+
+# Source lives at ``./`` (this file sits inside the ``copilot`` package
+# directory). Map the package name "copilot" to the parent of the pyproject
+# (i.e. itself) so editable installs resolve ``import copilot`` correctly.
+[tool.setuptools]
+packages = ["copilot", "copilot.vendor", "copilot.tests"]
+package-dir = { copilot = ".", "copilot.vendor" = "vendor", "copilot.tests" = "tests" }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = [
+    # librosa pulls audioread which warns under py3.12; not actionable here.
+    "ignore::DeprecationWarning:audioread.*",
+    "ignore::DeprecationWarning:librosa.*",
+]
