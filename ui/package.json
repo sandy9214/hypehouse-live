@@ -1,0 +1,17 @@
+{
+  "name": "hypehouse-live-ui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TypeScript frontend for hypehouse-live. Talks to the Rust engine over WebSocket; uses Web Audio API for visualization only.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "vite": "^6.0.0"
+  }
+}

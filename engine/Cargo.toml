@@ -1,0 +1,56 @@
+[package]
+name = "hypehouse-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "hypehouse-live audio engine — 2-deck mixing with sub-5ms latency, MIDI control, event-sourced state."
+license = "MIT"
+publish = false
+
+[dependencies]
+# Audio I/O — cpal gives us a lock-free callback into the audio thread.
+cpal = "0.16"
+
+# Decode any common container (mp3, m4a, wav, flac, ogg) — symphonia is pure-Rust + no FFI.
+symphonia = { version = "0.5", features = ["all"] }
+
+# High-quality time-stretch (independent of pitch) — rubato sits behind a sample-rate-converter API.
+rubato = "0.16"
+
+# MIDI input — native ALSA / CoreMIDI / WinMM via a single crate.
+midir = "0.10"
+
+# Event-sourced state needs serialization.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "2"
+
+# JSON-RPC over WebSocket — bridge to the Tauri/TS frontend AND to the Python co-pilot.
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.27"
+futures-util = "0.3"
+
+# Ring buffer for the event log + lock-free SPSC queue for the audio thread.
+ringbuf = "0.4"
+crossbeam = "0.8"
+
+# Logging — structured JSON via tracing.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Errors.
+anyhow = "1"
+thiserror = "2"
+
+[dev-dependencies]
+criterion = "0.7"
+proptest = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1   # Even dev needs audio-thread-real-time perf; debug builds at opt 0 stutter.

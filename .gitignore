@@ -1,0 +1,32 @@
+# Rust
+/engine/target/
+/engine/Cargo.lock.bak
+**/*.rs.bk
+
+# Node / Vite
+/ui/node_modules/
+/ui/dist/
+/ui/.vite/
+
+# Python (copilot service)
+/copilot/__pycache__/
+/copilot/.pytest_cache/
+/copilot/.ruff_cache/
+/copilot/.mypy_cache/
+/copilot/venv/
+/copilot/*.egg-info/
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Local secrets / env
+.env
+.env.local
+
+# Claude worktrees
+.claude/worktrees/
+
+# Test artifacts
+*.log
