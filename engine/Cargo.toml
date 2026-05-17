@@ -34,6 +34,10 @@ futures-util = "0.3"
 ringbuf = "0.4"
 crossbeam = "0.8"
 
+# Small stack-allocated vectors — used by the control→audio translator to
+# emit 0..N AudioCommands without heap allocation on the hot path.
+smallvec = "1"
+
 # Logging — structured JSON via tracing.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -45,6 +49,13 @@ thiserror = "2"
 [dev-dependencies]
 criterion = "0.7"
 proptest = "1"
+# Asserts no heap allocation happens within a gated scope — used to prove
+# the audio-thread hot path is alloc-free per ADR-004.
+assert_no_alloc = "1"
+
+[[bench]]
+name = "translator"
+harness = false
 
 [profile.release]
 opt-level = 3
