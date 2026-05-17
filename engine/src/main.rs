@@ -15,7 +15,7 @@
 //! `engine.state_changed` notifications to every connected client.
 
 use anyhow::Result;
-use crossbeam::channel::{self, Receiver, Sender};
+use crossbeam::channel::{self, Receiver};
 use hypehouse_engine::audio::{
     event_to_commands, io::spawn_audio_thread, AudioProducer, AudioRing, EngineClock,
     StubDecodeService,
@@ -64,15 +64,21 @@ async fn main() -> Result<()> {
     let sample_rate = stream.sample_rate;
     std::thread::spawn(move || control_loop(event_rx, producer, clock, sample_rate));
 
-    let engine = EngineHandle::new();
+    // Bridge handle is wired to the control-loop event channel so every
+    // accepted `engine.submit_event` RPC flows into `event_rx`. Cloning
+    // `event_tx` keeps a sender alive inside the handle for the bridge's
+    // lifetime — the control loop will only see `recv` return Err once
+    // both the bridge handle (and its clones) and the local `event_tx`
+    // are dropped during shutdown.
+    let engine = EngineHandle::with_event_sink(event_tx.clone());
     let config = bridge::BridgeConfig::from_env();
     let server = bridge::spawn(config, engine).await?;
     info!(addr = %server.local_addr, "ws bridge ready");
 
-    // Keep event_tx alive so the control loop doesn't exit while the
-    // bridge is still running. Future PRs will wire bridge → event_tx
-    // so UI/copilot RPC calls flow into the engine.
-    let _event_tx: Sender<Event> = event_tx;
+    // Drop the local sender now that the bridge owns its own clone. The
+    // control loop continues to receive events from any handle clone
+    // (e.g. additional sources wired in later PRs).
+    drop(event_tx);
 
     // Graceful shutdown on SIGINT (Ctrl-C) or SIGTERM. The accept loop
     // selects on the cancel oneshot, drains in-flight client tasks, and

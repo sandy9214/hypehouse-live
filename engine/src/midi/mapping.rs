@@ -221,7 +221,7 @@ impl Mapping {
                 )));
             }
         }
-        for (k, _) in &self.pitch_bends {
+        for k in self.pitch_bends.keys() {
             parse_status_only_key(k).map_err(MappingError::Invalid)?;
         }
         Ok(())
@@ -314,7 +314,10 @@ mod tests {
         }"#;
         let err = Mapping::from_json_str(json).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("malformed key") || msg.contains("expected 0x"), "got: {msg}");
+        assert!(
+            msg.contains("malformed key") || msg.contains("expected 0x"),
+            "got: {msg}"
+        );
     }
 
     #[test]

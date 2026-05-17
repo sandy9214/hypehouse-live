@@ -10,7 +10,7 @@
 //! Module layout:
 //! * `mapping`  — JSON-deserializable schema + DDJ-200 default (embedded).
 //! * `clamp`    — value-clamping primitives. Every MIDI-derived value
-//!                passes through here before becoming an `Event`.
+//!   passes through here before becoming an `Event`.
 //! * `listener` — `MidiListener::start` opens a port + spawns the callback.
 //!
 //! The default mapping ships at `mappings/ddj200.json` and is bundled into
@@ -23,6 +23,5 @@ pub mod mapping;
 
 pub use listener::{ListenerError, MidiListener, MidiListenerHandle};
 pub use mapping::{
-    CcAction, CcBinding, MapDeck, Mapping, MappingError, NoteAction, NoteBinding,
-    PitchBendBinding,
+    CcAction, CcBinding, MapDeck, Mapping, MappingError, NoteAction, NoteBinding, PitchBendBinding,
 };

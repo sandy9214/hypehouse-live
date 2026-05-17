@@ -9,7 +9,15 @@
 //! * `-32603` Internal error   — server-side reducer / state failure.
 //!
 //! Application-defined codes live in `-32000..=-32099` (reserved by spec).
-//! We currently use `-32001` for "auth required / rejected".
+//!
+//! Engine-specific application codes:
+//! * `-32000` `ENGINE_OFFLINE` — control-loop event channel rejected the
+//!   event (full / disconnected).
+//! * `-32001` `ENGINE_SINK_UNWIRED` — handle has no `event_sink`
+//!   configured; submit_event cannot reach the control loop. Snapshot /
+//!   event_log / health still work.
+//! * `-32002` `AUTH_REJECTED` — bearer-token auth missing/wrong (rare;
+//!   handshake usually rejects with HTTP 401 before this code is emitted).
 
 use serde::{Deserialize, Serialize};
 
@@ -18,8 +26,13 @@ pub const INVALID_REQUEST: i32 = -32600;
 pub const METHOD_NOT_FOUND: i32 = -32601;
 pub const INVALID_PARAMS: i32 = -32602;
 pub const INTERNAL_ERROR: i32 = -32603;
+/// Application-defined: control-loop event channel is full or disconnected.
+pub const ENGINE_OFFLINE: i32 = -32000;
+/// Application-defined: handle has no event_sink wired (typical in unit
+/// tests using `EngineHandle::new()`).
+pub const ENGINE_SINK_UNWIRED: i32 = -32001;
 /// Application-defined: bearer-token auth missing or wrong.
-pub const AUTH_REJECTED: i32 = -32001;
+pub const AUTH_REJECTED: i32 = -32002;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct RpcError {
@@ -62,6 +75,20 @@ impl RpcError {
         Self::new(AUTH_REJECTED, "Authentication rejected").with_data(detail.into())
     }
 
+    /// Build a `-32000 engine offline` error. Returned when the bridge
+    /// could not forward an event onto the control-loop channel (full or
+    /// disconnected). Callers may retry after backoff.
+    pub fn engine_offline(detail: impl Into<String>) -> Self {
+        Self::new(ENGINE_OFFLINE, "engine offline").with_data(detail.into())
+    }
+
+    /// Build a `-32001 engine sink not wired` error. Returned when the
+    /// `EngineHandle` was built without an event sink (typical for unit
+    /// tests). Snapshot / event_log / health calls still succeed.
+    pub fn engine_sink_unwired(detail: impl Into<String>) -> Self {
+        Self::new(ENGINE_SINK_UNWIRED, "engine sink not wired").with_data(detail.into())
+    }
+
     fn with_data(mut self, data: String) -> Self {
         self.data = Some(serde_json::Value::String(data));
         self
@@ -79,6 +106,31 @@ mod tests {
         assert_eq!(METHOD_NOT_FOUND, -32601);
         assert_eq!(INVALID_PARAMS, -32602);
         assert_eq!(INTERNAL_ERROR, -32603);
+    }
+
+    #[test]
+    fn engine_app_codes_in_reserved_range() {
+        // JSON-RPC 2.0 reserves -32000..=-32099 for the server side.
+        assert_eq!(ENGINE_OFFLINE, -32000);
+        assert_eq!(ENGINE_SINK_UNWIRED, -32001);
+        assert_eq!(AUTH_REJECTED, -32002);
+    }
+
+    #[test]
+    fn engine_offline_serializes_with_code_and_message() {
+        let e = RpcError::engine_offline("channel full");
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("-32000"));
+        assert!(s.contains("engine offline"));
+        assert!(s.contains("channel full"));
+    }
+
+    #[test]
+    fn engine_sink_unwired_serializes_with_code_and_message() {
+        let e = RpcError::engine_sink_unwired("test handle");
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("-32001"));
+        assert!(s.contains("engine sink not wired"));
     }
 
     #[test]

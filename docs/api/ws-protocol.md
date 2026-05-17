@@ -65,11 +65,67 @@ client doesn't have to.
 
 **Result**
 ```json
-{ "accepted": true, "state_id": 17 }
+{ "accepted": true }
 ```
 
-`state_id` is the assigned event id, which equals the new "last event"
-counter of the engine.
+On success the bridge stamps the event with a monotonic id + `ts_micros`
+and forwards it onto the control-loop event channel via a non-blocking
+`try_send`. The reducer + audio dispatch happen on the control thread;
+clients observe the resulting state via the subsequent
+`engine.state_changed` notification, not as part of this response.
+
+**Errors specific to this method**
+
+| Code     | Symbol                | Meaning                                                                                                                    |
+|----------|-----------------------|----------------------------------------------------------------------------------------------------------------------------|
+| `-32000` | `ENGINE_OFFLINE`      | Control-loop event channel is full or its receiver was dropped (control thread exited). Caller may retry after backoff.    |
+| `-32001` | `ENGINE_SINK_UNWIRED` | The serving `EngineHandle` was built without an event sink — common in unit tests using `EngineHandle::new()`. Other methods (`engine.snapshot`, `engine.event_log`, `engine.health`) still succeed. |
+
+### `submit_event` data path
+
+```
+   UI / MIDI / copilot           Rust engine process
+   ┌────────────────┐
+   │ submit_event   │            ┌──────────────────────────────┐
+   │ DeckLoad{…}    │ ───WS──▶   │ bridge::ws_server            │
+   └────────────────┘            │   dispatch SUBMIT_EVENT      │
+                                 │   stamp id + ts              │
+                                 │   engine.forward_event       │
+                                 │     try_send(event)          │
+                                 │       ├─ Ok        → result  │
+                                 │       │              accepted│
+                                 │       ├─ Full      → -32000  │
+                                 │       └─ Disconn.  → -32000  │
+                                 └──────────────┬───────────────┘
+                                                ▼
+                                 ┌──────────────────────────────┐
+                                 │  crossbeam channel<Event>    │
+                                 │   (control-plane back-pressure)
+                                 └──────────────┬───────────────┘
+                                                ▼
+                                 ┌──────────────────────────────┐
+                                 │ control_loop (OS thread)     │
+                                 │   state = state.apply(ev)    │
+                                 │   cmds = translator(state…)  │
+                                 │   producer.try_push(cmd)     │
+                                 └──────────────┬───────────────┘
+                                                ▼
+                                 ┌──────────────────────────────┐
+                                 │ SPSC AudioRing               │
+                                 │   (lock-free, no alloc)      │
+                                 └──────────────┬───────────────┘
+                                                ▼
+                                 ┌──────────────────────────────┐
+                                 │ cpal audio callback          │
+                                 │   render → device            │
+                                 └──────────────────────────────┘
+```
+
+The two queues (`crossbeam` event channel + `ringbuf` AudioRing) are the
+boundary points where back-pressure is surfaced. The bridge maps the
+control-plane queue to `-32000`; the audio-plane queue drops with a
+`tracing` warn (no client-visible error today). Both choices avoid any
+blocking on the WS task or the audio thread.
 
 ### `engine.snapshot`
 
@@ -154,9 +210,11 @@ Standard JSON-RPC 2.0 codes:
 
 Application-defined codes live in `-32000..=-32099`:
 
-| Code     | Symbol            | Meaning                                                  |
-|----------|-------------------|----------------------------------------------------------|
-| `-32001` | `AUTH_REJECTED`   | Reserved for in-protocol auth rejection. Today, missing-bearer rejection happens at the WS handshake (HTTP 401) instead, so this code is rarely surfaced. |
+| Code     | Symbol                | Meaning                                                                                                                                                          |
+|----------|-----------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `-32000` | `ENGINE_OFFLINE`      | The bridge could not forward an event onto the control-loop event channel (full or disconnected). Caller may retry after backoff. Emitted from `engine.submit_event`. |
+| `-32001` | `ENGINE_SINK_UNWIRED` | The serving `EngineHandle` was built without an event sink (`EngineHandle::new()` instead of `EngineHandle::with_event_sink(tx)`). Other RPCs still work.        |
+| `-32002` | `AUTH_REJECTED`       | Reserved for in-protocol auth rejection. Today, missing-bearer rejection happens at the WS handshake (HTTP 401) instead, so this code is rarely surfaced.        |
 
 Error envelope:
 
@@ -204,3 +262,9 @@ case). Coverage:
 * Graceful `shutdown()` returns promptly with no clients.
 * End-to-end integration: spin server on ephemeral port → connect →
   submit DeckPlay → assert response + notification + snapshot reflects.
+* `engine.submit_event` forwarded onto control-loop channel and the
+  matching `Event` lands on the receiver (full event-shape round-trip).
+* `engine.submit_event` returns `-32000 engine offline` once the bounded
+  event channel is saturated.
+* `engine.submit_event` returns `-32001 engine sink not wired` when the
+  handle was built without an event sink.
