@@ -1,0 +1,57 @@
+{
+  "device_name_match": "DDJ-200",
+  "name": "pioneer-ddj-200-v0",
+  "notes": {
+    "0x90:0x0B": { "deck": "A", "action": "play_pause" },
+    "0x91:0x0B": { "deck": "B", "action": "play_pause" },
+
+    "0x90:0x0C": { "deck": "A", "action": "cue" },
+    "0x91:0x0C": { "deck": "B", "action": "cue" },
+
+    "0x97:0x00": { "deck": "A", "action": "hot_cue", "slot": 0 },
+    "0x97:0x01": { "deck": "A", "action": "hot_cue", "slot": 1 },
+    "0x97:0x02": { "deck": "A", "action": "hot_cue", "slot": 2 },
+    "0x97:0x03": { "deck": "A", "action": "hot_cue", "slot": 3 },
+    "0x97:0x04": { "deck": "A", "action": "hot_cue", "slot": 4 },
+    "0x97:0x05": { "deck": "A", "action": "hot_cue", "slot": 5 },
+    "0x97:0x06": { "deck": "A", "action": "hot_cue", "slot": 6 },
+    "0x97:0x07": { "deck": "A", "action": "hot_cue", "slot": 7 },
+
+    "0x98:0x00": { "deck": "B", "action": "hot_cue", "slot": 0 },
+    "0x98:0x01": { "deck": "B", "action": "hot_cue", "slot": 1 },
+    "0x98:0x02": { "deck": "B", "action": "hot_cue", "slot": 2 },
+    "0x98:0x03": { "deck": "B", "action": "hot_cue", "slot": 3 },
+    "0x98:0x04": { "deck": "B", "action": "hot_cue", "slot": 4 },
+    "0x98:0x05": { "deck": "B", "action": "hot_cue", "slot": 5 },
+    "0x98:0x06": { "deck": "B", "action": "hot_cue", "slot": 6 },
+    "0x98:0x07": { "deck": "B", "action": "hot_cue", "slot": 7 },
+
+    "0x94:0x10": { "deck": "A", "action": "loop_in" },
+    "0x94:0x11": { "deck": "A", "action": "loop_out" },
+    "0x94:0x4D": { "deck": "A", "action": "loop_exit" },
+    "0x95:0x10": { "deck": "B", "action": "loop_in" },
+    "0x95:0x11": { "deck": "B", "action": "loop_out" },
+    "0x95:0x4D": { "deck": "B", "action": "loop_exit" },
+
+    "0x90:0x58": { "deck": "A", "action": "copilot_toggle" },
+    "0x91:0x58": { "deck": "B", "action": "copilot_toggle" },
+
+    "0x90:0x3F": { "deck": "A", "action": "take_over" },
+    "0x91:0x3F": { "deck": "B", "action": "take_over" }
+  },
+  "ccs": {
+    "0xB0:0x0F": { "deck": "A", "action": "eq_low",  "range_db": [-26, 6] },
+    "0xB0:0x0B": { "deck": "A", "action": "eq_mid",  "range_db": [-26, 6] },
+    "0xB0:0x07": { "deck": "A", "action": "eq_high", "range_db": [-26, 6] },
+
+    "0xB1:0x0F": { "deck": "B", "action": "eq_low",  "range_db": [-26, 6] },
+    "0xB1:0x0B": { "deck": "B", "action": "eq_mid",  "range_db": [-26, 6] },
+    "0xB1:0x07": { "deck": "B", "action": "eq_high", "range_db": [-26, 6] },
+
+    "0xBF:0x1F": { "action": "crossfader" }
+  },
+  "pitch_bends": {
+    "0xE0": { "deck": "A", "range_semitones": 2.0 },
+    "0xE1": { "deck": "B", "range_semitones": 2.0 }
+  }
+}
