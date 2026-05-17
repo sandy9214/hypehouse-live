@@ -70,8 +70,11 @@ pub enum EventKind {
     CopilotDisengage { deck: DeckId },
     /// User pre-empts the AI mid-transition. ADR-005 defines a bounded
     /// 1-bar handoff envelope; the audio thread continues AI automation
-    /// for that window while ramping user inputs in.
-    TakeOver { deck: DeckId },
+    /// for that window while ramping user inputs in. The control thread
+    /// computes `handoff_until_frame` from current engine clock + the
+    /// deck's beat_period_ms (4 beats = 1 bar at 4/4) and stamps it on
+    /// the event before applying — reducer is then pure.
+    TakeOver { deck: DeckId, handoff_until_frame: u64 },
     SessionStart,
     SessionEnd,
 }
@@ -251,11 +254,15 @@ impl EngineState {
             EventKind::CopilotDisengage { deck: id } => {
                 next.deck_mut(*id).copilot_engaged = false;
             }
-            EventKind::TakeOver { deck: id } => {
-                // User pre-empts copilot — disengage immediately. Audio
-                // crossfader / EQ stays as the copilot left it; further
-                // events are user-driven.
-                next.deck_mut(*id).copilot_engaged = false;
+            EventKind::TakeOver { deck: id, handoff_until_frame } => {
+                // User pre-empts copilot — disengage immediately + set
+                // the 1-bar handoff window end per ADR-005. Audio
+                // thread continues AI automation through this frame
+                // while user inputs cross-fade in. Reducer stores the
+                // value computed by the control thread; pure function.
+                let d = next.deck_mut(*id);
+                d.copilot_engaged = false;
+                d.handoff_until_frame = *handoff_until_frame;
             }
         }
         next
@@ -365,12 +372,19 @@ mod tests {
     }
 
     #[test]
-    fn takeover_disengages_copilot() {
+    fn takeover_disengages_copilot_and_arms_handoff() {
         let s = EngineState::default();
         let s = s.apply(&ev(1, EventKind::CopilotEngage { deck: DeckId::A }));
         assert!(s.deck_a.copilot_engaged);
-        let s = s.apply(&ev(2, EventKind::TakeOver { deck: DeckId::A }));
+        let s = s.apply(&ev(
+            2,
+            EventKind::TakeOver {
+                deck: DeckId::A,
+                handoff_until_frame: 96_000, // ~2s at 48kHz = ~1 bar at 120 BPM
+            },
+        ));
         assert!(!s.deck_a.copilot_engaged);
+        assert_eq!(s.deck_a.handoff_until_frame, 96_000);
     }
 
     #[test]
