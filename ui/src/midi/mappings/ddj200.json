@@ -1,0 +1,59 @@
+{
+  "id": "ddj200",
+  "deviceNameMatch": "DDJ-200",
+  "bindings": [
+    { "noteOn": { "channel": 0, "note": 11 }, "action": "play_pause", "deck": "A" },
+    { "noteOn": { "channel": 1, "note": 11 }, "action": "play_pause", "deck": "B" },
+
+    { "noteOn": { "channel": 0, "note": 12 }, "action": "cue", "deck": "A" },
+    { "noteOn": { "channel": 1, "note": 13 }, "action": "cue", "deck": "B" },
+
+    { "noteOn": { "channel": 7, "note": 7 },  "action": "hot_cue", "deck": "A", "slot": 0 },
+    { "noteOn": { "channel": 7, "note": 8 },  "action": "hot_cue", "deck": "A", "slot": 1 },
+    { "noteOn": { "channel": 7, "note": 9 },  "action": "hot_cue", "deck": "A", "slot": 2 },
+    { "noteOn": { "channel": 7, "note": 10 }, "action": "hot_cue", "deck": "A", "slot": 3 },
+    { "noteOn": { "channel": 7, "note": 11 }, "action": "hot_cue", "deck": "A", "slot": 4 },
+    { "noteOn": { "channel": 7, "note": 12 }, "action": "hot_cue", "deck": "A", "slot": 5 },
+    { "noteOn": { "channel": 7, "note": 13 }, "action": "hot_cue", "deck": "A", "slot": 6 },
+    { "noteOn": { "channel": 7, "note": 14 }, "action": "hot_cue", "deck": "A", "slot": 7 },
+
+    { "noteOn": { "channel": 8, "note": 7 },  "action": "hot_cue", "deck": "B", "slot": 0 },
+    { "noteOn": { "channel": 8, "note": 8 },  "action": "hot_cue", "deck": "B", "slot": 1 },
+    { "noteOn": { "channel": 8, "note": 9 },  "action": "hot_cue", "deck": "B", "slot": 2 },
+    { "noteOn": { "channel": 8, "note": 10 }, "action": "hot_cue", "deck": "B", "slot": 3 },
+    { "noteOn": { "channel": 8, "note": 11 }, "action": "hot_cue", "deck": "B", "slot": 4 },
+    { "noteOn": { "channel": 8, "note": 12 }, "action": "hot_cue", "deck": "B", "slot": 5 },
+    { "noteOn": { "channel": 8, "note": 13 }, "action": "hot_cue", "deck": "B", "slot": 6 },
+    { "noteOn": { "channel": 8, "note": 14 }, "action": "hot_cue", "deck": "B", "slot": 7 },
+
+    { "pitchBend": { "channel": 0 }, "action": "pitch", "deck": "A",
+      "inputRange": { "min": 0, "max": 16383 },
+      "outputRange": { "min": -12, "max": 12 } },
+    { "pitchBend": { "channel": 1 }, "action": "pitch", "deck": "B",
+      "inputRange": { "min": 0, "max": 16383 },
+      "outputRange": { "min": -12, "max": 12 } },
+
+    { "cc": { "channel": 0, "controller": 0 }, "action": "eq", "deck": "A", "band": "Low",
+      "inputRange": { "min": 0, "max": 127 },
+      "outputRange": { "min": -26, "max": 12 } },
+    { "cc": { "channel": 0, "controller": 1 }, "action": "eq", "deck": "A", "band": "Mid",
+      "inputRange": { "min": 0, "max": 127 },
+      "outputRange": { "min": -26, "max": 12 } },
+    { "cc": { "channel": 0, "controller": 2 }, "action": "eq", "deck": "A", "band": "High",
+      "inputRange": { "min": 0, "max": 127 },
+      "outputRange": { "min": -26, "max": 12 } },
+    { "cc": { "channel": 0, "controller": 3 }, "action": "eq", "deck": "B", "band": "Low",
+      "inputRange": { "min": 0, "max": 127 },
+      "outputRange": { "min": -26, "max": 12 } },
+    { "cc": { "channel": 0, "controller": 4 }, "action": "eq", "deck": "B", "band": "Mid",
+      "inputRange": { "min": 0, "max": 127 },
+      "outputRange": { "min": -26, "max": 12 } },
+    { "cc": { "channel": 0, "controller": 7 }, "action": "eq", "deck": "B", "band": "High",
+      "inputRange": { "min": 0, "max": 127 },
+      "outputRange": { "min": -26, "max": 12 } },
+
+    { "cc": { "channel": 15, "controller": 31 }, "action": "crossfader",
+      "inputRange": { "min": 0, "max": 127 },
+      "outputRange": { "min": 0, "max": 1 } }
+  ]
+}
