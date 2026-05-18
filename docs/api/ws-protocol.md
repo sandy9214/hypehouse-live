@@ -543,6 +543,22 @@ The copilot's `LibraryRpcHandler` keeps its own native dispatch surface
 (see `copilot/library_rpc.py`) for direct integrations — the proxy is
 an additional entry point, not a replacement.
 
+The HTTP listener on the copilot side is implemented in
+`copilot/http_server.py` (`JsonRpcHttpServer`). It exposes:
+
+* `POST /rpc` — accepts a JSON-RPC 2.0 request, dispatches to the
+  registered handlers (today: `LibraryRpcHandler`), returns a JSON-RPC
+  2.0 response. HTTP status is always 200; failure is carried in the
+  body's `error` field (`-32700` parse, `-32600` invalid envelope,
+  `-32601` unknown method, `-32602` invalid params, `-32603` internal).
+* `GET /health` — returns `{"status": "ok", "service":
+  "hypehouse-copilot"}` for the engine's liveness check before it
+  routes proxy traffic.
+
+The copilot binds the listener via `CoPilotService.run_with_http_server()`
+which `asyncio.gather`s the HTTP server with the engine WS subscriber.
+Pass `--no-http-server` on the copilot CLI to run subscriber-only.
+
 ### `library.list_tracks` (co-pilot)
 
 Paginated dump of the co-pilot's SQLite track catalog. Exposed by

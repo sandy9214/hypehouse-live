@@ -27,6 +27,7 @@ from pydantic import ValidationError
 
 from .decisions import NextTrackPlan, next_track_decision, transition_plan
 from .engine_client import EngineClient
+from .http_server import JsonRpcHttpServer, build_default_server
 from .library import TrackLibrary
 from .library_rpc import LibraryRpcHandler
 from .proposer import Proposal, TransitionProposer
@@ -348,3 +349,52 @@ class CoPilotService:
             await client.run()
         finally:
             await client.aclose()
+
+    # ----- combined loop: HTTP RPC server + engine WS subscriber -----
+
+    def build_http_server(
+        self,
+        *,
+        host: str | None = None,
+        port: int | None = None,
+    ) -> JsonRpcHttpServer:
+        """Construct the JSON-RPC HTTP server bound to this service's handlers.
+
+        Kept as a method so ``CoPilotService`` owns the wiring (it
+        knows which handlers to register). Today only ``library.*`` is
+        wired; future namespaces (e.g. ``copilot.*`` for proposer
+        introspection) can be added here without touching ``main.py``.
+        """
+        if host is not None:
+            server = JsonRpcHttpServer(host=host, port=port)
+            server.register_handler(self._library_rpc)
+            return server
+        return build_default_server(self._library_rpc, port=port)
+
+    async def run_with_http_server(
+        self,
+        *,
+        http_host: str | None = None,
+        http_port: int | None = None,
+        use_legacy_engine_loop: bool = False,
+    ) -> None:
+        """Run the HTTP RPC server AND the engine WS subscriber concurrently.
+
+        The two loops are independent: a failure in one shouldn't take
+        the other down silently. ``asyncio.gather(..., return_exceptions=False)``
+        propagates the first failure, which is what we want — the
+        service-runner in ``main.py`` will log it and exit.
+
+        Caller picks the engine-side loop via ``use_legacy_engine_loop``;
+        the default is :meth:`run_with_proposer` (modern path with
+        ``EngineClient`` + ``TransitionProposer``).
+        """
+        server = self.build_http_server(host=http_host, port=http_port)
+        engine_coro: Awaitable[None] = (
+            self.run() if use_legacy_engine_loop else self.run_with_proposer()
+        )
+        await server.start()
+        try:
+            await engine_coro
+        finally:
+            await server.stop()

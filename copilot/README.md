@@ -26,6 +26,32 @@ Env vars:
 | `HYPEHOUSE_ENGINE_WS` | `ws://127.0.0.1:8765` | Engine WebSocket URL. |
 | `HYPEHOUSE_LIBRARY_DB` | `~/.hypehouse-live/library.db` | SQLite library path. |
 | `HYPEHOUSE_COPILOT_LOG_LEVEL` | `INFO` | Log level. |
+| `HYPEHOUSE_COPILOT_HTTP_PORT` | `8766` | Bind port for the JSON-RPC HTTP server. |
+
+## HTTP JSON-RPC server
+
+The copilot exposes an HTTP endpoint that the engine bridge proxies
+`library.*` calls to. See `docs/api/ws-protocol.md` ("`library.*`
+namespace — engine-bridge proxy to copilot") for the engine-side
+proxy contract.
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/rpc` | POST | JSON-RPC 2.0 request → response. Dispatches `library.*` to `LibraryRpcHandler`; unknown methods return `-32601`. |
+| `/health` | GET | Liveness probe — returns `{"status": "ok", "service": "hypehouse-copilot"}`. |
+
+Default bind: `127.0.0.1:8766`. Override port via
+`HYPEHOUSE_COPILOT_HTTP_PORT`. Disable entirely with `--no-http-server`
+on the CLI (pure WS-subscriber mode — engine `library.*` proxy returns
+`-32000 engine offline`).
+
+```bash
+# default: HTTP RPC + engine WS subscriber both active
+python -m copilot
+
+# pure subscriber mode (no HTTP RPC listener)
+python -m copilot --no-http-server
+```
 
 ## Tests
 
@@ -42,6 +68,8 @@ pytest tests/
 | `library.py` | SQLite-backed track catalog + Camelot/BPM gate logic. |
 | `schemas.py` | Pydantic mirrors of the Rust engine's serde shapes. |
 | `service.py` | aiohttp WebSocket loop. Subscribes, reconnects with backoff, calls the decision functions. |
+| `http_server.py` | aiohttp JSON-RPC 2.0 HTTP server (`/rpc`, `/health`). Receives `library.*` proxy hops from the engine bridge. |
+| `library_rpc.py` | Transport-agnostic `library.*` dispatch handler. |
 | `main.py` / `__main__.py` | `python -m copilot` entry. |
 | `vendor/` | Verbatim copy of HypeHouse v1 `analyzer.py`, `mashup.py`, `shared_cache.py`. See `vendor/VENDOR.md`. |
 
