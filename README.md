@@ -30,6 +30,7 @@ Rust audio engine (sub-5ms latency) + Tauri/WebSocket bridge + TypeScript UI + n
 - Effects chain v0.1 — filter / echo / reverb / gate (ADR-006)
 - WebSocket + JSON-RPC bridge with bearer-token auth (browser + native modes)
 - **MIDI clock OUT (alpha, ADR-007 v0.1)** — engine acts as master, emits 24 PPQN to hardware drum machines / synths. Enable with `cargo run --features midi-clock-out` and `MIDI_CLOCK_OUT_DEVICE=<substring>`. See [`docs/api/ws-protocol.md`](docs/api/ws-protocol.md#midi-clock-out-adr-007-v01).
+- **MIDI clock IN (alpha, ADR-007 v0.3)** — engine acts as slave, locks `master_bpm` to an external sequencer / DAW via 24 PPQN MIDI clock with 4-beat smoothing + ±0.1 BPM deadband. Enable with `cargo run --features midi-clock-in` and `MIDI_CLOCK_IN_DEVICE=<substring>`. When IN is active, OUT is silently disabled to avoid feedback loops. See [`docs/api/ws-protocol.md`](docs/api/ws-protocol.md#midi-clock-in-adr-007-v03).
 - Co-pilot service (Python): beat-grid + downbeat analysis, mashup scoring, next-track suggestions
 
 ## Status
