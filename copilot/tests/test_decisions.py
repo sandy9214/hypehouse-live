@@ -13,15 +13,11 @@ from copilot.decisions import (
 )
 from copilot.library import TrackLibrary, TrackRef
 from copilot.schemas import (
-    CopilotEngage,
     CrossfaderRamp,
     Deck,
     DeckId,
     DeckLoad,
-    DeckPlay,
     EngineState,
-    LoopIn,
-    LoopOut,
     TrackRef as EngineTrackRef,
 )
 
