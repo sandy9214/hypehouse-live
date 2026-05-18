@@ -26,6 +26,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
+use crate::audio::effects::{
+    descriptors, EffectId, ParamDescriptor, EFFECT_ECHO, EFFECT_FILTER, EFFECT_GATE, EFFECT_REVERB,
+};
 use crate::state::{EngineState, Event, EventKind, EventSource};
 
 use super::auth::AuthConfig;
@@ -506,6 +509,47 @@ pub fn dispatch_with_auth(
     (dispatch(engine, req), state)
 }
 
+/// Static list of registered (id, name) pairs the manifest exposes.
+///
+/// Kept inline here (not on the registry) because the wire-facing name
+/// is a UI contract — the audio-thread side doesn't need the strings
+/// and adding one is a bridge-layer choice.
+const REGISTERED_EFFECTS: &[(EffectId, &str)] = &[
+    (EFFECT_FILTER, "filter"),
+    (EFFECT_ECHO, "echo"),
+    (EFFECT_REVERB, "reverb"),
+    (EFFECT_GATE, "gate"),
+];
+
+fn param_descriptor_to_json(d: &ParamDescriptor) -> Value {
+    serde_json::json!({
+        "name": d.name,
+        "min": d.min,
+        "max": d.max,
+        "default": d.default,
+    })
+}
+
+/// Build the `engine.list_effects` result body. Pure — no I/O, no
+/// allocation outside the JSON nodes themselves.
+fn list_effects_result() -> Value {
+    let effects: Vec<Value> = REGISTERED_EFFECTS
+        .iter()
+        .map(|(id, name)| {
+            let params: Vec<Value> = descriptors(*id)
+                .iter()
+                .map(param_descriptor_to_json)
+                .collect();
+            serde_json::json!({
+                "id": *id,
+                "name": *name,
+                "params": params,
+            })
+        })
+        .collect();
+    serde_json::json!({ "effects": effects })
+}
+
 /// Translate a JSON-RPC request into a response by dispatching into the
 /// engine handle. No I/O — pure CPU.
 ///
@@ -585,12 +629,14 @@ pub fn dispatch(engine: &EngineHandle, req: RpcRequest) -> RpcResponse {
             }
         }
         method::HEALTH => RpcResponse::ok(id, engine.health()),
-        // ADR-006 — effect manifest stub. Returns an empty array
-        // until the registry → JSON wiring lands. The UI may call
-        // this and treat `[]` as "no effects available".
-        // TODO(#TBD): emit the full effect descriptor list from
-        //             `crate::audio::effects::descriptors()`.
-        method::LIST_EFFECTS => RpcResponse::ok(id, serde_json::json!([])),
+        // ADR-006 — effect manifest. Pulls the static descriptor list
+        // from `crate::audio::effects::descriptors()` for each
+        // registered effect id and emits a JSON payload the UI can
+        // render directly. The shape is `{ "effects": [ ... ] }` so
+        // the response is a JSON object (forward-compatible with
+        // future top-level fields like `version`) rather than a bare
+        // array. See docs/api/ws-protocol.md.
+        method::LIST_EFFECTS => RpcResponse::ok(id, list_effects_result()),
         other => RpcResponse::err(id, RpcError::method_not_found(other)),
     }
 }
@@ -963,6 +1009,82 @@ mod tests {
             EventKind::DeckPlay { deck: DeckId::A } => {}
             other => panic!("unexpected event kind: {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // engine.list_effects — manifest from the audio effects registry.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn list_effects_returns_all_four_built_in_effects() {
+        let e = engine();
+        let req = submit(method::LIST_EFFECTS, Value::Null, 30);
+        let resp = dispatch(&e, req);
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let result = resp.result.expect("list_effects must return a result");
+        let effects = result
+            .get("effects")
+            .and_then(Value::as_array)
+            .expect("`effects` array must be present in result");
+        assert_eq!(
+            effects.len(),
+            4,
+            "expected 4 effects (filter, echo, reverb, gate), got {}",
+            effects.len()
+        );
+
+        // Each entry must have id, name, params; params descriptors must
+        // expose name + min + max + default.
+        let filter = &effects[0];
+        assert_eq!(filter["id"], serde_json::json!(1));
+        assert_eq!(filter["name"], serde_json::json!("filter"));
+        let filter_params = filter["params"]
+            .as_array()
+            .expect("filter.params must be an array");
+        assert_eq!(filter_params.len(), 3);
+        assert_eq!(filter_params[0]["name"], serde_json::json!("cutoff_hz"));
+        assert_eq!(filter_params[0]["min"], serde_json::json!(20.0));
+        assert_eq!(filter_params[0]["max"], serde_json::json!(20_000.0));
+        assert_eq!(filter_params[0]["default"], serde_json::json!(500.0));
+        assert_eq!(filter_params[1]["name"], serde_json::json!("resonance"));
+        assert_eq!(filter_params[2]["name"], serde_json::json!("mode"));
+
+        let echo = &effects[1];
+        assert_eq!(echo["id"], serde_json::json!(2));
+        assert_eq!(echo["name"], serde_json::json!("echo"));
+        let echo_params = echo["params"].as_array().unwrap();
+        assert_eq!(echo_params.len(), 3);
+        assert_eq!(echo_params[0]["name"], serde_json::json!("time_ms"));
+        assert_eq!(echo_params[1]["name"], serde_json::json!("feedback"));
+        assert_eq!(echo_params[2]["name"], serde_json::json!("tone"));
+
+        let reverb = &effects[2];
+        assert_eq!(reverb["id"], serde_json::json!(3));
+        assert_eq!(reverb["name"], serde_json::json!("reverb"));
+        let reverb_params = reverb["params"].as_array().unwrap();
+        assert_eq!(reverb_params.len(), 3);
+        assert_eq!(reverb_params[0]["name"], serde_json::json!("room_size"));
+        assert_eq!(reverb_params[1]["name"], serde_json::json!("damping"));
+        assert_eq!(reverb_params[2]["name"], serde_json::json!("width"));
+
+        let gate = &effects[3];
+        assert_eq!(gate["id"], serde_json::json!(4));
+        assert_eq!(gate["name"], serde_json::json!("gate"));
+        let gate_params = gate["params"].as_array().unwrap();
+        assert_eq!(gate_params.len(), 2);
+        assert_eq!(gate_params[0]["name"], serde_json::json!("period_div"));
+        assert_eq!(gate_params[1]["name"], serde_json::json!("duty"));
+    }
+
+    #[test]
+    fn list_effects_is_callable_without_event_sink() {
+        // Bare engine (no wired sink) — list_effects is read-only so it
+        // must still succeed; the UI calls it on connect before any
+        // submit_event is in flight.
+        let e = engine();
+        let req = submit(method::LIST_EFFECTS, Value::Null, 31);
+        let resp = dispatch(&e, req);
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
     }
 
     #[test]

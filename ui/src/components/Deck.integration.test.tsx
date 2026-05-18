@@ -6,6 +6,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { Deck } from "./Deck";
 import type { Deck as DeckState } from "../store/engine";
 import type { JsonRpcWS } from "../ws/client";
+import { __resetEffectsManifest } from "../store/effectsManifest";
 
 interface MockBundle {
   client: JsonRpcWS;
@@ -17,6 +18,13 @@ const makeClient = (): MockBundle => {
   const client = { call } as unknown as JsonRpcWS;
   return { client, call };
 };
+
+const emptySlot = (): DeckState["effects"][number] => ({
+  effect_id: 0,
+  params: {},
+  wet_dry: 0.5,
+  enabled: false,
+});
 
 const loadedDeck = (overrides: Partial<DeckState> = {}): DeckState => ({
   id: "A",
@@ -32,6 +40,7 @@ const loadedDeck = (overrides: Partial<DeckState> = {}): DeckState => ({
   loop_in_ms: null,
   loop_out_ms: null,
   copilot_enabled: false,
+  effects: [emptySlot(), emptySlot(), emptySlot()],
   ...overrides,
 });
 
@@ -44,10 +53,12 @@ const submittedEvents = (mb: MockBundle): unknown[] =>
 describe("Deck (integration)", () => {
   beforeEach((): void => {
     vi.useFakeTimers();
+    __resetEffectsManifest();
   });
   afterEach((): void => {
     vi.useRealTimers();
     cleanup();
+    __resetEffectsManifest();
   });
 
   it("emits DeckPlay when play button is clicked on a paused loaded deck", (): void => {

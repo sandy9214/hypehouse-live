@@ -11,6 +11,18 @@ import type { JsonRpcNotification } from "../ws/client";
 
 export type DeckId = "A" | "B";
 
+/**
+ * Single effect slot mirror of engine `EffectSlot` (engine/src/state.rs).
+ * `effect_id` = 0 means empty. `params` is a string→number map keyed
+ * by the param descriptor's `name`.
+ */
+export interface EffectSlotState {
+  effect_id: number;
+  params: Readonly<Record<string, number>>;
+  wet_dry: number;
+  enabled: boolean;
+}
+
 export interface Deck {
   id: DeckId;
   track_title: string | null;
@@ -25,6 +37,8 @@ export interface Deck {
   loop_in_ms: number | null;
   loop_out_ms: number | null;
   copilot_enabled: boolean;
+  /** Per-deck effects chain (ADR-006). Length 3. */
+  effects: readonly [EffectSlotState, EffectSlotState, EffectSlotState];
 }
 
 export interface EngineState {
@@ -34,6 +48,13 @@ export interface EngineState {
 }
 
 type Listener = () => void;
+
+const emptyEffectSlot = (): EffectSlotState => ({
+  effect_id: 0,
+  params: {},
+  wet_dry: 0.5,
+  enabled: false,
+});
 
 const emptyDeck = (id: DeckId): Deck => ({
   id,
@@ -49,6 +70,7 @@ const emptyDeck = (id: DeckId): Deck => ({
   loop_in_ms: null,
   loop_out_ms: null,
   copilot_enabled: false,
+  effects: [emptyEffectSlot(), emptyEffectSlot(), emptyEffectSlot()],
 });
 
 let current: EngineState = {
