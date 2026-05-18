@@ -15,6 +15,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Deck } from "./Deck";
 import { Crossfader } from "./Crossfader";
 import { Library } from "./Library";
+import { MasterControls } from "./MasterControls";
 import { Sessions } from "./Sessions";
 import { JsonRpcWS } from "../ws/client";
 import { applyNotification, useEngineState } from "../store/engine";
@@ -103,6 +104,12 @@ export const DeckRow = (): JSX.Element => {
         <Deck deck={state.decks[1]} side="right" client={client} />
       </div>
       <Crossfader client={client} value={state.crossfader} />
+      <MasterControls
+        client={client}
+        enabled={state.master_limiter_enabled}
+        thresholdDb={state.master_limiter_threshold_db}
+        gainReductionDb={state.master_limiter_gain_reduction_db}
+      />
       <div
         style={{
           display: "flex",

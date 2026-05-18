@@ -426,6 +426,18 @@ impl AudioMixer {
         self.limiter.threshold_linear()
     }
 
+    /// Cheap clone of the master-bus limiter's shared gain-reduction
+    /// atomic. The bridge thread reads this to populate the
+    /// `master_limiter_gain_reduction_db` field of every
+    /// `engine.state_changed` notification — that's what the UI's
+    /// vertical meter renders. Cloning the `Arc` is cheap + happens
+    /// **off** the audio thread.
+    pub fn master_limiter_gain_reduction_atomic(
+        &self,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicI16> {
+        self.limiter.shared_gain_reduction()
+    }
+
     /// Return a mutable borrow of the per-deck pitch/tempo processor.
     #[inline]
     fn pitch_tempo_mut(&mut self, id: DeckId) -> &mut PitchTempo {

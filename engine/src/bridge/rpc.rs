@@ -18,6 +18,7 @@
 //! module that lives outside the bridge, the dispatch is still the
 //! single place that translates JSON-RPC into a typed call.
 
+use std::sync::atomic::{AtomicI16, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
+use crate::audio::decode_gain_reduction_db;
 use crate::audio::effects::{
     descriptors, EffectId, ParamDescriptor, EFFECT_ECHO, EFFECT_FILTER, EFFECT_GATE, EFFECT_REVERB,
 };
@@ -190,6 +192,14 @@ pub enum BridgeNotice {
     StateChanged {
         state: Box<EngineState>,
         last_event_id: u64,
+        /// Live master-bus limiter gain reduction in dB at the moment
+        /// this notification was built. Always `≤ 0`. Sourced from the
+        /// audio thread's shared atomic; sampled once per
+        /// `state_changed` so UI clients can render the meter live
+        /// without polling a separate channel. `0.0` when no GR atomic
+        /// is wired (e.g. unit tests that hit the bare
+        /// `EngineHandle::new()` constructor).
+        master_limiter_gain_reduction_db: f32,
     },
     AudioAlert {
         kind: String,
@@ -217,6 +227,13 @@ struct EngineInner {
     /// `EngineHandle::new()` constructor still get a structured error
     /// instead of a panic — and snapshot/event_log/health remain usable.
     event_sink: Option<Sender<Event>>,
+    /// Optional shared handle on the master-bus limiter's
+    /// gain-reduction readout (audio thread → bridge thread). When
+    /// `Some`, every `BridgeNotice::StateChanged` we publish stamps a
+    /// fresh `master_limiter_gain_reduction_db` read off this atomic so
+    /// the UI meter can render live. `None` in tests that don't spin
+    /// up a real audio thread; the wire payload then carries `0.0`.
+    master_limiter_gr: std::sync::Mutex<Option<Arc<AtomicI16>>>,
 }
 
 impl EngineHandle {
@@ -245,9 +262,39 @@ impl EngineHandle {
             metrics: BridgeMetrics::default(),
             boot_instant: Instant::now(),
             event_sink,
+            master_limiter_gr: std::sync::Mutex::new(None),
         };
         Self {
             inner: Arc::new(inner),
+        }
+    }
+
+    /// Wire the audio thread's master-bus limiter gain-reduction
+    /// readout into this handle. Called once at startup (see
+    /// `main.rs`); the bridge then samples the atomic for every
+    /// outgoing `engine.state_changed` notification. Re-calling
+    /// replaces the previous handle so a future hot-swap of the audio
+    /// stack is safe.
+    pub fn attach_master_limiter_gr(&self, gr: Arc<AtomicI16>) {
+        let mut slot = self
+            .inner
+            .master_limiter_gr
+            .lock()
+            .expect("engine master_limiter_gr poisoned");
+        *slot = Some(gr);
+    }
+
+    /// Read the live master-limiter gain reduction in dB. Returns
+    /// `0.0` when no audio thread is wired (test/bare mode).
+    pub fn master_limiter_gain_reduction_db(&self) -> f32 {
+        let slot = self
+            .inner
+            .master_limiter_gr
+            .lock()
+            .expect("engine master_limiter_gr poisoned");
+        match slot.as_ref() {
+            None => 0.0,
+            Some(a) => decode_gain_reduction_db(a.load(Ordering::Relaxed)),
         }
     }
 
@@ -365,9 +412,11 @@ impl EngineHandle {
 
         self.inner.log.lock().expect("engine log poisoned").push(ev);
 
+        let gr_db = self.master_limiter_gain_reduction_db();
         let _ = self.inner.notices.send(BridgeNotice::StateChanged {
             state: Box::new(next_state),
             last_event_id: id,
+            master_limiter_gain_reduction_db: gr_db,
         });
 
         id
@@ -690,10 +739,25 @@ pub fn dispatch(engine: &EngineHandle, req: RpcRequest) -> RpcResponse {
 }
 
 /// Build a `state_changed` notification frame.
-pub fn state_changed_notification(state: &EngineState, last_event_id: u64) -> RpcNotification {
+///
+/// `master_limiter_gain_reduction_db` is published alongside `state` as
+/// a sibling field (not on `EngineState` itself) because GR is a live
+/// audio-thread measurement — not part of the event-sourced reducer
+/// state. The UI store reads it from the wire payload and merges it
+/// into the local mirror so the gain-reduction meter has a fresh value
+/// on every notification tick.
+pub fn state_changed_notification(
+    state: &EngineState,
+    last_event_id: u64,
+    master_limiter_gain_reduction_db: f32,
+) -> RpcNotification {
     RpcNotification::new(
         method::NOTIFY_STATE_CHANGED,
-        serde_json::json!({ "state": state, "last_event_id": last_event_id }),
+        serde_json::json!({
+            "state": state,
+            "last_event_id": last_event_id,
+            "master_limiter_gain_reduction_db": master_limiter_gain_reduction_db,
+        }),
     )
 }
 
@@ -892,12 +956,48 @@ mod tests {
             BridgeNotice::StateChanged {
                 state,
                 last_event_id,
+                master_limiter_gain_reduction_db,
             } => {
                 assert_eq!(last_event_id, 1);
                 assert!(state.deck_a.playing);
+                // No audio thread wired in tests; GR defaults to 0.
+                assert!(master_limiter_gain_reduction_db.abs() < f32::EPSILON);
             }
             BridgeNotice::AudioAlert { .. } => panic!("expected StateChanged"),
         }
+    }
+
+    #[test]
+    fn state_changed_notification_includes_master_limiter_gr_when_wired() {
+        // Wire a synthetic GR atomic (= -3.0 dB stored as -30 i16) and
+        // verify the bridge stamps the decoded dB onto every outgoing
+        // StateChanged. Exercises the audio→bridge side-channel
+        // without needing a real audio thread.
+        let e = engine();
+        let gr = Arc::new(AtomicI16::new(-30));
+        e.attach_master_limiter_gr(Arc::clone(&gr));
+        let mut rx = e.subscribe();
+        e.submit_event_kind(EventKind::DeckPlay { deck: DeckId::A }, EventSource::Ui);
+        let n = rx.try_recv().expect("notification queued");
+        match n {
+            BridgeNotice::StateChanged {
+                master_limiter_gain_reduction_db,
+                ..
+            } => {
+                assert!(
+                    (master_limiter_gain_reduction_db - (-3.0)).abs() < 0.05,
+                    "expected -3 dB GR, got {master_limiter_gain_reduction_db}",
+                );
+            }
+            BridgeNotice::AudioAlert { .. } => panic!("expected StateChanged"),
+        }
+        // And the wire-frame builder mirrors the same value.
+        let frame = state_changed_notification(&EngineState::default(), 1, -3.0);
+        let payload = serde_json::to_value(&frame).unwrap();
+        let gr_v = payload["params"]["master_limiter_gain_reduction_db"]
+            .as_f64()
+            .unwrap();
+        assert!((gr_v - (-3.0)).abs() < 1e-6);
     }
 
     #[test]

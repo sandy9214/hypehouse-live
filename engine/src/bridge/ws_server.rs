@@ -305,8 +305,13 @@ async fn handle_client(
                 Ok(BridgeNotice::StateChanged {
                     state,
                     last_event_id,
+                    master_limiter_gain_reduction_db,
                 }) => {
-                    let n = state_changed_notification(state.as_ref(), last_event_id);
+                    let n = state_changed_notification(
+                        state.as_ref(),
+                        last_event_id,
+                        master_limiter_gain_reduction_db,
+                    );
                     if let Ok(text) = serde_json::to_string(&n) {
                         if out_for_notices
                             .send(Message::Text(text.into()))
