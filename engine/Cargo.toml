@@ -31,7 +31,7 @@ tokio-tungstenite = "0.27"
 futures-util = "0.3"
 
 # Ring buffer for the event log + lock-free SPSC queue for the audio thread.
-ringbuf = "0.4"
+ringbuf = "0.5"
 crossbeam = "0.8"
 
 # Small stack-allocated vectors — used by the control→audio translator to
