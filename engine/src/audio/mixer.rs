@@ -754,10 +754,18 @@ mod tests {
                 worst = dt;
             }
         }
+        // Budget accounts for WSOLA stage-2 routing (added in the
+        // engine-wsola-pitch-tempo PR): when BOTH knobs are
+        // non-default, stage 2 runs a per-channel WSOLA SAD search
+        // (~150-300 µs / chunk worst case). For a 1024-frame render
+        // (4 × 256-frame chunks, 2 decks, 2 channels each) the
+        // cumulative cost lands ~1.5-2 ms in release builds. 3 ms
+        // gives ~33% headroom while still leaving the entire callback
+        // well inside ADR-004's 50% rule (10.6 ms at 1024 / 48 kHz).
         let budget = if cfg!(debug_assertions) {
-            std::time::Duration::from_millis(5)
+            std::time::Duration::from_millis(15)
         } else {
-            std::time::Duration::from_millis(1)
+            std::time::Duration::from_millis(3)
         };
         // Print so the test can be used as a quick probe via
         // `cargo test ... -- --nocapture`. The actual gate is the

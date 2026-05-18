@@ -96,3 +96,27 @@ The audio thread, on every callback:
 - Ring buffer capacity: 1024 commands per direction should suffice (a busy live set is ~10 events/sec; 1024 = ~100s of buffering). Bench under MIDI flood.
 - Engine clock source: cpal's `OutputCallbackInfo.timestamp.callback` (monotonic sample frame at callback start). Trust it.
 - How fast can a fresh `DecodedTrack` (e.g. 6-minute mp3) be ready post-`DeckLoad`? Decode on control thread + fire `DeckLoadBuffer { buffer_id }` when done. Target <500ms for a typical track on M-series hardware.
+
+## Addendum (2026-05-18) — WSOLA stage 2 in pitch/tempo cascade
+
+The pitch/tempo cascade (`audio::pitch_tempo`) now routes stage 2 through
+a WSOLA time-stretcher (`audio::wsola`) when BOTH knobs are non-default,
+delivering true pitch/tempo orthogonality. The SRC-only cascade is
+retained for single-knob movement (cheaper). Both paths remain
+audio-thread safe:
+
+- All WSOLA buffers (input ring, OLA accumulator, pending-emit queue,
+  last-tail cache, Hann window) are pre-allocated in `Wsola::new` and
+  reused across `process()` calls. `assert_no_alloc` covers both paths
+  in `pitch_tempo::tests::process_is_alloc_free` and
+  `wsola::tests::wsola_alloc_free`.
+- WSOLA `process()` worst-case ≤ 500 µs / 1024 input samples (release
+  build, M-class laptop) per channel. With 2 decks × 2 channels the
+  cascaded budget for a 1024-frame `render` is ≤ 3 ms — well inside
+  ADR-004's 50% rule (≈ 10.6 ms at 1024 / 48 kHz). Verified by
+  `mixer::tests::render_1024_frame_pitch_tempo_active_meets_latency_budget`.
+- WSOLA introduces an additional latency of ~1 window (21.3 ms at the
+  default 1024-sample window / 48 kHz) on first activation. This is
+  upstream of the cpal callback budget and shows up as a one-shot
+  delay when the user moves both knobs off default — acceptable for a
+  DJ knob whose effect onset is already in the tens-of-ms range.
