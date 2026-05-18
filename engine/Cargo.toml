@@ -2,7 +2,7 @@
 name = "hypehouse-engine"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.85"
 description = "hypehouse-live audio engine — 2-deck mixing with sub-5ms latency, MIDI control, event-sourced state."
 license = "MIT"
 publish = false

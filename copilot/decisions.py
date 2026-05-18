@@ -32,6 +32,7 @@ from .library import (
 from .schemas import (
     CopilotEngage,
     CrossfaderRamp,
+    Deck,
     DeckId,
     DeckLoad,
     EngineState,
@@ -118,7 +119,7 @@ class NextTrackPlan:
     runner_ups: tuple[tuple[TrackRef, MashabilityFactors], ...]
 
 
-def _active_playing_deck(state: EngineState) -> tuple[DeckId, "Deck"] | None:  # type: ignore[name-defined]
+def _active_playing_deck(state: EngineState) -> tuple[DeckId, Deck] | None:
     """Return the deck that's currently playing audio out front of house.
 
     Heuristic: a deck is "active" if ``playing == True`` and the crossfader

@@ -24,7 +24,6 @@ from aiohttp import web
 from copilot.library import TrackLibrary, TrackRef
 from copilot.schemas import (
     Deck,
-    DeckId,
     EngineState,
     JsonRpcNotification,
     JsonRpcRequest,
