@@ -32,6 +32,7 @@ from .http_server import JsonRpcHttpServer, build_default_server
 from .library import TrackLibrary
 from .library_rpc import LibraryRpcHandler
 from .library_rpc import RpcError as LibraryRpcError
+from .preset_rpc import PresetRpcHandler
 from .proposer import Proposal, TransitionProposer
 from .schemas import (
     DeckId,
@@ -105,6 +106,11 @@ class CoPilotService:
         # Owned by the service so it shares the library handle + lifetime.
         self._library_rpc = LibraryRpcHandler(library)
 
+        # Preset RPC handler — exposes ``presets.*`` methods. Shares the
+        # library's SQLite connection via ``library.preset_store()`` so a
+        # preset save and a track read both hit the same DB file.
+        self._preset_rpc = PresetRpcHandler(library)
+
         # Auto-Mix controller — lazy-init in the proposer property below
         # so unit tests that don't exercise auto-mix avoid the cost.
         # Owned by the service so its lifetime tracks the engine WS loop.
@@ -122,6 +128,11 @@ class CoPilotService:
     def library_rpc(self) -> LibraryRpcHandler:
         """Public accessor — transport wiring asks for this to dispatch."""
         return self._library_rpc
+
+    @property
+    def preset_rpc(self) -> PresetRpcHandler:
+        """Public accessor for the ``presets.*`` handler."""
+        return self._preset_rpc
 
     # ----- public surface for tests + callers -----
 
@@ -520,9 +531,12 @@ class CoPilotService:
         if host is not None:
             server = JsonRpcHttpServer(host=host, port=port)
             server.register_handler(self._library_rpc)
+            server.register_handler(self._preset_rpc)
             server.register_handler(_CopilotRpcAdapter(self))
             return server
-        server = build_default_server(self._library_rpc, port=port)
+        server = build_default_server(
+            self._library_rpc, preset_rpc=self._preset_rpc, port=port
+        )
         server.register_handler(_CopilotRpcAdapter(self))
         return server
 

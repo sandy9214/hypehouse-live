@@ -39,6 +39,7 @@ from typing import Any, Awaitable, Callable, Protocol
 from aiohttp import web
 
 from .library_rpc import LibraryRpcHandler, RpcError
+from .preset_rpc import PresetRpcHandler
 
 log = logging.getLogger(__name__)
 
@@ -327,16 +328,22 @@ class JsonRpcHttpServer:
 def build_default_server(
     library_rpc: LibraryRpcHandler,
     *,
+    preset_rpc: PresetRpcHandler | None = None,
     host: str = DEFAULT_HOST,
     port: int | None = None,
 ) -> JsonRpcHttpServer:
-    """Construct the production server with the ``library.*`` handler wired up.
+    """Construct the production server with the ``library.*`` + ``presets.*`` handlers.
 
     Kept as a free function so unit tests can spin up a server with the
     same wiring as production without going through :class:`CoPilotService`.
+    ``preset_rpc`` defaults to ``None`` for backwards compatibility with
+    callers (and tests) that wired only the library handler before — when
+    omitted, the ``presets.*`` namespace returns -32601 method not found.
     """
     server = JsonRpcHttpServer(host=host, port=port)
     server.register_handler(library_rpc)
+    if preset_rpc is not None:
+        server.register_handler(preset_rpc)
     return server
 
 
