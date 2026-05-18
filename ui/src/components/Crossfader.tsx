@@ -1,8 +1,13 @@
-// Crossfader — slider input wired to `submit_event { CrossfaderSet }`.
+// Crossfader — slider input wired to `submit_event { Crossfader }`.
 //
 // ADR-002: master section owns the crossfader. We optimistically read
 // from local store but submit through the engine so the event log
 // stays the single source of truth.
+//
+// Wire shape mirrors the engine's externally-tagged serde `EventKind`
+// enum (see `engine/src/state.rs::EventKind::Crossfader { value }`):
+//   { "Crossfader": { "value": 0.5 } }
+// — same form used by `midi/translator.ts` + `keyboardListener.ts`.
 
 import type { ChangeEvent } from "react";
 import type { JsonRpcWS } from "../ws/client";
@@ -16,10 +21,7 @@ export const Crossfader = ({ client, value }: CrossfaderProps): JSX.Element => {
   const handleChange = (ev: ChangeEvent<HTMLInputElement>): void => {
     const next = Number(ev.target.value) / 1000;
     // Fire-and-forget; future PR adds error toast.
-    void client.call("submit_event", {
-      kind: "CrossfaderSet",
-      value: next,
-    });
+    void client.call("submit_event", { Crossfader: { value: next } });
   };
 
   return (
