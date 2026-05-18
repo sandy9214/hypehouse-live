@@ -21,6 +21,7 @@ use hypehouse_engine::audio::{
     EngineClock, SharedClock, SymphoniaDecodeService,
 };
 use hypehouse_engine::bridge::{self, EngineHandle};
+use hypehouse_engine::clock_sync::{LinkStub, PeerClock};
 use hypehouse_engine::persistence::{new_session_id, EventLog};
 use hypehouse_engine::recording::MasterRecorder;
 use hypehouse_engine::state::{EngineState, Event, EventKind};
@@ -131,6 +132,26 @@ async fn main() -> Result<()> {
         channels = stream.channels,
         "audio thread up — cpal stream playing"
     );
+
+    // Peer clock backend (ADR-007 §v0.2). Default = `LinkStub` (no-op
+    // backend that returns 120 BPM / 0 peers). When the `ableton-link`
+    // Cargo feature is enabled AND `ABLETON_LINK_ENABLED=1` is set in
+    // the environment, we'd swap in the real backend — but the
+    // v0.2.x follow-up PR (see ADR-007 §v0.2 + ADR-009) lands the
+    // actual `rust-link` binding. Today the "real" path simply panics
+    // with `unimplemented!()` on first use, so we keep it walled off
+    // behind both the compile-time feature AND the runtime env flag.
+    let peer_clock: Arc<dyn PeerClock> = build_peer_clock();
+    info!(
+        backend = peer_clock_backend_label(),
+        tempo = peer_clock.current_tempo(),
+        peers = peer_clock.peer_count(),
+        "PeerClock backend wired (ADR-007 §v0.2 scaffold)"
+    );
+    // Currently we don't fan the peer-clock readings into the audio
+    // thread — that's the v0.2.x wiring step. Keeping the handle alive
+    // for the duration of `main` so the eventual UI bridge can read it.
+    let _peer_clock = peer_clock;
 
     // MIDI clock IN (ADR-007 §v0.3). Gated by both the `midi-clock-in`
     // Cargo feature AND the `MIDI_CLOCK_IN_DEVICE` env var. When
@@ -366,6 +387,53 @@ fn control_loop(
         }
     }
     info!("control loop: event channel closed — shutting down");
+}
+
+/// Build the [`PeerClock`] backend per ADR-007 §v0.2.
+///
+/// Selection rules:
+/// * Default → [`LinkStub`] (logs the "not yet wired" warning once).
+/// * `ableton-link` feature ON + `ABLETON_LINK_ENABLED=1` → real
+///   backend (currently panics on use — see `clock_sync::link_real`).
+///   We intentionally do NOT construct it here at boot so a default
+///   developer build with `ableton-link` accidentally enabled doesn't
+///   crash on startup; the panic only surfaces when something actually
+///   calls into the placeholder backend.
+/// * Any other combination → [`LinkStub`].
+fn build_peer_clock() -> Arc<dyn PeerClock> {
+    #[cfg(feature = "ableton-link")]
+    {
+        let enabled = std::env::var("ABLETON_LINK_ENABLED")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if enabled {
+            warn!(
+                "ableton-link feature + ABLETON_LINK_ENABLED=1 — real backend is a placeholder; \
+                 see ADR-007 §v0.2 + ADR-009 for the v0.2.x follow-up plan"
+            );
+            return Arc::new(hypehouse_engine::clock_sync::link_real::LinkReal::new(
+                120.0,
+            ));
+        }
+    }
+    Arc::new(LinkStub::new())
+}
+
+/// Stringified backend label for the boot log. Pure helper so the log
+/// line stays readable.
+fn peer_clock_backend_label() -> &'static str {
+    #[cfg(feature = "ableton-link")]
+    {
+        let enabled = std::env::var("ABLETON_LINK_ENABLED")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if enabled {
+            return "real";
+        }
+    }
+    "stub"
 }
 
 /// Spawn the MIDI clock OUT worker if the user has configured it.

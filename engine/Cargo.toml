@@ -17,6 +17,14 @@ midi-clock-out = []
 # but the midir-backed `MidiClockIn::start` entry point is omitted and
 # main.rs skips device probe.
 midi-clock-in = []
+# Enables the Ableton Link v0.2 backend (ADR-007 §v0.2 + ADR-009).
+# **Scaffold only** as of this PR — the real `rust-link` binding is
+# deferred to a v0.2.x follow-up that ships under ADR-009 sign-off
+# (Link is LGPL v3). When the feature is enabled the `clock_sync::
+# link_real::LinkReal` placeholder compiles but every method panics
+# with `unimplemented!()` so accidentally opting in surfaces loudly
+# rather than silently mis-syncing. Default off.
+ableton-link = []
 
 [dependencies]
 # Audio I/O — cpal gives us a lock-free callback into the audio thread.
