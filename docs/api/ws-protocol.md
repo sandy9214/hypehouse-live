@@ -20,17 +20,84 @@ Related ADRs: [ADR-001 stack choice](../adr/ADR-001-stack-choice.md),
 
 ## Auth
 
+Two modes, both produce the same authenticated steady-state.
+
+### Header auth (native clients — Tauri / Rust integration)
+
 | `HYPEHOUSE_BRIDGE_TOKEN` | Bind addr policy           | Per-connection check                     |
 |--------------------------|----------------------------|------------------------------------------|
 | **unset / empty**        | Forced to `127.0.0.1`      | None — every handshake accepted.         |
-| **set to `<token>`**     | Caller's choice (default loopback) | `Authorization: Bearer <token>` required on the WS upgrade. Mismatched / missing → handshake fails with HTTP 401. |
+| **set to `<token>`**     | Caller's choice (default loopback) | `Authorization: Bearer <token>` required on the WS upgrade. Header **present and wrong** → handshake fails with HTTP 401. Header **absent** → upgrade accepted in `PendingAuth` state (see browser mode below). |
 
 Rationale: the unauthenticated mode literally cannot accept a remote
 connection, so a forgotten token never widens the attack surface.
+Explicit-but-wrong tokens still fail fast at the upgrade for native
+clients (no in-band retries needed).
+
+### Browser-mode auth (in-band `auth.hello`)
+
+Browsers cannot attach custom headers to a WebSocket upgrade, so the
+engine accepts header-less connections in a **pending-auth** state. The
+client must call `auth.hello` as the **first JSON-RPC method** on the
+socket. Every other method short-circuits with `-32002 AUTH_REJECTED`
+until the handshake completes.
+
+Request:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "auth.hello",
+  "params": { "token": "<bearer>" },
+  "id": 1
+}
+```
+
+Success response — the connection transitions to authed:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": { "authed": true, "session": 1734567890123456 },
+  "id": 1
+}
+```
+
+`session` is a micros-since-UNIX-epoch marker the client can correlate
+with engine logs. It is **not** a credential; the bearer token still
+gates the connection.
+
+Failure response — invalid token, connection stays in `PendingAuth` and
+the client may retry within the timeout window:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "error": { "code": -32002, "message": "Authentication rejected", "data": "invalid token" },
+  "id": 1
+}
+```
+
+Idempotency: once a connection is authed, replaying `auth.hello` with
+the valid token is a no-op success (still requires the correct token).
+The handshake never regresses the state machine.
+
+**Pending-auth idle timeout**: a connection that does not send a
+successful `auth.hello` within **5 seconds** is closed by the server
+with WebSocket close code **1008 ("policy violation")**, reason
+`"auth.hello timeout"`. Browser clients SHOULD send `auth.hello`
+immediately after `onopen`; queueing it behind UI bootstrapping risks
+the eviction.
+
+When `HYPEHOUSE_BRIDGE_TOKEN` is unset the gate is a no-op: every
+connection is admitted as `Authed` from the first frame and `auth.hello`
+returns success against any token (the server simply has no token to
+compare).
 
 ## Method catalog
 
-All methods are namespaced `engine.*`. Request envelope:
+The auth method is namespaced `auth.*`; everything else is `engine.*`.
+Request envelope:
 
 ```json
 { "jsonrpc": "2.0", "method": "<name>", "params": <object>, "id": <num|str> }
@@ -41,6 +108,25 @@ Response envelope on success:
 ```json
 { "jsonrpc": "2.0", "result": <value>, "id": <num|str> }
 ```
+
+### `auth.hello`
+
+In-band bearer-token handshake for browser WS clients. See the
+**Browser-mode auth** section above for the full state-machine
+contract, idempotency, and idle-timeout policy.
+
+**Params**
+```json
+{ "token": "<bearer>" }
+```
+
+**Result**
+```json
+{ "authed": true, "session": 1734567890123456 }
+```
+
+**Errors**: `-32002 AUTH_REJECTED` on invalid token; `-32602
+INVALID_PARAMS` if the params shape is missing the `token` field.
 
 ### `engine.submit_event`
 
@@ -214,7 +300,7 @@ Application-defined codes live in `-32000..=-32099`:
 |----------|-----------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `-32000` | `ENGINE_OFFLINE`      | The bridge could not forward an event onto the control-loop event channel (full or disconnected). Caller may retry after backoff. Emitted from `engine.submit_event`. |
 | `-32001` | `ENGINE_SINK_UNWIRED` | The serving `EngineHandle` was built without an event sink (`EngineHandle::new()` instead of `EngineHandle::with_event_sink(tx)`). Other RPCs still work.        |
-| `-32002` | `AUTH_REJECTED`       | Reserved for in-protocol auth rejection. Today, missing-bearer rejection happens at the WS handshake (HTTP 401) instead, so this code is rarely surfaced.        |
+| `-32002` | `AUTH_REJECTED`       | In-protocol auth rejection. Returned when (a) a `PendingAuth` browser-mode connection calls any method other than `auth.hello`, or (b) `auth.hello` is called with an invalid token. Native clients that present a wrong `Authorization` header still get HTTP 401 at the WS handshake instead — they never reach this code path. |
 
 Error envelope:
 
@@ -268,3 +354,15 @@ case). Coverage:
   event channel is saturated.
 * `engine.submit_event` returns `-32001 engine sink not wired` when the
   handle was built without an event sink.
+
+In-band auth (`engine/tests/ws_auth_hello.rs`):
+
+* Connect without `Authorization` header → handshake accepted.
+* `engine.submit_event` before `auth.hello` → `-32002 AUTH_REJECTED`,
+  engine state untouched.
+* `auth.hello` with valid token → `{authed: true, session: …}`; follow-up
+  `submit_event` succeeds.
+* No frames for >5s while pending-auth → server closes with WS code
+  `1008` (`Policy`).
+* Invalid `auth.hello` → `-32002`; retry with valid token still works.
+* Header-authed native client skips `auth.hello` entirely (back-compat).
