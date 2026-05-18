@@ -127,6 +127,48 @@ pub enum EventKind {
     DeckUnload {
         deck: DeckId,
     },
+    /// Stem-aware load — alternative to `DeckLoad` that points the deck
+    /// at **four pre-separated stem WAVs** (vocals / drums / bass /
+    /// other) produced by the copilot's `stems.py` (demucs). The
+    /// engine opens each stem as an independent decode handle + mixes
+    /// them per render block with the deck's `stem_gains` envelope,
+    /// unlocking "kill the vocals" / "drums only" mashup tricks.
+    ///
+    /// `stem_paths` ordering MUST be:
+    /// * `0` = vocals
+    /// * `1` = drums
+    /// * `2` = bass
+    /// * `3` = other
+    ///
+    /// Mutually exclusive with `DeckLoad` on the same deck: the
+    /// reducer clears any prior full-mix `loaded` TrackRef when a
+    /// stem load lands, and vice versa (a later `DeckLoad` clears the
+    /// stem-load state). This avoids ambiguity in the audio path —
+    /// the deck is either streaming the full mix or the 4-stem split,
+    /// never both.
+    DeckLoadStems {
+        deck: DeckId,
+        track: TrackRef,
+        /// 4 stem WAV paths in canonical order (vocals/drums/bass/other).
+        stem_paths: [String; 4],
+        /// Same beatgrid + hot-cue payload shape as `DeckLoad` so the
+        /// copilot can reuse the analyzer it already ran on the full
+        /// mix.
+        bpm: f32,
+        beat_grid_anchor_ms: u64,
+        #[serde(default)]
+        downbeats_ms: Vec<u32>,
+        #[serde(default = "default_hot_cues")]
+        hot_cues: [Option<u64>; 8],
+    },
+    /// Per-stem linear gain (0..1). Indexed by canonical stem order
+    /// (0=vocals 1=drums 2=bass 3=other). Out-of-range indices are
+    /// silently ignored by the reducer + translator.
+    SetStemGain {
+        deck: DeckId,
+        stem: u8,
+        gain: f32,
+    },
     DeckPlay {
         deck: DeckId,
     },
@@ -330,6 +372,32 @@ pub struct Deck {
     pub effects: [EffectSlot; 3],
     /// Co-pilot takeover handoff window end (ADR-005). 0 = no handoff active.
     pub handoff_until_frame: u64,
+    /// Per-stem linear gain when the deck is loaded with separated
+    /// stems via `EventKind::DeckLoadStems`. Indexed by canonical stem
+    /// order — 0=vocals, 1=drums, 2=bass, 3=other. Default
+    /// `[1.0, 1.0, 1.0, 1.0]` means **all stems fully audible**, which
+    /// is equivalent to the original full mix (stems sum to the input
+    /// signal because demucs is designed that way). Setting any entry
+    /// to 0.0 mutes that stem (e.g. `[0, 1, 1, 1]` = full mix minus
+    /// vocals, the classic karaoke trick). Values are clamped to
+    /// `[0.0, 1.0]` by the reducer.
+    ///
+    /// This field is ALWAYS populated (irrespective of whether the
+    /// deck is in stem mode) so old serde payloads that omit it still
+    /// deserialize. The audio thread only consults `stem_gains` when
+    /// a stem handle is bound to the deck — in regular full-mix
+    /// playback the field is ignored.
+    #[serde(default = "default_stem_gains")]
+    pub stem_gains: [f32; 4],
+    /// Marker that this deck is in stem-mode (vs. full-mix mode).
+    /// `true` after a successful `DeckLoadStems` reducer pass; cleared
+    /// by `DeckLoad`, `DeckUnload`, or a fresh `DeckLoadStems`. The
+    /// audio thread does not consult this — the mixer dispatches on
+    /// its own `stem_handle: Option<StemHandle>`. State-side flag
+    /// exists so a snapshot consumer (UI, persistence) can render the
+    /// correct controls.
+    #[serde(default)]
+    pub stem_mode: bool,
 }
 
 impl Default for Deck {
@@ -359,6 +427,8 @@ impl Default for Deck {
             downbeats: DownbeatGrid::new(),
             effects: Default::default(),
             handoff_until_frame: 0,
+            stem_gains: default_stem_gains(),
+            stem_mode: false,
         }
     }
 }
@@ -432,6 +502,14 @@ fn default_hot_cues() -> [Option<u64>; 8] {
     [None; 8]
 }
 
+/// Serde + reducer default for `Deck::stem_gains` — `[1.0, 1.0, 1.0, 1.0]`.
+/// All four stems fully audible = audibly equivalent to the original
+/// full mix (demucs's vocals+drums+bass+other sum to ≈ the input,
+/// modulo separation residual).
+fn default_stem_gains() -> [f32; 4] {
+    [1.0, 1.0, 1.0, 1.0]
+}
+
 impl Default for EngineState {
     fn default() -> Self {
         Self {
@@ -490,6 +568,66 @@ impl EngineState {
                 // via the serde default and so behave exactly like
                 // before.
                 d.hot_cues = *hot_cues;
+                // Full-mix load clears stem-mode (mutually exclusive
+                // with DeckLoadStems). Reset stem_gains to default
+                // so a later stem-load on the same deck starts from
+                // the documented all-audible baseline.
+                d.stem_mode = false;
+                d.stem_gains = default_stem_gains();
+            }
+            EventKind::DeckLoadStems {
+                deck: id,
+                track,
+                stem_paths: _,
+                bpm,
+                beat_grid_anchor_ms,
+                downbeats_ms,
+                hot_cues,
+            } => {
+                // Stem-mode load. Shares the beatgrid + hot-cue
+                // payload shape with `DeckLoad` so the copilot can
+                // reuse the analyzer pass it already ran on the full
+                // mix (stems are derived from the same source). The
+                // `stem_paths` themselves are consumed by the
+                // translator (it opens each path via the decode
+                // service); the reducer doesn't store them on the
+                // deck because the audio thread reads from the
+                // opaque `StemHandle` instead.
+                let d = next.deck_mut(*id);
+                d.loaded = Some(track.clone());
+                d.position_ms = 0;
+                d.playing = false;
+                let safe_bpm = if bpm.is_finite() && *bpm > 0.0 {
+                    *bpm
+                } else {
+                    120.0
+                };
+                d.bpm = safe_bpm;
+                d.beat_grid_anchor_ms = *beat_grid_anchor_ms;
+                d.beat_period_ms = 60_000.0 / safe_bpm;
+                d.phase_offset_ms = 0;
+                let take = downbeats_ms.len().min(DOWNBEATS_INLINE_CAPACITY);
+                d.downbeats = DownbeatGrid::from_slice(&downbeats_ms[..take]);
+                d.hot_cues = *hot_cues;
+                // Stem-mode marker + reset stem gains to the
+                // all-audible baseline so a stale `SetStemGain` from
+                // a previous track can't carry over.
+                d.stem_mode = true;
+                d.stem_gains = default_stem_gains();
+            }
+            EventKind::SetStemGain {
+                deck: id,
+                stem,
+                gain,
+            } => {
+                // Out-of-range stem index is a silent no-op (mirrors
+                // the reducer's defensive style on HotCueSet /
+                // EffectSwapSlots). Gain is clamped to [0, 1] to
+                // protect the per-block stem mix MAC from
+                // accidentally negative/saturating values.
+                if (*stem as usize) < 4 {
+                    next.deck_mut(*id).stem_gains[*stem as usize] = gain.clamp(0.0, 1.0);
+                }
             }
             EventKind::DeckUnload { deck: id } => {
                 *next.deck_mut(*id) = Deck::default();
@@ -1657,6 +1795,165 @@ mod tests {
                 assert_eq!(curve, CrossfaderCurve::Dipped);
             }
             other => panic!("expected SetCrossfaderCurve, got {other:?}"),
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Stem-aware playback (engine-stem-aware-mixer PR)
+    // ----------------------------------------------------------------
+
+    fn stem_paths() -> [String; 4] {
+        [
+            "/cache/t1/vocals.wav".into(),
+            "/cache/t1/drums.wav".into(),
+            "/cache/t1/bass.wav".into(),
+            "/cache/t1/other.wav".into(),
+        ]
+    }
+
+    #[test]
+    fn default_stem_gains_is_all_audible() {
+        // Contract: a fresh deck has all four stem gains at 1.0 so
+        // when stems are loaded (without any explicit SetStemGain
+        // commands) playback is audibly equivalent to the full mix.
+        let s = EngineState::default();
+        assert_eq!(s.deck_a.stem_gains, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(s.deck_b.stem_gains, [1.0, 1.0, 1.0, 1.0]);
+        assert!(!s.deck_a.stem_mode);
+    }
+
+    #[test]
+    fn set_stem_gain_mutes_vocals() {
+        // Canonical "kill the vocals" trick: stem index 0 = vocals,
+        // gain 0 → only drums/bass/other audible.
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::SetStemGain {
+                deck: DeckId::A,
+                stem: 0,
+                gain: 0.0,
+            },
+        ));
+        assert_eq!(s.deck_a.stem_gains, [0.0, 1.0, 1.0, 1.0]);
+        // Other deck untouched.
+        assert_eq!(s.deck_b.stem_gains, [1.0; 4]);
+        // Reducer clamps an out-of-range gain to [0, 1].
+        let s = s.apply(&ev(
+            2,
+            EventKind::SetStemGain {
+                deck: DeckId::A,
+                stem: 1,
+                gain: 2.5,
+            },
+        ));
+        assert!((s.deck_a.stem_gains[1] - 1.0).abs() < f32::EPSILON);
+        let s = s.apply(&ev(
+            3,
+            EventKind::SetStemGain {
+                deck: DeckId::A,
+                stem: 2,
+                gain: -0.4,
+            },
+        ));
+        assert!(s.deck_a.stem_gains[2].abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn deck_load_stems_vs_deck_load_are_mutually_exclusive() {
+        // DeckLoadStems sets stem_mode = true; a subsequent regular
+        // DeckLoad on the same deck must reset it back to false and
+        // restore the all-audible baseline. (And vice-versa.) This
+        // mirrors the audio thread's `apply` contract — only one of
+        // {full-mix DecodeHandle, StemHandle} is ever live per deck.
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::DeckLoadStems {
+                deck: DeckId::A,
+                track: TrackRef {
+                    id: "t1".into(),
+                    path: "/tracks/t1.mp3".into(),
+                },
+                stem_paths: stem_paths(),
+                bpm: 128.0,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![],
+                hot_cues: [None; 8],
+            },
+        ));
+        assert!(s.deck_a.stem_mode);
+        assert_eq!(s.deck_a.stem_gains, [1.0; 4]);
+        assert!((s.deck_a.bpm - 128.0).abs() < f32::EPSILON);
+        // Mutate stem gains to make sure a fresh load resets them.
+        let s = s.apply(&ev(
+            2,
+            EventKind::SetStemGain {
+                deck: DeckId::A,
+                stem: 0,
+                gain: 0.0,
+            },
+        ));
+        assert_eq!(s.deck_a.stem_gains[0], 0.0);
+        // Now switch to a regular DeckLoad — stem_mode must drop.
+        let s = s.apply(&ev(
+            3,
+            EventKind::DeckLoad {
+                deck: DeckId::A,
+                track: TrackRef {
+                    id: "t2".into(),
+                    path: "/tracks/t2.mp3".into(),
+                },
+                bpm: 120.0,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![],
+                hot_cues: [None; 8],
+            },
+        ));
+        assert!(!s.deck_a.stem_mode);
+        // Gains reset to all-audible so a follow-up DeckLoadStems
+        // starts from the documented baseline.
+        assert_eq!(s.deck_a.stem_gains, [1.0; 4]);
+        // And back the other way: DeckLoadStems re-engages stem mode
+        // even from a DeckLoad'd state.
+        let s = s.apply(&ev(
+            4,
+            EventKind::DeckLoadStems {
+                deck: DeckId::A,
+                track: TrackRef {
+                    id: "t3".into(),
+                    path: "/tracks/t3.mp3".into(),
+                },
+                stem_paths: stem_paths(),
+                bpm: 124.0,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![],
+                hot_cues: [None; 8],
+            },
+        ));
+        assert!(s.deck_a.stem_mode);
+    }
+
+    #[test]
+    fn set_stem_gain_out_of_range_index_is_silent_noop() {
+        // Defensive: a malformed copilot suggestion (or stale UI)
+        // could send a stem index of 4+ — the reducer must drop it
+        // silently rather than panic / clobber an adjacent slot.
+        let s = EngineState::default();
+        let before = s.deck_a.stem_gains;
+        for bad_stem in [4_u8, 7, 99, 255] {
+            let s2 = s.apply(&ev(
+                1,
+                EventKind::SetStemGain {
+                    deck: DeckId::A,
+                    stem: bad_stem,
+                    gain: 0.0,
+                },
+            ));
+            assert_eq!(
+                s2.deck_a.stem_gains, before,
+                "out-of-range stem {bad_stem} mutated the gains array",
+            );
         }
     }
 }

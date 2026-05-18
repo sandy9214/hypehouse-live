@@ -313,6 +313,56 @@ pub fn event_to_commands_with_errors(
                 kind: AudioCommandKind::DeckUnload { deck: *deck },
             });
         }
+        EventKind::DeckLoadStems {
+            deck,
+            track,
+            stem_paths,
+            ..
+        } => {
+            // Ask the decode service to open all 4 stem WAVs. On
+            // partial failure the service rolls back already-opened
+            // stems; the deck silently stays empty + a single
+            // `DecodeFailure` is published. State stays unmutated
+            // (the reducer's stem_mode flip is harmless — the audio
+            // thread never receives the StemHandle so the mixer
+            // keeps playing whatever was there before).
+            match decode.open_stems(track, stem_paths, sample_rate) {
+                Ok(stems) => {
+                    out.push(AudioCommand {
+                        at_frame: now_frame,
+                        kind: AudioCommandKind::DeckLoadStems { deck: *deck, stems },
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "decode",
+                        track_id = %track.id,
+                        error = ?e,
+                        "DecodeService::open_stems failed — surfacing as decode_error",
+                    );
+                    errors.push(DecodeFailure {
+                        deck: *deck,
+                        track_id: track.id.clone(),
+                        error: e,
+                    });
+                }
+            }
+        }
+        EventKind::SetStemGain { deck, stem, gain } => {
+            // Defensive: silently drop out-of-range stem indices
+            // (matches reducer behaviour). Gain is forwarded raw;
+            // the audio thread defensive-clamps to [0, 1] on apply.
+            if (*stem as usize) < 4 {
+                out.push(AudioCommand {
+                    at_frame: now_frame,
+                    kind: AudioCommandKind::SetStemGain {
+                        deck: *deck,
+                        stem: *stem,
+                        gain: *gain,
+                    },
+                });
+            }
+        }
         EventKind::HotCueTrigger { deck, .. } => {
             // Seek to whatever position the reducer landed on.
             let frame = ms_to_frames(next.deck_ref(*deck).position_ms, sample_rate);
