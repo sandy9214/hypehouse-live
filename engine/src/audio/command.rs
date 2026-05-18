@@ -76,10 +76,25 @@ pub enum AudioCommandKind {
         target_db: f32,
         ramp_frames: u32,
     },
+    /// Set the per-deck **pure pitch shift** (independent of tempo,
+    /// post the pitch/tempo-independent PR). Drives stage 1 of the
+    /// `audio::pitch_tempo::PitchTempo` cascade.
     Pitch {
         deck: DeckId,
         semitones: f32,
         ramp_frames: u32,
+    },
+    /// Set the per-deck **tempo ratio** (1.0 = original speed,
+    /// independent of pitch). Drives stage 2 of the cascade.
+    Tempo {
+        deck: DeckId,
+        ratio: f32,
+        ramp_frames: u32,
+    },
+    /// Reset both pitch + tempo on a deck to defaults (0 semitones /
+    /// 1.0 ratio) and clear the rubato cascade's internal state.
+    PitchTempoReset {
+        deck: DeckId,
     },
     LoopArm {
         deck: DeckId,

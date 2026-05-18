@@ -149,6 +149,25 @@ pub fn event_to_commands(
                 },
             });
         }
+        EventKind::TempoBend { deck, .. } => {
+            out.push(AudioCommand {
+                at_frame: now_frame,
+                kind: AudioCommandKind::Tempo {
+                    deck: *deck,
+                    ratio: next.deck_ref(*deck).tempo_ratio,
+                    ramp_frames: ramp,
+                },
+            });
+        }
+        EventKind::PitchTempoReset { deck } => {
+            // Single audio-command — the mixer collapses both knobs +
+            // resets the rubato cascade in one shot. Keeps the
+            // SmallVec to a length of 1 (cheap inline path).
+            out.push(AudioCommand {
+                at_frame: now_frame,
+                kind: AudioCommandKind::PitchTempoReset { deck: *deck },
+            });
+        }
         EventKind::LoopOut { deck } => {
             let d = next.deck_ref(*deck);
             if d.loop_active {
@@ -728,6 +747,73 @@ mod tests {
                 assert!(!enabled);
             }
             other => panic!("expected EffectEnable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tempo_bend_emits_tempo_command_with_clamped_value() {
+        // Pitch/tempo-independent PR — TempoBend translates 1-1 to an
+        // AudioCommandKind::Tempo carrying the deck's `tempo_ratio`
+        // *after* the reducer's clamp.
+        let prev = EngineState::default();
+        let e = ev(
+            1,
+            EventKind::TempoBend {
+                deck: DeckId::A,
+                ratio: 1.5,
+            },
+        );
+        let next = prev.apply(&e);
+        let cmds = translate(&prev, &next, &e, 0);
+        assert_eq!(cmds.len(), 1);
+        match cmds[0].kind {
+            AudioCommandKind::Tempo {
+                deck,
+                ratio,
+                ramp_frames,
+            } => {
+                assert_eq!(deck, DeckId::A);
+                assert!((ratio - 1.5).abs() < 1e-6);
+                assert!(ramp_frames > 0);
+            }
+            other => panic!("expected Tempo command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tempo_bend_out_of_range_emits_clamped_value() {
+        // ratio 10.0 reducer-clamps to MAX_TEMPO_RATIO; the translator
+        // must forward the clamped value, not the raw input.
+        let prev = EngineState::default();
+        let e = ev(
+            1,
+            EventKind::TempoBend {
+                deck: DeckId::B,
+                ratio: 10.0,
+            },
+        );
+        let next = prev.apply(&e);
+        let cmds = translate(&prev, &next, &e, 0);
+        match cmds[0].kind {
+            AudioCommandKind::Tempo { ratio, .. } => {
+                assert!((ratio - crate::audio::MAX_TEMPO_RATIO).abs() < 1e-6);
+            }
+            other => panic!("expected Tempo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pitch_tempo_reset_emits_single_audio_command() {
+        // Convenience event collapses to one command — the mixer's
+        // PitchTempoReset path resets both knobs + the rubato state.
+        let prev = EngineState::default();
+        let e = ev(1, EventKind::PitchTempoReset { deck: DeckId::A });
+        let next = prev.apply(&e);
+        let cmds = translate(&prev, &next, &e, 0);
+        assert_eq!(cmds.len(), 1);
+        match cmds[0].kind {
+            AudioCommandKind::PitchTempoReset { deck } => assert_eq!(deck, DeckId::A),
+            other => panic!("expected PitchTempoReset, got {other:?}"),
         }
     }
 

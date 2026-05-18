@@ -62,6 +62,11 @@ class Deck(BaseModel):
     playing: bool = False
     position_ms: int = 0
     pitch_semitones: float = 0.0
+    # Independent tempo control (pitch/tempo-independent PR). Mirrors
+    # `Deck::tempo_ratio` in engine/src/state.rs. 1.0 = original speed,
+    # clamped engine-side to [0.5, 2.0]. Pydantic `extra=ignore` means
+    # older engine payloads without this field still parse cleanly.
+    tempo_ratio: float = 1.0
     eq_low_db: float = 0.0
     eq_mid_db: float = 0.0
     eq_high_db: float = 0.0

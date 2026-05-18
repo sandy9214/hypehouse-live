@@ -112,9 +112,31 @@ pub enum EventKind {
     LoopExit {
         deck: DeckId,
     },
+    /// Pure pitch shift in semitones (key change). **Tempo unchanged**
+    /// — drives only the per-deck pitch resampler stage. Use
+    /// `TempoBend` for tempo control. Clamped to ±12 by the reducer.
     PitchBend {
         deck: DeckId,
         semitones: f32,
+    },
+    /// Independent tempo control — ratio of playback speed. 1.0 =
+    /// normal, < 1 = slower, > 1 = faster. Pitch is preserved by the
+    /// per-deck `PitchTempo` cascade. Reducer clamps to
+    /// `[audio::MIN_TEMPO_RATIO, audio::MAX_TEMPO_RATIO]` and rejects
+    /// non-finite inputs (treats them as 1.0). Companion to
+    /// `PitchBend`; the two knobs are independent in the public API
+    /// (v0.1 cascade implementation has a documented limitation — see
+    /// `engine/src/audio/pitch_tempo.rs`).
+    TempoBend {
+        deck: DeckId,
+        ratio: f32,
+    },
+    /// Convenience event — reset both `pitch_semitones` and
+    /// `tempo_ratio` on a deck to their defaults (0.0 / 1.0). Emits
+    /// `AudioCommandKind::PitchTempoReset` so the audio thread also
+    /// resets the rubato cascade state.
+    PitchTempoReset {
+        deck: DeckId,
     },
     /// Phase nudge — apply manual offset to deck's beat grid for sync (ADR-007).
     PhaseNudge {
@@ -182,12 +204,22 @@ pub struct Event {
     pub kind: EventKind,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Deck {
     pub loaded: Option<TrackRef>,
     pub playing: bool,
     pub position_ms: u64,
+    /// **Pure pitch shift** in semitones — independent of tempo (post
+    /// the pitch/tempo-independent PR). 0.0 = original key. Clamped to
+    /// ±12. Drives stage 1 of the per-deck rubato cascade in
+    /// `audio::pitch_tempo`.
     pub pitch_semitones: f32,
+    /// **Tempo ratio** — playback-speed multiplier independent of
+    /// pitch. 1.0 = normal speed. Clamped to
+    /// `[audio::MIN_TEMPO_RATIO, audio::MAX_TEMPO_RATIO]` (default
+    /// 0.5..2.0). Drives stage 2 of the per-deck rubato cascade.
+    #[serde(default = "default_tempo_ratio")]
+    pub tempo_ratio: f32,
     pub eq_low_db: f32,
     pub eq_mid_db: f32,
     pub eq_high_db: f32,
@@ -218,6 +250,37 @@ pub struct Deck {
     pub handoff_until_frame: u64,
 }
 
+impl Default for Deck {
+    fn default() -> Self {
+        // Hand-written `Default` because `tempo_ratio` defaults to 1.0
+        // (not 0.0). Every other field uses its type's natural default;
+        // capturing them explicitly avoids drift if a field is added
+        // upstream without a matching default-handler edit here.
+        Self {
+            loaded: None,
+            playing: false,
+            position_ms: 0,
+            pitch_semitones: 0.0,
+            tempo_ratio: default_tempo_ratio(),
+            eq_low_db: 0.0,
+            eq_mid_db: 0.0,
+            eq_high_db: 0.0,
+            loop_in_ms: None,
+            loop_out_ms: None,
+            loop_active: false,
+            hot_cues: [None; 8],
+            copilot_engaged: false,
+            bpm: 0.0,
+            beat_grid_anchor_ms: 0,
+            beat_period_ms: 0.0,
+            phase_offset_ms: 0,
+            downbeats: DownbeatGrid::new(),
+            effects: Default::default(),
+            handoff_until_frame: 0,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct EffectSlot {
     /// Effect-registry ID. 0 = empty slot.
@@ -244,6 +307,13 @@ pub struct EngineState {
 
 fn default_master_bpm() -> f32 {
     120.0
+}
+
+/// Serde default for `Deck::tempo_ratio` — 1.0 = original playback
+/// speed. Lives next to `default_master_bpm` so both serde defaults are
+/// findable together.
+fn default_tempo_ratio() -> f32 {
+    1.0
 }
 
 impl Default for EngineState {
@@ -413,7 +483,20 @@ impl EngineState {
                 deck: id,
                 semitones,
             } => {
-                next.deck_mut(*id).pitch_semitones = semitones.clamp(-12.0, 12.0);
+                next.deck_mut(*id).pitch_semitones =
+                    crate::audio::clamp_pitch_semitones(*semitones);
+            }
+            EventKind::TempoBend { deck: id, ratio } => {
+                // Use the audio module's clamp so the reducer and the
+                // audio-thread `PitchTempo::set_tempo_ratio` apply the
+                // exact same range — no risk of the state log holding
+                // a value the audio path silently re-clamps differently.
+                next.deck_mut(*id).tempo_ratio = crate::audio::clamp_tempo_ratio(*ratio);
+            }
+            EventKind::PitchTempoReset { deck: id } => {
+                let d = next.deck_mut(*id);
+                d.pitch_semitones = 0.0;
+                d.tempo_ratio = default_tempo_ratio();
             }
             EventKind::CopilotEngage { deck: id } => {
                 next.deck_mut(*id).copilot_engaged = true;
@@ -783,5 +866,109 @@ mod tests {
         assert_eq!(s.deck_a.effects[0].effect_id, 1);
         assert_eq!(s.deck_a.effects[0].params.get("cutoff_hz"), Some(&500.0));
         assert_eq!(s.deck_a.effects[0].wet_dry, 1.0); // clamped
+    }
+
+    #[test]
+    fn deck_default_tempo_ratio_is_one() {
+        // Pitch/tempo PR: tempo_ratio must default to 1.0, not the
+        // f32::default() of 0.0. Catches a regression of the manual
+        // `Default` impl reverting to the auto-derive.
+        let d: Deck = Default::default();
+        assert!((d.tempo_ratio - 1.0).abs() < f32::EPSILON);
+        assert!(d.pitch_semitones.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn tempo_bend_sets_ratio_clamped() {
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::TempoBend {
+                deck: DeckId::A,
+                ratio: 1.25,
+            },
+        ));
+        assert!((s.deck_a.tempo_ratio - 1.25).abs() < 1e-6);
+        // Over-range clamps to max.
+        let s = s.apply(&ev(
+            2,
+            EventKind::TempoBend {
+                deck: DeckId::A,
+                ratio: 10.0,
+            },
+        ));
+        assert!((s.deck_a.tempo_ratio - crate::audio::MAX_TEMPO_RATIO).abs() < 1e-6);
+        // Under-range clamps to min.
+        let s = s.apply(&ev(
+            3,
+            EventKind::TempoBend {
+                deck: DeckId::A,
+                ratio: 0.0,
+            },
+        ));
+        assert!((s.deck_a.tempo_ratio - crate::audio::MIN_TEMPO_RATIO).abs() < 1e-6);
+        // NaN safely falls back to 1.0.
+        let s = s.apply(&ev(
+            4,
+            EventKind::TempoBend {
+                deck: DeckId::A,
+                ratio: f32::NAN,
+            },
+        ));
+        assert!((s.deck_a.tempo_ratio - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn pitch_tempo_reset_returns_both_to_defaults() {
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::PitchBend {
+                deck: DeckId::A,
+                semitones: 5.0,
+            },
+        ));
+        let s = s.apply(&ev(
+            2,
+            EventKind::TempoBend {
+                deck: DeckId::A,
+                ratio: 1.5,
+            },
+        ));
+        assert!((s.deck_a.pitch_semitones - 5.0).abs() < 1e-6);
+        assert!((s.deck_a.tempo_ratio - 1.5).abs() < 1e-6);
+        let s = s.apply(&ev(3, EventKind::PitchTempoReset { deck: DeckId::A }));
+        assert!(s.deck_a.pitch_semitones.abs() < f32::EPSILON);
+        assert!((s.deck_a.tempo_ratio - 1.0).abs() < f32::EPSILON);
+        // Other deck untouched.
+        assert!((s.deck_b.tempo_ratio - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn pitch_bend_does_not_modify_tempo_ratio() {
+        // Pitch/tempo independence at the state-log level: bending pitch
+        // never touches tempo_ratio, even when its previous value was
+        // non-default.
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::TempoBend {
+                deck: DeckId::A,
+                ratio: 0.8,
+            },
+        ));
+        assert!((s.deck_a.tempo_ratio - 0.8).abs() < 1e-6);
+        let s = s.apply(&ev(
+            2,
+            EventKind::PitchBend {
+                deck: DeckId::A,
+                semitones: 7.0,
+            },
+        ));
+        assert!((s.deck_a.pitch_semitones - 7.0).abs() < 1e-6);
+        assert!(
+            (s.deck_a.tempo_ratio - 0.8).abs() < 1e-6,
+            "PitchBend must not touch tempo_ratio"
+        );
     }
 }

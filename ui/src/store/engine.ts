@@ -33,6 +33,13 @@ export interface Deck {
   eq_mid: number;
   eq_high: number;
   pitch_semitones: number;
+  /**
+   * Tempo ratio — 1.0 = original speed, < 1 = slower, > 1 = faster.
+   * Independent of `pitch_semitones` (post the pitch/tempo-independent
+   * PR). Range clamped engine-side to `[0.5, 2.0]`. Mirrors the
+   * `Deck::tempo_ratio` field in `engine/src/state.rs`.
+   */
+  tempo_ratio: number;
   hot_cues: ReadonlyArray<number | null>; // length 8
   loop_in_ms: number | null;
   loop_out_ms: number | null;
@@ -66,6 +73,7 @@ const emptyDeck = (id: DeckId): Deck => ({
   eq_mid: 0,
   eq_high: 0,
   pitch_semitones: 0,
+  tempo_ratio: 1.0,
   hot_cues: [null, null, null, null, null, null, null, null],
   loop_in_ms: null,
   loop_out_ms: null,

@@ -36,6 +36,7 @@ const loadedDeck = (overrides: Partial<DeckState> = {}): DeckState => ({
   eq_mid: 0,
   eq_high: 0,
   pitch_semitones: 0,
+  tempo_ratio: 1.0,
   hot_cues: [null, null, null, null, null, null, null, null],
   loop_in_ms: null,
   loop_out_ms: null,
@@ -146,6 +147,67 @@ describe("Deck (integration)", () => {
     expect(submittedEvents(mb)).toEqual([
       { PitchBend: { deck: "A", semitones: -4.2 } },
     ]);
+  });
+
+  it("emits TempoBend with ratio = 1 + pct/100 when tempo knob changes", (): void => {
+    // Pioneer-style tempo slider — UI works in percent, wire payload
+    // carries the engine's `tempo_ratio` so the reducer math (clamp +
+    // reducer side effects) is unambiguous.
+    const mb = makeClient();
+    render(<Deck deck={loadedDeck()} side="left" client={mb.client} />);
+    const input = screen.getByTestId("tempo-A-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "3" } });
+    const events = submittedEvents(mb);
+    expect(events).toHaveLength(1);
+    // floating-point equality: tolerate ULP drift.
+    const evt = events[0] as { TempoBend: { deck: string; ratio: number } };
+    expect(evt.TempoBend.deck).toBe("A");
+    expect(evt.TempoBend.ratio).toBeCloseTo(1.03, 6);
+  });
+
+  it("negative tempo percent emits ratio < 1", (): void => {
+    const mb = makeClient();
+    render(<Deck deck={loadedDeck()} side="left" client={mb.client} />);
+    const input = screen.getByTestId("tempo-A-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "-5" } });
+    const evt = submittedEvents(mb)[0] as {
+      TempoBend: { deck: string; ratio: number };
+    };
+    expect(evt.TempoBend.ratio).toBeCloseTo(0.95, 6);
+  });
+
+  it("renders effective BPM (= bpm × tempo_ratio) with ± delta marker", (): void => {
+    // Operator-visible feedback: when tempo_ratio drifts away from 1.0
+    // the BPM cell shows the *effective* BPM plus a tiny "+<delta>" or
+    // "-<delta>" inline marker. The marker disappears when the ratio
+    // is exactly 1.0 (no drift to communicate).
+    const mb = makeClient();
+    render(
+      <Deck
+        deck={loadedDeck({ bpm: 120, tempo_ratio: 1.04 })}
+        side="left"
+        client={mb.client}
+      />,
+    );
+    const cell = screen.getByTestId("bpm-A");
+    // Effective BPM = 120 × 1.04 = 124.80
+    expect(cell.textContent).toContain("124.80");
+    const delta = screen.getByTestId("bpm-delta-A");
+    expect(delta.textContent).toBe("+4.80");
+  });
+
+  it("hides BPM delta marker when tempo_ratio is exactly 1.0", (): void => {
+    const mb = makeClient();
+    render(
+      <Deck
+        deck={loadedDeck({ bpm: 128 })}
+        side="left"
+        client={mb.client}
+      />,
+    );
+    const cell = screen.getByTestId("bpm-A");
+    expect(cell.textContent).toContain("128.00");
+    expect(screen.queryByTestId("bpm-delta-A")).toBeNull();
   });
 
   it("emits HotCueTrigger on short-press, HotCueSet on long-press", (): void => {

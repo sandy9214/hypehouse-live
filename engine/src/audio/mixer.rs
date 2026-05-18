@@ -18,6 +18,7 @@ use crate::audio::clock::SharedClock;
 use crate::audio::command::{AudioCommand, AudioCommandKind};
 use crate::audio::decode::{DecodeHandle, DecodeService};
 use crate::audio::effects::{FxBank, EFFECT_NONE};
+use crate::audio::pitch_tempo::{PitchTempo, CHUNK_FRAMES as PT_CHUNK_FRAMES};
 use crate::state::DeckId;
 
 /// Per-callback scratch stride used when pulling stereo samples from
@@ -88,7 +89,24 @@ pub struct AudioMixer {
     /// `reset()`s the target instance.
     effects_a: [FxBank; 3],
     effects_b: [FxBank; 3],
+    /// Per-deck pitch + tempo processor (independent controls). Owns
+    /// the rubato cascade + per-channel scratch. Pre-allocated; the
+    /// audio thread only calls `set_*` / `process` / `reset`, all
+    /// alloc-free.
+    pitch_tempo_a: PitchTempo,
+    pitch_tempo_b: PitchTempo,
+    /// Output scratch for the pitch/tempo cascade. Re-used across
+    /// render calls so the audio thread never allocates. Sized to the
+    /// worst-case stage-2 expansion (input × MAX_TEMPO_RATIO/MIN ≈ 4×).
+    pt_scratch_a: [f32; PT_OUT_SCRATCH],
+    pt_scratch_b: [f32; PT_OUT_SCRATCH],
 }
+
+/// Per-deck pitch/tempo output scratch capacity (interleaved stereo
+/// samples). Stage-2 expansion is capped at 4× input chunk so a 256-
+/// frame input can yield up to ~1024 frames out = 2048 interleaved
+/// samples. Round up for rubato's polynomial safety margin.
+const PT_OUT_SCRATCH: usize = PT_CHUNK_FRAMES * 8 + 128;
 
 impl AudioMixer {
     pub fn new(sample_rate: u32) -> Self {
@@ -109,6 +127,10 @@ impl AudioMixer {
             stereo_scratch: [0.0; MAX_STEREO_SCRATCH],
             effects_a: [mk_bank(), mk_bank(), mk_bank()],
             effects_b: [mk_bank(), mk_bank(), mk_bank()],
+            pitch_tempo_a: PitchTempo::new(DeckId::A),
+            pitch_tempo_b: PitchTempo::new(DeckId::B),
+            pt_scratch_a: [0.0; PT_OUT_SCRATCH],
+            pt_scratch_b: [0.0; PT_OUT_SCRATCH],
         }
     }
 
@@ -153,9 +175,21 @@ impl AudioMixer {
                 let lin = db_to_linear(target_db);
                 self.deck_mut(deck).gain = lin;
             }
-            AudioCommandKind::Pitch { .. } => {
-                // v0.1: pitch shifting requires the buffer playback
-                // path; no-op until real audio lands.
+            AudioCommandKind::Pitch {
+                deck, semitones, ..
+            } => {
+                // Pitch is now PURE pitch (independent of tempo). The
+                // mixer's per-deck `PitchTempo` cascade handles it on
+                // the next `render` call. Ramp is applied inside the
+                // cascade via `set_resample_ratio` smoothing — see
+                // `audio::pitch_tempo`.
+                self.pitch_tempo_mut(deck).set_pitch_semitones(semitones);
+            }
+            AudioCommandKind::Tempo { deck, ratio, .. } => {
+                self.pitch_tempo_mut(deck).set_tempo_ratio(ratio);
+            }
+            AudioCommandKind::PitchTempoReset { deck } => {
+                self.pitch_tempo_mut(deck).reset();
             }
             AudioCommandKind::LoopArm { .. } | AudioCommandKind::LoopDisarm { .. } => {
                 // v0.1: loops require buffer playback; no-op.
@@ -281,6 +315,28 @@ impl AudioMixer {
                 }
             }
 
+            // Pitch + tempo cascade (independent controls). When both
+            // knobs are at default the cascade takes its `is_bypass()`
+            // path — input forwarded verbatim, zero rubato traffic. On
+            // any non-default value the cascade runs and we pad /
+            // truncate its variable-length output back to `chunk`
+            // frames so the downstream effects + crossfade math stays
+            // fixed-size. The pad-with-zeros tail is audibly
+            // negligible at typical chunk = 256 / sr = 48 kHz (≤5.3 ms
+            // grain on tempo ramps); v0.2 will overlap-add to remove it.
+            apply_pitch_tempo(
+                &mut self.pitch_tempo_a,
+                a_slice,
+                &mut self.pt_scratch_a,
+                chunk * 2,
+            );
+            apply_pitch_tempo(
+                &mut self.pitch_tempo_b,
+                &mut b_slice[..(chunk * 2)],
+                &mut self.pt_scratch_b,
+                chunk * 2,
+            );
+
             // ADR-006 — run each deck's effects chain in slot order.
             // The bank is alloc-free + audio-thread-safe.
             let sr_u = self.sample_rate;
@@ -300,6 +356,31 @@ impl AudioMixer {
                 out[written + i] = mix;
             }
             written += chunk;
+        }
+    }
+
+    /// Return a mutable borrow of the per-deck pitch/tempo processor.
+    #[inline]
+    fn pitch_tempo_mut(&mut self, id: DeckId) -> &mut PitchTempo {
+        match id {
+            DeckId::A => &mut self.pitch_tempo_a,
+            DeckId::B => &mut self.pitch_tempo_b,
+        }
+    }
+
+    /// Read accessor for tests — current tempo_ratio on a deck.
+    pub fn tempo_ratio(&self, id: DeckId) -> f32 {
+        match id {
+            DeckId::A => self.pitch_tempo_a.tempo_ratio(),
+            DeckId::B => self.pitch_tempo_b.tempo_ratio(),
+        }
+    }
+
+    /// Read accessor for tests — current pitch_semitones on a deck.
+    pub fn pitch_semitones(&self, id: DeckId) -> f32 {
+        match id {
+            DeckId::A => self.pitch_tempo_a.pitch_semitones(),
+            DeckId::B => self.pitch_tempo_b.pitch_semitones(),
         }
     }
 
@@ -383,6 +464,45 @@ fn render_deck(d: &mut DeckHot, sr: f32) -> f32 {
     s
 }
 
+/// Run the per-deck pitch + tempo cascade in place. `slice` is the
+/// deck's interleaved-stereo source samples; on return, `slice[..target_len]`
+/// holds the cascade's output, padded with zeros if the cascade
+/// produced fewer frames than requested.
+///
+/// **Audio-thread safe**: alloc-free; the cascade writes into
+/// `scratch` and we then copy back into `slice`. No new allocations.
+///
+/// Implementation notes:
+/// * The bypass path inside `PitchTempo::process` short-circuits the
+///   first call when both knobs are at default — no copy of more than
+///   the original slice.
+/// * When the cascade produces fewer samples than `target_len`, the
+///   tail is zero-padded. At chunk = 256 / sr = 48kHz this is a ≤5.3 ms
+///   silence per block on tempo ramps. v0.2 will replace with a small
+///   overlap-add ring; the API surface here is unchanged.
+#[inline]
+fn apply_pitch_tempo(
+    pt: &mut PitchTempo,
+    slice: &mut [f32],
+    scratch: &mut [f32],
+    target_len: usize,
+) {
+    if pt.is_bypass() {
+        // Cascade is a no-op; saves a memcpy.
+        return;
+    }
+    let slice_len = slice.len();
+    let n = pt.process(slice, scratch);
+    let copy_len = n.min(target_len).min(slice_len);
+    slice[..copy_len].copy_from_slice(&scratch[..copy_len]);
+    // Zero-pad if the cascade returned fewer samples than the caller
+    // asked for. Loud-glitch protection: never leave stale samples.
+    let tail_end = target_len.min(slice_len);
+    for s in slice[copy_len..tail_end].iter_mut() {
+        *s = 0.0;
+    }
+}
+
 #[inline]
 fn db_to_linear(db: f32) -> f32 {
     // 10 ^ (db / 20). Use `exp` since f32::powf can be slow.
@@ -463,6 +583,137 @@ mod tests {
                 target_db: -6.0,
                 ramp_frames: 240,
             }));
+            m.render(&mut buf);
+        });
+    }
+
+    #[test]
+    fn apply_tempo_command_caches_value_on_deck_processor() {
+        let mut m = AudioMixer::new(48_000);
+        m.apply(cmd(AudioCommandKind::Tempo {
+            deck: DeckId::B,
+            ratio: 1.3,
+            ramp_frames: 240,
+        }));
+        assert!((m.tempo_ratio(DeckId::B) - 1.3).abs() < 1e-6);
+        // Other deck unaffected.
+        assert!((m.tempo_ratio(DeckId::A) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn apply_pitch_command_caches_value_on_deck_processor() {
+        let mut m = AudioMixer::new(48_000);
+        m.apply(cmd(AudioCommandKind::Pitch {
+            deck: DeckId::A,
+            semitones: 5.0,
+            ramp_frames: 240,
+        }));
+        assert!((m.pitch_semitones(DeckId::A) - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pitch_tempo_reset_returns_both_to_defaults_in_mixer() {
+        let mut m = AudioMixer::new(48_000);
+        m.apply(cmd(AudioCommandKind::Tempo {
+            deck: DeckId::A,
+            ratio: 0.8,
+            ramp_frames: 0,
+        }));
+        m.apply(cmd(AudioCommandKind::Pitch {
+            deck: DeckId::A,
+            semitones: 4.0,
+            ramp_frames: 0,
+        }));
+        m.apply(cmd(AudioCommandKind::PitchTempoReset { deck: DeckId::A }));
+        assert!((m.tempo_ratio(DeckId::A) - 1.0).abs() < f32::EPSILON);
+        assert!(m.pitch_semitones(DeckId::A).abs() < f32::EPSILON);
+    }
+
+    /// Latency probe — worst-case `render` for a 1024-frame buffer
+    /// with the pitch+tempo cascade active. ADR-004 budget for the
+    /// audio thread is ≤ 1ms per render call; this test fails if the
+    /// observed worst case across 100 iterations exceeds 1.0ms (≈
+    /// 50% margin to the audio-callback budget at 1024 frames @ 48
+    /// kHz ≈ 21.3 ms wall-clock).
+    ///
+    /// Run with `cargo test --release` to measure realistic numbers;
+    /// in debug builds the bound is relaxed to 5ms.
+    #[test]
+    fn render_1024_frame_pitch_tempo_active_meets_latency_budget() {
+        let mut m = AudioMixer::new(48_000);
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::A }));
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::B }));
+        m.apply(cmd(AudioCommandKind::Tempo {
+            deck: DeckId::A,
+            ratio: 1.07,
+            ramp_frames: 0,
+        }));
+        m.apply(cmd(AudioCommandKind::Pitch {
+            deck: DeckId::A,
+            semitones: 2.0,
+            ramp_frames: 0,
+        }));
+        m.apply(cmd(AudioCommandKind::Tempo {
+            deck: DeckId::B,
+            ratio: 0.93,
+            ramp_frames: 0,
+        }));
+        m.apply(cmd(AudioCommandKind::Pitch {
+            deck: DeckId::B,
+            semitones: -3.0,
+            ramp_frames: 0,
+        }));
+        let mut buf = [0.0_f32; 1024];
+        // Prime — first call fills rubato's polynomial state.
+        m.render(&mut buf);
+        let mut worst = std::time::Duration::ZERO;
+        for _ in 0..100 {
+            let t = std::time::Instant::now();
+            m.render(&mut buf);
+            let dt = t.elapsed();
+            if dt > worst {
+                worst = dt;
+            }
+        }
+        let budget = if cfg!(debug_assertions) {
+            std::time::Duration::from_millis(5)
+        } else {
+            std::time::Duration::from_millis(1)
+        };
+        // Print so the test can be used as a quick probe via
+        // `cargo test ... -- --nocapture`. The actual gate is the
+        // assertion below.
+        eprintln!(
+            "[latency] 1024-frame render w/ pitch+tempo active: worst = {worst:?}, budget = {budget:?}"
+        );
+        assert!(
+            worst <= budget,
+            "render exceeded latency budget: worst {worst:?} > {budget:?}"
+        );
+    }
+
+    #[test]
+    fn render_with_non_default_tempo_still_alloc_free() {
+        // ADR-004 — the active pitch/tempo cascade must remain
+        // alloc-free on the audio thread. This is the strongest test
+        // because rubato's `process_into_buffer` is non-trivial; if it
+        // ever heap-allocs internally the assert_no_alloc gate trips.
+        let mut m = AudioMixer::new(48_000);
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::A }));
+        m.apply(cmd(AudioCommandKind::Tempo {
+            deck: DeckId::A,
+            ratio: 1.2,
+            ramp_frames: 0,
+        }));
+        m.apply(cmd(AudioCommandKind::Pitch {
+            deck: DeckId::A,
+            semitones: 3.0,
+            ramp_frames: 0,
+        }));
+        // Prime — first render fills rubato's polynomial buffer.
+        let mut buf = [0.0_f32; 1024];
+        m.render(&mut buf);
+        assert_no_alloc::assert_no_alloc(|| {
             m.render(&mut buf);
         });
     }

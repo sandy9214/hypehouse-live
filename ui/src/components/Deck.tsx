@@ -12,8 +12,10 @@ import type { Deck as DeckState } from "../store/engine";
 import { Waveform } from "./Waveform";
 import {
   fmtMs,
+  formatEffectiveBpm,
   HotCueGrid,
   KnobRow,
+  tempoPctToRatio,
   TransportRow,
   type EqBand,
 } from "./DeckControls";
@@ -26,8 +28,6 @@ export interface DeckProps {
   client: JsonRpcWS;
 }
 
-const fmtNum = (n: number | null, digits = 1): string =>
-  n === null ? "—" : n.toFixed(digits);
 const isLoaded = (d: DeckState): boolean => d.track_title !== null;
 const loopActive = (d: DeckState): boolean =>
   d.loop_in_ms !== null && d.loop_out_ms !== null;
@@ -85,6 +85,14 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
     });
   const onPitch = (value: number): void =>
     submit(client, { PitchBend: { deck: deck.id, semitones: value } });
+  const onTempoPct = (pct: number): void =>
+    // Convert the knob's UX-friendly percent into the engine's
+    // `tempo_ratio` field. Engine clamps to [0.5, 2.0]; the knob's
+    // ±8 % range never approaches that boundary so this is purely
+    // defence-in-depth.
+    submit(client, {
+      TempoBend: { deck: deck.id, ratio: tempoPctToRatio(pct) },
+    });
   const onEq = (band: EqBand, value_db: number): void =>
     submit(client, { EqAdjust: { deck: deck.id, band, value_db } });
   const onHotCueTrigger = (slot: number): void =>
@@ -130,11 +138,40 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
         onCopilotToggle={onCopilotToggle}
       />
 
-      <KnobRow deck={deck} onPitch={onPitch} onEq={onEq} />
+      <KnobRow
+        deck={deck}
+        onPitch={onPitch}
+        onTempoPct={onTempoPct}
+        onEq={onEq}
+      />
 
       <dl style={dlStyle}>
         <dt>BPM</dt>
-        <dd>{fmtNum(deck.bpm, 2)}</dd>
+        <dd data-testid={`bpm-${deck.id}`}>
+          {((): JSX.Element => {
+            // Show the *effective* BPM (bpm × tempo_ratio) alongside a
+            // small "±delta" marker so DJs can see at a glance how far
+            // the deck has drifted from its nominal tempo.
+            const { effective, delta } = formatEffectiveBpm(
+              deck.bpm,
+              deck.tempo_ratio,
+            );
+            return (
+              <>
+                <span>{effective}</span>
+                {delta !== null ? (
+                  <span
+                    data-testid={`bpm-delta-${deck.id}`}
+                    style={{ marginLeft: 6, color: "#8aa", fontSize: 11 }}
+                    aria-label={`bpm-delta-${deck.id}`}
+                  >
+                    {delta}
+                  </span>
+                ) : null}
+              </>
+            );
+          })()}
+        </dd>
         <dt>Pos</dt>
         <dd>{fmtMs(deck.position_ms)}</dd>
         <dt>Loop</dt>
