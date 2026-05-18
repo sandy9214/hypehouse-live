@@ -22,6 +22,7 @@ use hypehouse_engine::audio::{
 };
 use hypehouse_engine::bridge::{self, EngineHandle};
 use hypehouse_engine::persistence::{new_session_id, EventLog};
+use hypehouse_engine::recording::MasterRecorder;
 use hypehouse_engine::state::{EngineState, Event, EventKind};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -55,10 +56,67 @@ async fn main() -> Result<()> {
     // docs.
     let decode_service: Arc<dyn DecodeService> = Arc::new(SymphoniaDecodeService::new());
 
+    // Persistent event log (ADR-003). One session id per process boot;
+    // the log file lives under XDG_DATA_HOME (or the
+    // HYPEHOUSE_EVENT_LOG_DIR override). Disabling is supported via
+    // HYPEHOUSE_EVENT_LOG_DISABLED=1 — useful for ephemeral runs and
+    // the CI matrix where the filesystem isn't durable.
+    //
+    // We create the session id BEFORE the audio stream so the same id
+    // is used for both the event log and the master-mix recorder
+    // (they share the on-disk session directory).
+    let session_id = new_session_id();
+
+    // Per-session master-mix recorder (master.wav under the session
+    // directory). Honours `HYPEHOUSE_RECORDING_DISABLED=1` — when set,
+    // `try_new_from_env` returns `Ok(None)` and the mixer runs without
+    // a tee. Persistence failure is non-fatal: the live engine
+    // continues without an audio recording.
+    let recording_path = resolve_recording_path(&session_id);
+    let (mut master_recorder, recorder_sink) = match MasterRecorder::try_new_from_env(
+        &recording_path,
+        // We don't yet know the device sample rate — use 48 kHz as the
+        // working default. cpal will pick the device's preferred rate
+        // below; we re-open the recorder with the real rate if it
+        // differs. This avoids racing the file create against the
+        // device probe.
+        48_000,
+    ) {
+        Ok(Some((rec, sink))) => {
+            info!(
+                session_id = %session_id,
+                path = %rec.path().display(),
+                "master-mix recorder opened"
+            );
+            (Some(rec), Some(sink))
+        }
+        Ok(None) => {
+            info!(
+                session_id = %session_id,
+                "master-mix recorder disabled by env"
+            );
+            (None, None)
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                session_id = %session_id,
+                path = %recording_path.display(),
+                "master-mix recorder open failed — continuing without recording"
+            );
+            (None, None)
+        }
+    };
+
     // Spawn the audio thread (cpal stream). Holds the stream alive
     // for the duration of `main`. The mixer carries an Arc clone of
     // the decode service so cpal's callback can pull stereo frames.
-    let stream = spawn_audio_thread(consumer, clock.shared.clone(), Arc::clone(&decode_service))?;
+    let stream = spawn_audio_thread(
+        consumer,
+        clock.shared.clone(),
+        Arc::clone(&decode_service),
+        recorder_sink,
+    )?;
     info!(
         sample_rate = stream.sample_rate,
         channels = stream.channels,
@@ -75,12 +133,6 @@ async fn main() -> Result<()> {
     // the control-thread loop.
     let (event_tx, event_rx) = channel::unbounded::<Event>();
 
-    // Persistent event log (ADR-003). One session id per process boot;
-    // the log file lives under XDG_DATA_HOME (or the
-    // HYPEHOUSE_EVENT_LOG_DIR override). Disabling is supported via
-    // HYPEHOUSE_EVENT_LOG_DISABLED=1 — useful for ephemeral runs and
-    // the CI matrix where the filesystem isn't durable.
-    let session_id = new_session_id();
     let event_log = match EventLog::new(&session_id) {
         Ok(log) => {
             info!(
@@ -145,7 +197,55 @@ async fn main() -> Result<()> {
     info!("shutdown signal received — closing bridge");
     server.shutdown().await?;
 
+    // Tear down the audio stream BEFORE finalizing the master.wav so
+    // the cpal callback can't push more samples after we patch the
+    // WAV header. Dropping the stream joins the OS audio thread.
+    drop(stream);
+
+    if let Some(rec) = master_recorder.as_mut() {
+        let dropped = rec.dropped_frames();
+        match rec.stop() {
+            Ok(()) => info!(
+                path = %rec.path().display(),
+                dropped_frames = dropped,
+                "master-mix recorder stopped + finalized"
+            ),
+            Err(e) => warn!(error = %e, "master-mix recorder stop failed"),
+        }
+    }
+
     Ok(())
+}
+
+/// Compute the on-disk path for the master-mix WAV. Mirrors the event
+/// log layout: `<persistence root>/<session_id>/master.wav`. Honours
+/// the same env override (`HYPEHOUSE_EVENT_LOG_DIR`) so a single env
+/// var moves both the audit trail and the master mix to the same dir,
+/// which is the most common ops deployment shape.
+fn resolve_recording_path(session_id: &str) -> std::path::PathBuf {
+    let root = std::env::var("HYPEHOUSE_EVENT_LOG_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("XDG_DATA_HOME")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|x| {
+                    std::path::PathBuf::from(x)
+                        .join("hypehouse-live")
+                        .join("sessions")
+                })
+        })
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            std::path::PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("hypehouse-live")
+                .join("sessions")
+        });
+    root.join(session_id).join("master.wav")
 }
 
 /// Control-thread loop: pull events, fold state, emit audio commands.

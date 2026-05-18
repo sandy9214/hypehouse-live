@@ -23,6 +23,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
 
 use crate::audio::{AudioConsumer, AudioMixer, DecodeService, SharedClock};
+use crate::recording::MasterRecorderSink;
 
 /// Extract the sample rate from a [`SupportedStreamConfig`] as `u32`.
 ///
@@ -56,10 +57,16 @@ pub struct AudioStreamHandle {
 
 /// Build + start the output stream. The producer side of the SPSC ring
 /// stays with the caller (control thread); we take the consumer.
+///
+/// An optional `recorder_sink` tees the master mix into the per-session
+/// `master.wav` recorder (see [`crate::recording`]). When `None`, the
+/// tee path is a single `is_some()` check per render chunk — no extra
+/// cost on the audio thread.
 pub fn spawn_audio_thread(
     consumer: AudioConsumer,
     clock: SharedClock,
     decode: Arc<dyn DecodeService>,
+    recorder_sink: Option<MasterRecorderSink>,
 ) -> Result<AudioStreamHandle> {
     let host = cpal::default_host();
     let device = host
@@ -75,7 +82,10 @@ pub fn spawn_audio_thread(
     let sample_format = supported.sample_format();
     let config: StreamConfig = supported.into();
 
-    let mixer = AudioMixer::with_decode(sample_rate, decode);
+    let mut mixer = AudioMixer::with_decode(sample_rate, decode);
+    if let Some(sink) = recorder_sink {
+        mixer.attach_recorder(sink);
+    }
 
     // Hand the consumer + mixer + clock to the callback. cpal callbacks
     // must be `Send + 'static`; we move owned values in.
