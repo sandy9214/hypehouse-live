@@ -25,6 +25,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { Button } from "./Button";
 import { Knob } from "./Knob";
+import { BpmLockBadge } from "./BpmLockBadge";
+import type { ClockSource } from "../store/engine";
 import type { JsonRpcWS } from "../ws/client";
 
 export interface MasterControlsProps {
@@ -32,6 +34,10 @@ export interface MasterControlsProps {
   enabled: boolean;
   thresholdDb: number;
   gainReductionDb: number;
+  /** Active tempo source from the engine's SharedClock. Drives the
+   * BPM-lock badge rendered next to the limiter controls. Optional so
+   * older test harnesses still compile; absent ⇒ `"internal"`. */
+  clockSource?: ClockSource;
   /** Override the smoothing time-constant (ms). Tests pin it to 0
    * for deterministic snap-to-target meter. */
   meterTauMs?: number;
@@ -103,6 +109,7 @@ export const MasterControls = ({
   enabled,
   thresholdDb,
   gainReductionDb,
+  clockSource = "internal",
   meterTauMs = METER_TAU_MS_DEFAULT,
 }: MasterControlsProps): JSX.Element => {
   // Smoothed meter value. We start at the engine's sampled GR so the
@@ -177,6 +184,7 @@ export const MasterControls = ({
 
   return (
     <div style={wrap} data-testid="master-controls">
+      <BpmLockBadge source={clockSource} />
       <Button
         pressed={enabled}
         onClick={handleToggle}

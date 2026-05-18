@@ -27,10 +27,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
+use crate::audio::clock::SharedClock;
 use crate::audio::decode_gain_reduction_db;
 use crate::audio::effects::{
     descriptors, EffectId, ParamDescriptor, EFFECT_ECHO, EFFECT_FILTER, EFFECT_GATE, EFFECT_REVERB,
 };
+use crate::audio::ClockSource;
 use crate::state::{DeckId, EngineState, Event, EventKind, EventSource};
 
 use super::auth::AuthConfig;
@@ -216,6 +218,13 @@ pub enum BridgeNotice {
         /// is wired (e.g. unit tests that hit the bare
         /// `EngineHandle::new()` constructor).
         master_limiter_gain_reduction_db: f32,
+        /// Active tempo source at the moment this notification was
+        /// built. Sourced from the shared clock's atomic — same
+        /// rationale as `master_limiter_gain_reduction_db`: a live
+        /// audio-thread measurement, NOT part of the event-sourced
+        /// reducer state. `ClockSource::Internal` when no shared clock
+        /// is wired (the bare `EngineHandle::new()` test path).
+        clock_source: ClockSource,
     },
     AudioAlert {
         kind: String,
@@ -267,6 +276,13 @@ struct EngineInner {
     /// the UI meter can render live. `None` in tests that don't spin
     /// up a real audio thread; the wire payload then carries `0.0`.
     master_limiter_gr: std::sync::Mutex<Option<Arc<AtomicI16>>>,
+    /// Optional handle on the engine's `SharedClock`. When `Some`, every
+    /// `BridgeNotice::StateChanged` we publish stamps the active
+    /// [`ClockSource`] read off the clock's atomic so the UI BPM-lock
+    /// badge can render without polling a separate channel. `None` in
+    /// tests that don't spin up a real audio thread; the wire payload
+    /// then carries `"internal"`.
+    shared_clock: std::sync::Mutex<Option<SharedClock>>,
 }
 
 impl EngineHandle {
@@ -296,6 +312,7 @@ impl EngineHandle {
             boot_instant: Instant::now(),
             event_sink,
             master_limiter_gr: std::sync::Mutex::new(None),
+            shared_clock: std::sync::Mutex::new(None),
         };
         Self {
             inner: Arc::new(inner),
@@ -328,6 +345,34 @@ impl EngineHandle {
         match slot.as_ref() {
             None => 0.0,
             Some(a) => decode_gain_reduction_db(a.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Wire the engine's `SharedClock` into this handle so every
+    /// outgoing `engine.state_changed` notification samples the active
+    /// [`ClockSource`]. Called once at startup (`main.rs`); re-calling
+    /// replaces the previous handle so a future hot-swap of the clock
+    /// is safe.
+    pub fn attach_shared_clock(&self, clock: SharedClock) {
+        let mut slot = self
+            .inner
+            .shared_clock
+            .lock()
+            .expect("engine shared_clock poisoned");
+        *slot = Some(clock);
+    }
+
+    /// Read the active tempo source. Returns `ClockSource::Internal`
+    /// when no shared clock is wired (test/bare mode).
+    pub fn clock_source(&self) -> ClockSource {
+        let slot = self
+            .inner
+            .shared_clock
+            .lock()
+            .expect("engine shared_clock poisoned");
+        match slot.as_ref() {
+            None => ClockSource::Internal,
+            Some(c) => c.clock_source(),
         }
     }
 
@@ -465,10 +510,12 @@ impl EngineHandle {
         self.inner.log.lock().expect("engine log poisoned").push(ev);
 
         let gr_db = self.master_limiter_gain_reduction_db();
+        let clock_source = self.clock_source();
         let _ = self.inner.notices.send(BridgeNotice::StateChanged {
             state: Box::new(next_state),
             last_event_id: id,
             master_limiter_gain_reduction_db: gr_db,
+            clock_source,
         });
 
         id
@@ -844,16 +891,21 @@ pub fn dispatch(engine: &EngineHandle, req: RpcRequest) -> RpcResponse {
 
 /// Build a `state_changed` notification frame.
 ///
-/// `master_limiter_gain_reduction_db` is published alongside `state` as
-/// a sibling field (not on `EngineState` itself) because GR is a live
-/// audio-thread measurement — not part of the event-sourced reducer
-/// state. The UI store reads it from the wire payload and merges it
-/// into the local mirror so the gain-reduction meter has a fresh value
-/// on every notification tick.
+/// `master_limiter_gain_reduction_db` and `clock_source` are published
+/// alongside `state` as sibling fields (not on `EngineState` itself)
+/// because both are live audio-thread measurements — not part of the
+/// event-sourced reducer state. The UI store reads them from the wire
+/// payload and merges into the local mirror so the gain-reduction meter
+/// + the BPM-lock badge stay fresh on every notification tick.
+///
+/// `clock_source` serializes as the stable kebab-case string
+/// (`"internal" | "midi_in" | "ableton_link"`); the UI keys off the
+/// same set.
 pub fn state_changed_notification(
     state: &EngineState,
     last_event_id: u64,
     master_limiter_gain_reduction_db: f32,
+    clock_source: ClockSource,
 ) -> RpcNotification {
     RpcNotification::new(
         method::NOTIFY_STATE_CHANGED,
@@ -861,6 +913,7 @@ pub fn state_changed_notification(
             "state": state,
             "last_event_id": last_event_id,
             "master_limiter_gain_reduction_db": master_limiter_gain_reduction_db,
+            "clock_source": clock_source.as_str(),
         }),
     )
 }
@@ -1088,11 +1141,14 @@ mod tests {
                 state,
                 last_event_id,
                 master_limiter_gain_reduction_db,
+                clock_source,
             } => {
                 assert_eq!(last_event_id, 1);
                 assert!(state.deck_a.playing);
                 // No audio thread wired in tests; GR defaults to 0.
                 assert!(master_limiter_gain_reduction_db.abs() < f32::EPSILON);
+                // No shared clock wired in tests; source defaults to Internal.
+                assert_eq!(clock_source, ClockSource::Internal);
             }
             BridgeNotice::AudioAlert { .. } | BridgeNotice::DecodeError { .. } => {
                 panic!("expected StateChanged")
@@ -1182,12 +1238,51 @@ mod tests {
             }
         }
         // And the wire-frame builder mirrors the same value.
-        let frame = state_changed_notification(&EngineState::default(), 1, -3.0);
+        let frame =
+            state_changed_notification(&EngineState::default(), 1, -3.0, ClockSource::Internal);
         let payload = serde_json::to_value(&frame).unwrap();
         let gr_v = payload["params"]["master_limiter_gain_reduction_db"]
             .as_f64()
             .unwrap();
         assert!((gr_v - (-3.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn state_changed_notification_carries_clock_source_when_wired() {
+        // Wire a SharedClock, flip it to MidiIn, and verify both the
+        // `BridgeNotice` and the wire-frame builder surface the
+        // kebab-case source label. This is the load-bearing field for
+        // the UI BPM-lock badge — without it the badge can't tell when
+        // an external master is providing tempo.
+        let e = engine();
+        let clock = SharedClock::new();
+        clock.set_clock_source(ClockSource::MidiIn);
+        e.attach_shared_clock(clock.clone());
+        let mut rx = e.subscribe();
+        e.submit_event_kind(EventKind::DeckPlay { deck: DeckId::A }, EventSource::Ui);
+        let n = rx.try_recv().expect("notification queued");
+        match n {
+            BridgeNotice::StateChanged { clock_source, .. } => {
+                assert_eq!(clock_source, ClockSource::MidiIn);
+            }
+            BridgeNotice::AudioAlert { .. } | BridgeNotice::DecodeError { .. } => {
+                panic!("expected StateChanged")
+            }
+        }
+        // Wire frame must serialize the kebab-case label, NOT a numeric
+        // discriminant — the UI's `ClockSourceLabel` is a string union.
+        let frame =
+            state_changed_notification(&EngineState::default(), 1, 0.0, ClockSource::MidiIn);
+        let payload = serde_json::to_value(&frame).unwrap();
+        assert_eq!(payload["params"]["clock_source"], "midi_in");
+        let frame2 =
+            state_changed_notification(&EngineState::default(), 1, 0.0, ClockSource::AbletonLink);
+        let payload2 = serde_json::to_value(&frame2).unwrap();
+        assert_eq!(payload2["params"]["clock_source"], "ableton_link");
+        let frame3 =
+            state_changed_notification(&EngineState::default(), 1, 0.0, ClockSource::Internal);
+        let payload3 = serde_json::to_value(&frame3).unwrap();
+        assert_eq!(payload3["params"]["clock_source"], "internal");
     }
 
     #[test]

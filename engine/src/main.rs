@@ -221,6 +221,12 @@ async fn main() -> Result<()> {
     // into the bridge so every outgoing `engine.state_changed`
     // notification carries the live GR value for the UI meter.
     engine.attach_master_limiter_gr(stream.master_limiter_gr.clone());
+    // Wire the SharedClock into the bridge so every outgoing
+    // `engine.state_changed` notification carries the active
+    // `clock_source` (Internal / MidiIn / AbletonLink) for the UI
+    // BPM-lock badge. The MIDI clock-IN callback flips this byte on
+    // 0xFA / 0xFC so the badge reacts to the master's transport.
+    engine.attach_shared_clock(clock.shared.clone());
 
     // Control-thread loop runs on a dedicated OS thread so it doesn't
     // block the async runtime.

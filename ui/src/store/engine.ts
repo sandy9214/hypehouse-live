@@ -12,6 +12,37 @@ import type { JsonRpcNotification } from "../ws/client";
 export type DeckId = "A" | "B";
 
 /**
+ * Active tempo source for the master clock. Mirrors the engine-side
+ * `audio::clock::ClockSource` enum (engine/src/audio/clock.rs). Wire
+ * label is the stable kebab-case string the engine emits on every
+ * `engine.state_changed` payload as a sibling of `state`:
+ *   - `"internal"`     — engine drives its own master_bpm (default).
+ *   - `"midi_in"`      — external MIDI clock master is locked in.
+ *   - `"ableton_link"` — peer session is driving the tempo (future).
+ *
+ * Keep this union in lockstep with `ClockSource::as_str` on the engine
+ * side; mismatches collapse to `"internal"` via `normaliseClockSource`.
+ */
+export type ClockSource = "internal" | "midi_in" | "ableton_link";
+
+const VALID_CLOCK_SOURCES: ReadonlyArray<ClockSource> = [
+  "internal",
+  "midi_in",
+  "ableton_link",
+];
+
+/** Coerce an unknown wire value to a known `ClockSource`. Defends the
+ * mirror against a future engine that ships a variant the UI doesn't
+ * recognise yet — unknown source = treat as `internal` (badge falls
+ * back to the no-lock state rather than glitching). */
+const normaliseClockSource = (raw: unknown): ClockSource => {
+  if (typeof raw === "string" && (VALID_CLOCK_SOURCES as string[]).includes(raw)) {
+    return raw as ClockSource;
+  }
+  return "internal";
+};
+
+/**
  * Single effect slot mirror of engine `EffectSlot` (engine/src/state.rs).
  * `effect_id` = 0 means empty. `params` is a string→number map keyed
  * by the param descriptor's `name`.
@@ -72,6 +103,14 @@ export interface EngineState {
    * `MasterControls` vertical meter.
    */
   master_limiter_gain_reduction_db: number;
+  /**
+   * Active tempo source at the moment the last `engine.state_changed`
+   * notification was published. Like `master_limiter_gain_reduction_db`
+   * this is a live audio-thread measurement (sourced from the engine's
+   * `SharedClock` atomic) and rides on the envelope rather than inside
+   * `state`. Drives the BPM-lock badge in `MasterControls`.
+   */
+  clock_source: ClockSource;
 }
 
 type Listener = () => void;
@@ -116,6 +155,7 @@ const emptyEngineState = (): EngineState => ({
   master_limiter_enabled: true,
   master_limiter_threshold_db: DEFAULT_MASTER_LIMITER_THRESHOLD_DB,
   master_limiter_gain_reduction_db: 0,
+  clock_source: "internal",
 });
 
 let current: EngineState = emptyEngineState();
@@ -225,6 +265,10 @@ interface StateChangedPayload {
   state?: Partial<EngineState>;
   last_event_id?: number;
   master_limiter_gain_reduction_db?: number;
+  /** Sibling field — see `ClockSource` jsdoc. Engine emits the
+   * kebab-case label; `normaliseClockSource` defends the mirror
+   * against unknown variants. */
+  clock_source?: unknown;
 }
 
 /**
@@ -266,6 +310,13 @@ const mergeState = (
     typeof payload.master_limiter_gain_reduction_db === "number"
       ? payload.master_limiter_gain_reduction_db
       : prev.master_limiter_gain_reduction_db;
+  // `clock_source` also rides on the envelope. Omitted = stick with
+  // previous value so older engines (pre-this-PR) don't reset the
+  // badge on every push.
+  const source =
+    payload.clock_source === undefined
+      ? prev.clock_source
+      : normaliseClockSource(payload.clock_source);
   return {
     decks,
     crossfader: patch.crossfader ?? prev.crossfader,
@@ -276,6 +327,7 @@ const mergeState = (
     master_limiter_threshold_db:
       patch.master_limiter_threshold_db ?? prev.master_limiter_threshold_db,
     master_limiter_gain_reduction_db: gr,
+    clock_source: source,
   };
 };
 

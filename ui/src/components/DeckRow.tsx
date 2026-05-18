@@ -128,6 +128,7 @@ export const DeckRow = ({ client: external }: DeckRowProps = {}): JSX.Element =>
         enabled={state.master_limiter_enabled}
         thresholdDb={state.master_limiter_threshold_db}
         gainReductionDb={state.master_limiter_gain_reduction_db}
+        clockSource={state.clock_source}
       />
       <div
         style={{
