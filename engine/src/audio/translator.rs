@@ -180,6 +180,20 @@ pub fn event_to_commands_with_errors(
                 },
             });
         }
+        EventKind::SetCrossfaderCurve { .. } => {
+            // Read the reducer-finalized curve so the audio thread +
+            // state log always agree (mirrors the limiter pattern).
+            // Curve switch is metadata only — no smoothing needed; the
+            // gain lookup re-evaluates at the next render block, and
+            // the per-sample crossfader value is already ramp-smoothed
+            // by the `Crossfader` command on the same frame.
+            out.push(AudioCommand {
+                at_frame: now_frame,
+                kind: AudioCommandKind::SetCrossfaderCurve {
+                    curve: next.crossfader_curve,
+                },
+            });
+        }
         EventKind::EqAdjust { deck, band, .. } => {
             let target = match band {
                 EqBand::Low => next.deck_ref(*deck).eq_low_db,

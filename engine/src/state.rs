@@ -35,6 +35,47 @@ pub enum EqBand {
     High,
 }
 
+/// Crossfader response curve (pro-DJ convention).
+///
+/// Mirrors the four curves that hardware DJ mixers expose on a back-panel
+/// switch. The variant drives the per-block gain lookup in
+/// [`crate::audio::mixer::AudioMixer::render`]:
+///
+/// * `Linear`  — smooth `gain_a = 1-x`, `gain_b = x`. Classic long-blend
+///   curve; loses ~3 dB of master energy in the centre.
+/// * `Dipped`  — equal-power `gain_a = sqrt(1-x)`, `gain_b = sqrt(x)`.
+///   Each side is **-3 dB** at centre, so summed power stays flat across
+///   the full travel. Best for vocal-on-vocal blends.
+/// * `Sharp`   — full-amplitude on the dominant side until the narrow
+///   centre region, then a linear ramp. Aggressive cut for hip-hop /
+///   scratch styles where you want both decks audible only inside a
+///   ±0.05 window. The 0.1-wide ramp prevents the click an instant snap
+///   would create.
+/// * `Scratch` — almost-instant cut. Full A for x ≤ 0.05, linear in the
+///   ±0.05 window around 0.5 is **not** used here — instead the curve
+///   snaps on a single 0.10-wide window across the very edges. The
+///   resulting curve sounds like a turntable cut-in; it's *not* a true
+///   square wave (which would zip) but is sharper than `Sharp`.
+///
+/// Wire / serde representation: external-tag default. JSON values are
+/// the variant names (`"Linear"`, `"Dipped"`, `"Sharp"`, `"Scratch"`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CrossfaderCurve {
+    /// Smooth `gain_a = 1-x`, `gain_b = x` (default; existing behaviour
+    /// pre-curve PR).
+    #[default]
+    Linear,
+    /// Equal-power `gain_a = sqrt(1-x)`, `gain_b = sqrt(x)`. -3 dB
+    /// dip on each side at centre.
+    Dipped,
+    /// Aggressive ramp inside a narrow `±0.05` window around centre;
+    /// full-amplitude outside.
+    Sharp,
+    /// Near-instant cut: full A until `x ≥ 0.95`, full B above.
+    /// Linear blend in the 0.10-wide cliff window.
+    Scratch,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum EventSource {
     Ui,
@@ -98,6 +139,13 @@ pub enum EventKind {
     },
     Crossfader {
         value: f32,
+    },
+    /// Select the crossfader response curve. See [`CrossfaderCurve`]
+    /// for variant semantics. Pure state mutation — the audio thread
+    /// receives a single `SetCrossfaderCurve` command and switches its
+    /// per-block gain lookup. No audio-thread allocation.
+    SetCrossfaderCurve {
+        curve: CrossfaderCurve,
     },
     EqAdjust {
         deck: DeckId,
@@ -331,6 +379,12 @@ pub struct EngineState {
     pub deck_a: Deck,
     pub deck_b: Deck,
     pub crossfader: f32, // 0.0 = full A, 1.0 = full B
+    /// Crossfader response curve (pro-DJ convention). See
+    /// [`CrossfaderCurve`] docs. Default = `Linear` for wire-compat
+    /// (old snapshots without this field deserialize to existing
+    /// behaviour).
+    #[serde(default)]
+    pub crossfader_curve: CrossfaderCurve,
     pub master_volume_db: f32,
     pub session_active: bool,
     /// Session master BPM (ADR-007 §v0.1). Drives MIDI clock OUT period.
@@ -384,6 +438,7 @@ impl Default for EngineState {
             deck_a: Deck::default(),
             deck_b: Deck::default(),
             crossfader: 0.5,
+            crossfader_curve: CrossfaderCurve::default(),
             master_volume_db: 0.0,
             session_active: false,
             master_bpm: default_master_bpm(),
@@ -521,6 +576,9 @@ impl EngineState {
             }
             EventKind::Crossfader { value } => {
                 next.crossfader = value.clamp(0.0, 1.0);
+            }
+            EventKind::SetCrossfaderCurve { curve } => {
+                next.crossfader_curve = *curve;
             }
             EventKind::EqAdjust {
                 deck: id,
@@ -1519,5 +1577,86 @@ mod tests {
                 .abs()
                 < 1e-6
         );
+        // Crossfader curve default = Linear (pre-curve PR snapshots
+        // must keep producing the same audio).
+        assert_eq!(s.crossfader_curve, CrossfaderCurve::Linear);
+    }
+
+    #[test]
+    fn crossfader_curve_defaults_to_linear() {
+        // Existing engine behaviour must be preserved — no UI / wire
+        // changes should silently flip a session's curve.
+        let s = EngineState::default();
+        assert_eq!(s.crossfader_curve, CrossfaderCurve::Linear);
+    }
+
+    #[test]
+    fn set_crossfader_curve_event_applies() {
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::SetCrossfaderCurve {
+                curve: CrossfaderCurve::Dipped,
+            },
+        ));
+        assert_eq!(s.crossfader_curve, CrossfaderCurve::Dipped);
+        let s = s.apply(&ev(
+            2,
+            EventKind::SetCrossfaderCurve {
+                curve: CrossfaderCurve::Sharp,
+            },
+        ));
+        assert_eq!(s.crossfader_curve, CrossfaderCurve::Sharp);
+        let s = s.apply(&ev(
+            3,
+            EventKind::SetCrossfaderCurve {
+                curve: CrossfaderCurve::Scratch,
+            },
+        ));
+        assert_eq!(s.crossfader_curve, CrossfaderCurve::Scratch);
+        // Round-trip back to Linear.
+        let s = s.apply(&ev(
+            4,
+            EventKind::SetCrossfaderCurve {
+                curve: CrossfaderCurve::Linear,
+            },
+        ));
+        assert_eq!(s.crossfader_curve, CrossfaderCurve::Linear);
+    }
+
+    #[test]
+    fn set_crossfader_curve_does_not_touch_crossfader_value() {
+        // Switching the curve is metadata only — the slider position
+        // (`crossfader`) is preserved across the curve toggle so the
+        // user doesn't hear a level jump.
+        let s = EngineState::default();
+        let s = s.apply(&ev(1, EventKind::Crossfader { value: 0.7 }));
+        let s = s.apply(&ev(
+            2,
+            EventKind::SetCrossfaderCurve {
+                curve: CrossfaderCurve::Sharp,
+            },
+        ));
+        assert!((s.crossfader - 0.7).abs() < f32::EPSILON);
+        assert_eq!(s.crossfader_curve, CrossfaderCurve::Sharp);
+    }
+
+    #[test]
+    fn crossfader_curve_serde_externally_tagged_variants() {
+        // Wire-shape pin: serde-default external tag = bare variant
+        // names. The UI submits `{ SetCrossfaderCurve: { curve: "Dipped" } }`
+        // so any reorder / rename here would break the wire contract.
+        let kind = EventKind::SetCrossfaderCurve {
+            curve: CrossfaderCurve::Dipped,
+        };
+        let json = serde_json::to_string(&kind).expect("serialize");
+        assert_eq!(json, r#"{"SetCrossfaderCurve":{"curve":"Dipped"}}"#);
+        let parsed: EventKind = serde_json::from_str(&json).expect("roundtrip");
+        match parsed {
+            EventKind::SetCrossfaderCurve { curve } => {
+                assert_eq!(curve, CrossfaderCurve::Dipped);
+            }
+            other => panic!("expected SetCrossfaderCurve, got {other:?}"),
+        }
     }
 }

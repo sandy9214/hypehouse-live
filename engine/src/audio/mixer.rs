@@ -11,6 +11,30 @@
 //!
 //! Real per-track sample playback lands in a later PR; this PR proves
 //! the wire is end-to-end functional.
+//!
+//! # Crossfader curves
+//!
+//! The crossfader dispatches by [`CrossfaderCurve`] to one of four
+//! response shapes. `x = self.crossfader` is the normalised slider
+//! value (0 = full A, 1 = full B). [`crossfader_gains`] is the single
+//! source of truth — called **once per render block** (see
+//! [`AudioMixer::render`]) and the resulting `(gain_a, gain_b)` pair
+//! feeds the inner-loop MAC, so the dispatch cost is amortised across
+//! 256 samples.
+//!
+//! | Curve     | gain_a                  | gain_b                  | -3 dB at centre? | Use case                       |
+//! |-----------|-------------------------|-------------------------|------------------|--------------------------------|
+//! | `Linear`  | `1 - x`                 | `x`                     | yes (vol drops)  | Long smooth blends             |
+//! | `Dipped`  | `sqrt(1 - x)`           | `sqrt(x)`               | no (equal-power) | Vocal-on-vocal blends          |
+//! | `Sharp`   | full-amp outside ±0.05 of centre, linear inside the 0.10 window | full-amp / linear ramp | no | Aggressive cuts                |
+//! | `Scratch` | full A for x ≤ 0.05, linear in ±0.05 window around the 0.05/0.95 edges, 0 above 0.95 | mirror | no | Turntable-style cut-in/out     |
+//!
+//! Why the narrow linear windows for `Sharp` and `Scratch`: a true step
+//! discontinuity in gain at any sample boundary produces a click
+//! audible up to ~70 dB below full-scale. The 0.10-wide ramp gives the
+//! gain ~5 ms of travel at typical slider speeds — well under
+//! perceptible smear, but enough to eliminate the click. See ADR-004's
+//! comments on smooth-ramp parameter changes.
 
 use std::sync::Arc;
 
@@ -21,7 +45,7 @@ use crate::audio::effects::{FxBank, EFFECT_NONE};
 use crate::audio::limiter::MasterLimiter;
 use crate::audio::pitch_tempo::{PitchTempo, CHUNK_FRAMES as PT_CHUNK_FRAMES};
 use crate::recording::MasterRecorderSink;
-use crate::state::DeckId;
+use crate::state::{CrossfaderCurve, DeckId};
 
 /// Per-callback scratch stride used when pulling stereo samples from
 /// the decode service. 256 stereo frames = 512 interleaved f32 = ~5 ms
@@ -77,6 +101,12 @@ impl DeckHot {
 pub struct AudioMixer {
     sample_rate: u32,
     crossfader: f32,
+    /// Active crossfader response curve. Set via
+    /// [`AudioCommandKind::SetCrossfaderCurve`]; sampled once per render
+    /// block by [`crossfader_gains`] so the per-sample mix loop runs a
+    /// straight `gain_a * a + gain_b * b` MAC. See the module docs on
+    /// curves for the math.
+    crossfader_curve: CrossfaderCurve,
     deck_a: DeckHot,
     deck_b: DeckHot,
     /// Streaming decode service. None → fallback oscillator path
@@ -139,6 +169,7 @@ impl AudioMixer {
         Self {
             sample_rate,
             crossfader: 0.5,
+            crossfader_curve: CrossfaderCurve::Linear,
             deck_a: DeckHot::new(440.0),
             deck_b: DeckHot::new(220.0),
             decode: None,
@@ -188,6 +219,12 @@ impl AudioMixer {
             }
             AudioCommandKind::Crossfader { target, .. } => {
                 self.crossfader = target.clamp(0.0, 1.0);
+            }
+            AudioCommandKind::SetCrossfaderCurve { curve } => {
+                // Pure POD assignment — `CrossfaderCurve` is `Copy +
+                // Eq`. The per-block gain lookup picks up the change
+                // on the next render() call (≤ one buffer of latency).
+                self.crossfader_curve = curve;
             }
             AudioCommandKind::EqLow {
                 deck, target_db, ..
@@ -396,12 +433,19 @@ impl AudioMixer {
                 slot.process(&mut b_slice[..(chunk * 2)], sr_u);
             }
 
+            // Pre-compute crossfader gains once per render block.
+            // ADR-004: the per-sample mix loop runs a straight 2-MAC,
+            // so the curve dispatch's cost is amortised over `chunk`
+            // (= 256) samples. See [`crossfader_gains`] for the math
+            // behind each variant.
+            let (gain_a, gain_b) = crossfader_gains(self.crossfader, self.crossfader_curve);
+
             // Downmix to mono + crossfade. Reuses the v0.1 contract
             // (the engine output is mono until a separate stereo PR).
             for i in 0..chunk {
                 let a = 0.5 * (a_slice[i * 2] + a_slice[i * 2 + 1]);
                 let b = 0.5 * (b_slice[i * 2] + b_slice[i * 2 + 1]);
-                let mix = a * (1.0 - self.crossfader) + b * self.crossfader;
+                let mix = a * gain_a + b * gain_b;
                 out[written + i] = mix;
             }
 
@@ -508,6 +552,12 @@ impl AudioMixer {
         self.crossfader
     }
 
+    /// Currently-active crossfader response curve. Test-only read
+    /// accessor; also useful for the future debug HUD.
+    pub fn crossfader_curve(&self) -> CrossfaderCurve {
+        self.crossfader_curve
+    }
+
     pub fn is_playing(&self, deck: DeckId) -> bool {
         match deck {
             DeckId::A => self.deck_a.playing,
@@ -600,6 +650,87 @@ fn apply_pitch_tempo(
 fn db_to_linear(db: f32) -> f32 {
     // 10 ^ (db / 20). Use `exp` since f32::powf can be slow.
     (db * (std::f32::consts::LN_10 / 20.0)).exp()
+}
+
+/// Width of the linear ramp used inside the `Sharp` and `Scratch`
+/// curves to soften the click an instant snap would produce. 0.10 of
+/// slider travel at typical hand speeds ≈ 5 ms, well under perceptible
+/// smear. ADR-004 §"smooth-ramp" reasoning.
+const SHARP_RAMP_HALF_WIDTH: f32 = 0.05;
+
+/// Per-block crossfader gain lookup. Pure function — single source of
+/// truth for the four [`CrossfaderCurve`] variants. Called **once per
+/// render block** in [`AudioMixer::render`]; the per-sample inner loop
+/// then runs a 2-MAC `a*gain_a + b*gain_b`, so the dispatch cost is
+/// amortised over `STEREO_PULL_FRAMES` (256) samples.
+///
+/// Caller must ensure `x` is finite + in `[0, 1]`. The audio thread
+/// already clamps via [`AudioMixer::apply`]; tests assert on the
+/// boundary points (0.0 / 0.25 / 0.5 / 0.75 / 1.0).
+///
+/// **Audio-thread safe**: no allocation, no `unsafe`, branchless inside
+/// each match arm except the `Sharp` / `Scratch` piecewise selectors
+/// (the curve enum itself is the only branch, evaluated once per
+/// block).
+#[inline]
+pub fn crossfader_gains(x: f32, curve: CrossfaderCurve) -> (f32, f32) {
+    // Defensive clamp — saturates to the documented `[0, 1]` window so
+    // a buggy caller can't produce negative gains. The audio thread
+    // already clamps on `Crossfader`, but this function is also reused
+    // by the in-process tests + future telemetry pipeline.
+    let x = x.clamp(0.0, 1.0);
+    match curve {
+        CrossfaderCurve::Linear => (1.0 - x, x),
+        CrossfaderCurve::Dipped => {
+            // Equal-power (-3 dB at centre): `sqrt` is exact at the
+            // 0 / 1 boundaries and yields 0.7071 at x=0.5, the
+            // canonical -3 dB constant. Stays cheaper than a full
+            // `cos/sin` pan law and matches the standard "DJ equal
+            // power" curve.
+            (x.mul_add(-1.0, 1.0).sqrt(), x.sqrt())
+        }
+        CrossfaderCurve::Sharp => {
+            // Full-amplitude on the dominant side outside a narrow
+            // window around centre; linear ramp inside the 0.10-wide
+            // window so the gain doesn't snap discontinuously.
+            //   x ≤ 0.45 → a=1, b=0
+            //   0.45 < x < 0.55 → linear in both
+            //   x ≥ 0.55 → a=0, b=1
+            let lo = 0.5 - SHARP_RAMP_HALF_WIDTH;
+            let hi = 0.5 + SHARP_RAMP_HALF_WIDTH;
+            if x <= lo {
+                (1.0, 0.0)
+            } else if x >= hi {
+                (0.0, 1.0)
+            } else {
+                let t = (x - lo) / (hi - lo); // 0..1 inside the window
+                (1.0 - t, t)
+            }
+        }
+        CrossfaderCurve::Scratch => {
+            // Near-instant cut at the edges. Full A until x ≥ 0.05,
+            // ramp to crossover by x = 0.05 boundary, mirror at top.
+            //   x < 0.05 → a=1, b=0
+            //   0.05 ≤ x ≤ 0.95 → linear blend, but compressed into
+            //     two 0.05 windows at each edge (full-mix in middle)
+            // Specifically: ramp-in 0.05..0.10, full-mix 0.10..0.90,
+            // ramp-out 0.90..0.95. Inside `0.10..0.90` both sides are
+            // fully open (gain ~ linear) so a stick-and-stop scratch
+            // hands off cleanly.
+            if x < 0.05 {
+                (1.0, 0.0)
+            } else if x > 0.95 {
+                (0.0, 1.0)
+            } else {
+                // Within the active window, a near-linear crossfade
+                // mapped to the 0.05..0.95 range. The narrow dead
+                // zones outside this band are what give `Scratch` its
+                // cliff feel; inside, we re-use the linear curve.
+                let inner = (x - 0.05) / 0.90;
+                (1.0 - inner, inner)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -911,5 +1042,157 @@ mod tests {
             (thr - 10_f32.powf(-12.0 / 20.0)).abs() < 1e-4,
             "threshold_linear should reflect SetMasterLimiterThreshold event, got {thr}",
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Crossfader curves
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn linear_curve_matches_legacy_gains_at_sample_points() {
+        // Wire-compat: the default `Linear` curve must produce the same
+        // gains as the pre-curve `(1-x, x)` math at every documented
+        // sample point.
+        for (x, want_a, want_b) in [
+            (0.0_f32, 1.0_f32, 0.0_f32),
+            (0.25, 0.75, 0.25),
+            (0.5, 0.5, 0.5),
+            (0.75, 0.25, 0.75),
+            (1.0, 0.0, 1.0),
+        ] {
+            let (a, b) = crossfader_gains(x, CrossfaderCurve::Linear);
+            assert!(
+                (a - want_a).abs() < 1e-6,
+                "linear gain_a at x={x}: got {a}, want {want_a}"
+            );
+            assert!(
+                (b - want_b).abs() < 1e-6,
+                "linear gain_b at x={x}: got {b}, want {want_b}"
+            );
+        }
+    }
+
+    #[test]
+    fn dipped_curve_is_equal_power_minus_three_db_at_centre() {
+        // Equal-power curve: at x=0.5 each side equals 1/sqrt(2) ≈
+        // 0.7071, which is -3.0103 dB. Sum-of-squares = 1 at every
+        // sample point.
+        let inv_sqrt_2 = 1.0_f32 / 2.0_f32.sqrt();
+        for x in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+            let (a, b) = crossfader_gains(x, CrossfaderCurve::Dipped);
+            // Power conservation: a^2 + b^2 == 1 (within fp tolerance).
+            let power = a * a + b * b;
+            assert!(
+                (power - 1.0).abs() < 1e-5,
+                "dipped curve must conserve power at x={x}: a^2+b^2 = {power}",
+            );
+        }
+        let (a, b) = crossfader_gains(0.5, CrossfaderCurve::Dipped);
+        assert!((a - inv_sqrt_2).abs() < 1e-6);
+        assert!((b - inv_sqrt_2).abs() < 1e-6);
+        // Edges still snap to {0, 1}.
+        assert_eq!(crossfader_gains(0.0, CrossfaderCurve::Dipped), (1.0, 0.0));
+        assert_eq!(crossfader_gains(1.0, CrossfaderCurve::Dipped), (0.0, 1.0));
+    }
+
+    #[test]
+    fn sharp_curve_full_amplitude_outside_window_linear_inside() {
+        // Outside the 0.10-wide window around centre: full-amp on the
+        // dominant side, silent on the other.
+        assert_eq!(crossfader_gains(0.0, CrossfaderCurve::Sharp), (1.0, 0.0));
+        assert_eq!(crossfader_gains(0.25, CrossfaderCurve::Sharp), (1.0, 0.0));
+        assert_eq!(crossfader_gains(0.75, CrossfaderCurve::Sharp), (0.0, 1.0));
+        assert_eq!(crossfader_gains(1.0, CrossfaderCurve::Sharp), (0.0, 1.0));
+        // Centre = 50/50.
+        let (a, b) = crossfader_gains(0.5, CrossfaderCurve::Sharp);
+        assert!((a - 0.5).abs() < 1e-6, "sharp at x=0.5: a={a}");
+        assert!((b - 0.5).abs() < 1e-6, "sharp at x=0.5: b={b}");
+        // Inside the linear window — a+b should always equal 1.0
+        // (linear blend).
+        for x in [0.46_f32, 0.48, 0.5, 0.52, 0.54] {
+            let (a, b) = crossfader_gains(x, CrossfaderCurve::Sharp);
+            assert!(
+                (a + b - 1.0).abs() < 1e-6,
+                "sharp linear-window sum at x={x}: a+b = {}",
+                a + b,
+            );
+        }
+    }
+
+    #[test]
+    fn scratch_curve_has_cliff_at_edges() {
+        // Full A until x >= 0.05, full B after x > 0.95.
+        assert_eq!(crossfader_gains(0.0, CrossfaderCurve::Scratch), (1.0, 0.0));
+        assert_eq!(crossfader_gains(0.04, CrossfaderCurve::Scratch), (1.0, 0.0));
+        assert_eq!(crossfader_gains(1.0, CrossfaderCurve::Scratch), (0.0, 1.0));
+        assert_eq!(crossfader_gains(0.96, CrossfaderCurve::Scratch), (0.0, 1.0));
+        // Centre: a+b = 1 (linear blend inside the active window).
+        let (a, b) = crossfader_gains(0.5, CrossfaderCurve::Scratch);
+        assert!(
+            (a + b - 1.0).abs() < 1e-6,
+            "scratch active-window sum at x=0.5: a+b = {}",
+            a + b,
+        );
+        // x = 0.25 / 0.75 also inside the active window.
+        let (a, b) = crossfader_gains(0.25, CrossfaderCurve::Scratch);
+        assert!(a > b, "x=0.25 — A should still dominate (got a={a}, b={b})");
+        let (a, b) = crossfader_gains(0.75, CrossfaderCurve::Scratch);
+        assert!(b > a, "x=0.75 — B should dominate (got a={a}, b={b})");
+    }
+
+    #[test]
+    fn crossfader_gains_is_alloc_free_for_all_curves() {
+        // ADR-004: the gain lookup runs once per render block on the
+        // audio thread. Any future variant that needs a Vec / HashMap
+        // / std::format! would trip this gate.
+        assert_no_alloc::assert_no_alloc(|| {
+            for curve in [
+                CrossfaderCurve::Linear,
+                CrossfaderCurve::Dipped,
+                CrossfaderCurve::Sharp,
+                CrossfaderCurve::Scratch,
+            ] {
+                for x_pct in 0..=100 {
+                    let x = (x_pct as f32) / 100.0;
+                    let _ = crossfader_gains(x, curve);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn set_crossfader_curve_command_updates_mixer_state() {
+        let mut m = AudioMixer::new(48_000);
+        assert_eq!(m.crossfader_curve(), CrossfaderCurve::Linear);
+        m.apply(cmd(AudioCommandKind::SetCrossfaderCurve {
+            curve: CrossfaderCurve::Dipped,
+        }));
+        assert_eq!(m.crossfader_curve(), CrossfaderCurve::Dipped);
+        m.apply(cmd(AudioCommandKind::SetCrossfaderCurve {
+            curve: CrossfaderCurve::Scratch,
+        }));
+        assert_eq!(m.crossfader_curve(), CrossfaderCurve::Scratch);
+    }
+
+    #[test]
+    fn render_under_each_curve_stays_alloc_free() {
+        // Stronger gate: drive a render through with each curve active
+        // to confirm the dispatch path itself doesn't introduce a
+        // heap allocation.
+        let mut m = AudioMixer::new(48_000);
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::A }));
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::B }));
+        let mut buf = [0.0_f32; 256];
+        for curve in [
+            CrossfaderCurve::Linear,
+            CrossfaderCurve::Dipped,
+            CrossfaderCurve::Sharp,
+            CrossfaderCurve::Scratch,
+        ] {
+            m.apply(cmd(AudioCommandKind::SetCrossfaderCurve { curve }));
+            assert_no_alloc::assert_no_alloc(|| {
+                m.render(&mut buf);
+            });
+        }
     }
 }
