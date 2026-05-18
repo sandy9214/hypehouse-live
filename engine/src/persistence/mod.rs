@@ -43,6 +43,7 @@
 //!   the test suite + ephemeral runs.
 
 pub mod replay;
+pub mod sessions;
 
 use crate::state::Event;
 use anyhow::{Context, Result};

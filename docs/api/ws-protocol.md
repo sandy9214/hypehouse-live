@@ -429,6 +429,91 @@ Reserved `id` values:
 | 3  | reverb  | Schroeder 4-comb + 2-allpass |
 | 4  | gate    | beat-synced gate (master BPM x period_div) |
 
+### `engine.list_sessions`
+
+Enumerate persisted past sessions on disk. Read-only — never touches
+live engine state. Backed by
+`crate::persistence::sessions::list_sessions`, which walks the
+resolved persistence root (`$HYPEHOUSE_EVENT_LOG_DIR` →
+`$XDG_DATA_HOME/hypehouse-live/sessions` → `~/.local/share/...`)
+and returns one summary per directory. Used by the UI History panel.
+
+**Params**: none.
+**Result**: object with a `sessions` array, sorted by `started_at_micros`
+descending (most recent first). Capped at 50 entries. Sessions with an
+unreadable or empty `events.jsonl` still appear (with
+`event_count: 0`, `started_at_micros: null`) so the user can see the
+directory exists.
+
+```json
+{
+  "sessions": [
+    {
+      "id": "20260518T013312Z-a4f2",
+      "started_at_micros": 1779067992000000,
+      "ended_at_micros":   1779071512000000,
+      "event_count": 4823,
+      "has_recording": true,
+      "recording_size_bytes": 2147483648
+    }
+  ]
+}
+```
+
+* `id` — directory name; matches `crate::persistence::new_session_id()`
+  format (`YYYYMMDDTHHMMSSZ-XXXX`).
+* `started_at_micros` / `ended_at_micros` — `ts_micros` of the first /
+  last event in `events.jsonl`. `null` when log is empty / unparseable.
+* `event_count` — JSONL line count (non-empty lines).
+* `has_recording` — `true` only when `master.wav` is present **and**
+  non-empty.
+* `recording_size_bytes` — `master.wav` size in bytes, or `null` when
+  absent.
+
+### `engine.replay_session`
+
+Fold the events of a single past session through `EngineState::apply`
+and return the resulting snapshot. **Read-only** — does NOT mutate live
+engine state. v0.1 returns the snapshot for inspection / UI rendering;
+a future PR can layer "load this snapshot into the engine" on top.
+
+**Params**:
+
+```json
+{ "session_id": "20260518T013312Z-a4f2" }
+```
+
+`session_id` is validated to refuse path traversal (no `/`, `\`, `\0`,
+no leading dot, length ≤ 128). Invalid ids return `-32602`.
+
+**Result**:
+
+```json
+{
+  "state": { "...": "full EngineState snapshot — same shape as engine.snapshot" },
+  "event_count": 4823
+}
+```
+
+A missing or empty `events.jsonl` returns `state = EngineState::default()`
++ `event_count = 0` rather than an error — the UI shows "no events
+yet" without alarming the user.
+
+Errors:
+
+* `-32602 INVALID_PARAMS` — bad `session_id` shape / not found / file
+  parse failure (malformed JSONL line). The error `data` field carries
+  the underlying anyhow chain for debugging.
+
+Replay correctness is bounded by the event-sourced contract: the
+reducer is a pure fold over `Event`s, so any state field derivable
+from events alone reconstructs exactly. Fields that depend on
+wall-clock time (e.g. live track playhead position) are stamped at
+event time and replayed verbatim — the snapshot reflects "where the
+state was at the last event", not "where the audio is now". The
+master mix audio (`master.wav`) is not replayed through this RPC; the
+UI can offer the file path for direct playback.
+
 ### `library.list_tracks` (co-pilot)
 
 Paginated dump of the co-pilot's SQLite track catalog. Exposed by

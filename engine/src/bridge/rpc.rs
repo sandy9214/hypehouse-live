@@ -125,6 +125,14 @@ pub mod method {
     /// ADR-006 — effect manifest. Stubbed: returns `[]` until the full
     /// manifest plumbing lands (issue TBD).
     pub const LIST_EFFECTS: &str = "engine.list_effects";
+    /// History — enumerate persisted past sessions on disk. Read-only.
+    /// Backed by `crate::persistence::sessions::list_sessions`. See
+    /// `docs/api/ws-protocol.md` for the response shape.
+    pub const LIST_SESSIONS: &str = "engine.list_sessions";
+    /// History — replay the events of a single past session and return
+    /// the resulting `EngineState` snapshot. Does NOT mutate live
+    /// state. Backed by `crate::persistence::sessions::replay_session`.
+    pub const REPLAY_SESSION: &str = "engine.replay_session";
     /// In-band bearer-token auth for browser WS clients that cannot set
     /// the `Authorization` header at upgrade. See `auth::AuthState`.
     pub const AUTH_HELLO: &str = "auth.hello";
@@ -403,6 +411,13 @@ fn default_limit() -> u32 {
     1024
 }
 
+/// Params for `engine.replay_session`. Object-typed so future fields
+/// (e.g. `up_to_event_id`) slot in without breaking older clients.
+#[derive(Deserialize, Debug)]
+struct ReplaySessionParams {
+    session_id: String,
+}
+
 /// Params for `auth.hello` — the in-band bearer-token handshake.
 #[derive(Deserialize, Debug)]
 struct AuthHelloParams {
@@ -637,6 +652,39 @@ pub fn dispatch(engine: &EngineHandle, req: RpcRequest) -> RpcResponse {
         // future top-level fields like `version`) rather than a bare
         // array. See docs/api/ws-protocol.md.
         method::LIST_EFFECTS => RpcResponse::ok(id, list_effects_result()),
+        // History — read-only enumeration of past session dirs. Pure
+        // disk I/O; never touches live engine state. Errors are
+        // bubbled as `-32603 internal` because the caller did nothing
+        // wrong — the storage layer is degraded.
+        method::LIST_SESSIONS => match crate::persistence::sessions::list_sessions() {
+            Ok(sessions) => {
+                match serde_json::to_value(crate::persistence::sessions::ListSessionsResult {
+                    sessions,
+                }) {
+                    Ok(v) => RpcResponse::ok(id, v),
+                    Err(e) => RpcResponse::err(id, RpcError::internal(e.to_string())),
+                }
+            }
+            Err(e) => RpcResponse::err(id, RpcError::internal(format!("{e:#}"))),
+        },
+        // History — fold one session's events.jsonl through
+        // `replay_state` and return the snapshot. Read-only.
+        method::REPLAY_SESSION => {
+            let params: ReplaySessionParams = match req.params {
+                Some(v) => match serde_json::from_value(v) {
+                    Ok(p) => p,
+                    Err(e) => return RpcResponse::err(id, RpcError::invalid_params(e.to_string())),
+                },
+                None => return RpcResponse::err(id, RpcError::invalid_params("missing params")),
+            };
+            match crate::persistence::sessions::replay_session(&params.session_id) {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(v) => RpcResponse::ok(id, v),
+                    Err(e) => RpcResponse::err(id, RpcError::internal(e.to_string())),
+                },
+                Err(e) => RpcResponse::err(id, RpcError::invalid_params(format!("{e:#}"))),
+            }
+        }
         other => RpcResponse::err(id, RpcError::method_not_found(other)),
     }
 }
@@ -1103,5 +1151,222 @@ mod tests {
             super::super::error::INVALID_PARAMS
         );
         assert_eq!(new_state, AuthState::PendingAuth);
+    }
+
+    // ---------------------------------------------------------------
+    // engine.list_sessions + engine.replay_session — history surface.
+    //
+    // These tests share process env (`HYPEHOUSE_EVENT_LOG_DIR`) with
+    // the persistence::sessions tests, so we re-use the same one-shot
+    // mutex approach: serialize anything that mutates the env to keep
+    // cargo's parallel runner happy.
+    // ---------------------------------------------------------------
+
+    fn sessions_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn sessions_scratch_root(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("hh-rpc-sessions-{tag}-{pid}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("scratch dir create");
+        dir
+    }
+
+    #[test]
+    fn list_sessions_rpc_returns_empty_envelope_for_empty_root() {
+        let _g = sessions_test_lock();
+        let root = sessions_scratch_root("rpc-empty");
+        std::env::set_var(super::super::super::persistence::ENV_LOG_DIR, &root);
+        let e = engine();
+        let req = submit(method::LIST_SESSIONS, Value::Null, 40);
+        let resp = dispatch(&e, req);
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let result = resp.result.expect("must have result");
+        let sessions = result
+            .get("sessions")
+            .and_then(Value::as_array)
+            .expect("sessions array");
+        assert!(sessions.is_empty(), "expected empty list, got {sessions:?}");
+        std::env::remove_var(super::super::super::persistence::ENV_LOG_DIR);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_sessions_rpc_surfaces_session_summary_fields() {
+        let _g = sessions_test_lock();
+        let root = sessions_scratch_root("rpc-fields");
+        std::env::set_var(super::super::super::persistence::ENV_LOG_DIR, &root);
+
+        // Seed one session with a couple of events + master.wav.
+        let sid = "20260301T010101Z-aaaa";
+        let dir = root.join(sid);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let e1 = Event {
+            id: 1,
+            ts_micros: 1_000_000,
+            source: EventSource::Ui,
+            kind: EventKind::SessionStart,
+        };
+        let e2 = Event {
+            id: 2,
+            ts_micros: 2_000_000,
+            source: EventSource::Ui,
+            kind: EventKind::DeckPlay { deck: DeckId::A },
+        };
+        let mut f = std::fs::File::create(dir.join("events.jsonl")).expect("create events");
+        use std::io::Write as _;
+        writeln!(f, "{}", serde_json::to_string(&e1).unwrap()).unwrap();
+        writeln!(f, "{}", serde_json::to_string(&e2).unwrap()).unwrap();
+        drop(f);
+        std::fs::write(dir.join("master.wav"), b"RIFFfakeWAVE").expect("write wav");
+
+        let e = engine();
+        let req = submit(method::LIST_SESSIONS, Value::Null, 41);
+        let resp = dispatch(&e, req);
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let result = resp.result.expect("result");
+        let sessions = result.get("sessions").and_then(Value::as_array).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s["id"], serde_json::json!(sid));
+        assert_eq!(s["event_count"], serde_json::json!(2));
+        assert_eq!(s["started_at_micros"], serde_json::json!(1_000_000));
+        assert_eq!(s["ended_at_micros"], serde_json::json!(2_000_000));
+        assert_eq!(s["has_recording"], serde_json::json!(true));
+        // master.wav size is a positive number.
+        let size = s["recording_size_bytes"].as_u64().expect("size present");
+        assert!(size > 0);
+
+        std::env::remove_var(super::super::super::persistence::ENV_LOG_DIR);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn replay_session_rpc_returns_reconstructed_state() {
+        let _g = sessions_test_lock();
+        let root = sessions_scratch_root("rpc-replay");
+        std::env::set_var(super::super::super::persistence::ENV_LOG_DIR, &root);
+        let sid = "20260301T020202Z-bbbb";
+        let dir = root.join(sid);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let events = [
+            Event {
+                id: 1,
+                ts_micros: 1,
+                source: EventSource::Ui,
+                kind: EventKind::SessionStart,
+            },
+            Event {
+                id: 2,
+                ts_micros: 2,
+                source: EventSource::Ui,
+                kind: EventKind::Crossfader { value: 0.25 },
+            },
+        ];
+        let mut f = std::fs::File::create(dir.join("events.jsonl")).expect("create events");
+        use std::io::Write as _;
+        for e in &events {
+            writeln!(f, "{}", serde_json::to_string(e).unwrap()).unwrap();
+        }
+        drop(f);
+
+        let e = engine();
+        let req = submit(
+            method::REPLAY_SESSION,
+            serde_json::json!({ "session_id": sid }),
+            42,
+        );
+        let resp = dispatch(&e, req);
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let result = resp.result.expect("result");
+        assert_eq!(result["event_count"], serde_json::json!(2));
+        let state = &result["state"];
+        assert_eq!(state["session_active"], serde_json::json!(true));
+        let crossfader = state["crossfader"].as_f64().unwrap();
+        assert!((crossfader - 0.25).abs() < 1e-6);
+
+        std::env::remove_var(super::super::super::persistence::ENV_LOG_DIR);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn replay_session_rpc_rejects_missing_session_id_param() {
+        let _g = sessions_test_lock();
+        let root = sessions_scratch_root("rpc-missing-id");
+        std::env::set_var(super::super::super::persistence::ENV_LOG_DIR, &root);
+        let e = engine();
+        // Missing params entirely.
+        let req = RpcRequest {
+            jsonrpc: JSONRPC_VERSION.into(),
+            method: method::REPLAY_SESSION.into(),
+            params: None,
+            id: Some(RpcId::Num(43)),
+        };
+        let resp = dispatch(&e, req);
+        assert_eq!(
+            resp.error.unwrap().code,
+            super::super::error::INVALID_PARAMS
+        );
+        // Wrong shape — missing session_id field.
+        let req = submit(method::REPLAY_SESSION, serde_json::json!({}), 44);
+        let resp = dispatch(&e, req);
+        assert_eq!(
+            resp.error.unwrap().code,
+            super::super::error::INVALID_PARAMS
+        );
+        std::env::remove_var(super::super::super::persistence::ENV_LOG_DIR);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn replay_session_rpc_rejects_path_traversal_id() {
+        let _g = sessions_test_lock();
+        let root = sessions_scratch_root("rpc-traversal");
+        std::env::set_var(super::super::super::persistence::ENV_LOG_DIR, &root);
+        let e = engine();
+        // Forward slash — caught by the separator check.
+        let req = submit(
+            method::REPLAY_SESSION,
+            serde_json::json!({ "session_id": "foo/bar" }),
+            45,
+        );
+        let resp = dispatch(&e, req);
+        let err = resp.error.expect("expected error");
+        assert_eq!(err.code, super::super::error::INVALID_PARAMS);
+        assert!(
+            err.data
+                .as_ref()
+                .and_then(Value::as_str)
+                .map(|s| s.contains("path separator"))
+                .unwrap_or(false),
+            "expected path separator error: {err:?}"
+        );
+        // Leading dot — covers `..` parent-dir traversal.
+        let req = submit(
+            method::REPLAY_SESSION,
+            serde_json::json!({ "session_id": "../etc" }),
+            46,
+        );
+        let resp = dispatch(&e, req);
+        let err = resp.error.expect("expected error");
+        assert_eq!(err.code, super::super::error::INVALID_PARAMS);
+        assert!(
+            err.data
+                .as_ref()
+                .and_then(Value::as_str)
+                .map(|s| s.contains("starts with '.'"))
+                .unwrap_or(false),
+            "expected leading-dot error: {err:?}"
+        );
+        std::env::remove_var(super::super::super::persistence::ENV_LOG_DIR);
+        std::fs::remove_dir_all(&root).ok();
     }
 }
