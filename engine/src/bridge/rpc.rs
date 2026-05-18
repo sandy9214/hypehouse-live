@@ -19,7 +19,7 @@
 //! single place that translates JSON-RPC into a typed call.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam::channel::{Sender, TrySendError};
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,7 @@ use tokio::sync::broadcast;
 
 use crate::state::{EngineState, Event, EventKind, EventSource};
 
+use super::auth::AuthConfig;
 use super::error::RpcError;
 
 // ---------------------------------------------------------------------
@@ -118,9 +119,38 @@ pub mod method {
     pub const SNAPSHOT: &str = "engine.snapshot";
     pub const EVENT_LOG: &str = "engine.event_log";
     pub const HEALTH: &str = "engine.health";
+    /// In-band bearer-token auth for browser WS clients that cannot set
+    /// the `Authorization` header at upgrade. See `auth::AuthState`.
+    pub const AUTH_HELLO: &str = "auth.hello";
 
     pub const NOTIFY_STATE_CHANGED: &str = "engine.state_changed";
     pub const NOTIFY_AUDIO_ALERT: &str = "engine.audio_alert";
+}
+
+// ---------------------------------------------------------------------
+// Per-connection auth state — drives the pending-auth gate.
+// ---------------------------------------------------------------------
+
+/// State machine that gates per-connection RPC dispatch.
+///
+/// Browser WebSocket clients cannot attach an `Authorization: Bearer …`
+/// header at HTTP upgrade. They connect in [`AuthState::PendingAuth`] and
+/// must call `auth.hello` as the very first JSON-RPC method. Native
+/// clients (Tauri, Rust integration tests) keep using the header path and
+/// start in [`AuthState::Authed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthState {
+    /// No bearer-token presented yet. Only `auth.hello` is dispatched;
+    /// every other method short-circuits with `AUTH_REJECTED`.
+    PendingAuth,
+    /// Bearer-token already verified (via header or via `auth.hello`).
+    Authed,
+}
+
+impl AuthState {
+    pub fn is_authed(self) -> bool {
+        matches!(self, AuthState::Authed)
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -367,8 +397,121 @@ fn default_limit() -> u32 {
     1024
 }
 
+/// Params for `auth.hello` — the in-band bearer-token handshake.
+#[derive(Deserialize, Debug)]
+struct AuthHelloParams {
+    token: String,
+}
+
+/// Build the success result body for `auth.hello`. Each call gets a
+/// fresh micros-since-UNIX timestamp as a lightweight session marker so
+/// the client can correlate logs without needing a UUID dep.
+fn auth_hello_success_result() -> Value {
+    let session = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+    serde_json::json!({ "authed": true, "session": session })
+}
+
+/// Dispatch helper that handles only the in-band `auth.hello` handshake.
+///
+/// Returns the response envelope plus the **new** auth state. Caller
+/// (WS server task) threads the new state back into its loop so
+/// subsequent methods on the same connection see the transition.
+///
+/// Idempotency: calling `auth.hello` from an already-authed connection
+/// re-validates the token and returns success (no state regression) so
+/// retries / reconnect-and-replay scenarios stay safe.
+pub fn dispatch_auth_hello(
+    auth: &AuthConfig,
+    state: AuthState,
+    req: RpcRequest,
+) -> (RpcResponse, AuthState) {
+    let id = req.id.clone();
+    let params = match req.params.clone() {
+        Some(v) => v,
+        None => {
+            return (
+                RpcResponse::err(id, RpcError::invalid_params("missing params")),
+                state,
+            );
+        }
+    };
+    let parsed: Result<AuthHelloParams, _> = serde_json::from_value(params);
+    let token = match parsed {
+        Ok(p) => p.token,
+        Err(e) => {
+            return (
+                RpcResponse::err(id, RpcError::invalid_params(e.to_string())),
+                state,
+            );
+        }
+    };
+
+    // `check_header` is the same comparator the WS handshake uses — feed
+    // it a `Bearer <token>` string so the token-equality path is shared
+    // and we get its constant-time compare for free.
+    let header_value = format!("Bearer {token}");
+    if auth.check_header(Some(&header_value)) {
+        (
+            RpcResponse::ok(id, auth_hello_success_result()),
+            AuthState::Authed,
+        )
+    } else {
+        (
+            RpcResponse::err(id, RpcError::auth_rejected("invalid token")),
+            state,
+        )
+    }
+}
+
+/// Per-connection dispatch entry-point used by the WS server.
+///
+/// Enforces the pending-auth gate: when `state == PendingAuth`, the only
+/// method allowed through is `auth.hello`; everything else short-circuits
+/// with `-32002 AUTH_REJECTED`. On success, returns the new state so the
+/// caller can promote the connection without an explicit second
+/// round-trip.
+pub fn dispatch_with_auth(
+    engine: &EngineHandle,
+    auth: &AuthConfig,
+    state: AuthState,
+    req: RpcRequest,
+) -> (RpcResponse, AuthState) {
+    if !req.is_valid() {
+        return (
+            RpcResponse::err(
+                req.id,
+                RpcError::invalid_request("jsonrpc must be \"2.0\" and method non-empty"),
+            ),
+            state,
+        );
+    }
+
+    if req.method == method::AUTH_HELLO {
+        return dispatch_auth_hello(auth, state, req);
+    }
+
+    if state == AuthState::PendingAuth {
+        return (
+            RpcResponse::err(req.id, RpcError::auth_rejected("authentication required")),
+            state,
+        );
+    }
+
+    (dispatch(engine, req), state)
+}
+
 /// Translate a JSON-RPC request into a response by dispatching into the
 /// engine handle. No I/O — pure CPU.
+///
+/// Note: this entry-point does **not** consult the in-band auth state.
+/// Callers operating below the WS layer (unit tests, headless smoke
+/// tools, internal integrations) bypass `auth.hello` deliberately — they
+/// have already established trust by direct in-process access. The WS
+/// server uses [`dispatch_with_auth`] instead and gates every per-method
+/// call on `AuthState`.
 pub fn dispatch(engine: &EngineHandle, req: RpcRequest) -> RpcResponse {
     if !req.is_valid() {
         return RpcResponse::err(
@@ -720,5 +863,114 @@ mod tests {
         assert!(!EngineHandle::new().has_event_sink());
         let (tx, _rx) = channel::unbounded::<Event>();
         assert!(EngineHandle::with_event_sink(tx).has_event_sink());
+    }
+
+    // ---------------------------------------------------------------
+    // auth.hello + pending-auth gate.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn auth_hello_with_valid_token_authenticates() {
+        let e = engine();
+        let auth = AuthConfig::with_token("s3cret");
+        let req = submit(
+            method::AUTH_HELLO,
+            serde_json::json!({ "token": "s3cret" }),
+            10,
+        );
+        let (resp, new_state) = dispatch_with_auth(&e, &auth, AuthState::PendingAuth, req);
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let result = resp.result.unwrap();
+        assert_eq!(result["authed"], Value::Bool(true));
+        assert!(result.get("session").is_some());
+        assert_eq!(new_state, AuthState::Authed);
+    }
+
+    #[test]
+    fn auth_hello_with_invalid_token_rejects_and_keeps_pending() {
+        let e = engine();
+        let auth = AuthConfig::with_token("s3cret");
+        let req = submit(
+            method::AUTH_HELLO,
+            serde_json::json!({ "token": "wrong" }),
+            11,
+        );
+        let (resp, new_state) = dispatch_with_auth(&e, &auth, AuthState::PendingAuth, req);
+        let err = resp.error.expect("expected error");
+        assert_eq!(err.code, super::super::error::AUTH_REJECTED);
+        assert_eq!(new_state, AuthState::PendingAuth);
+    }
+
+    #[test]
+    fn auth_hello_is_idempotent_when_already_authed() {
+        let e = engine();
+        let auth = AuthConfig::with_token("s3cret");
+        let req = submit(
+            method::AUTH_HELLO,
+            serde_json::json!({ "token": "s3cret" }),
+            12,
+        );
+        let (resp, new_state) = dispatch_with_auth(&e, &auth, AuthState::Authed, req);
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        assert_eq!(resp.result.unwrap()["authed"], Value::Bool(true));
+        assert_eq!(new_state, AuthState::Authed);
+    }
+
+    #[test]
+    fn pending_auth_gate_blocks_submit_event_with_auth_rejected() {
+        let e = engine();
+        let auth = AuthConfig::with_token("s3cret");
+        let req = submit(
+            method::SUBMIT_EVENT,
+            serde_json::json!({ "kind": { "DeckPlay": { "deck": "A" } } }),
+            13,
+        );
+        let (resp, new_state) = dispatch_with_auth(&e, &auth, AuthState::PendingAuth, req);
+        let err = resp.error.expect("expected auth_rejected");
+        assert_eq!(err.code, super::super::error::AUTH_REJECTED);
+        assert_eq!(new_state, AuthState::PendingAuth);
+        // Engine state must be untouched — gate is before the reducer.
+        assert!(!e.snapshot().deck_a.playing);
+    }
+
+    #[test]
+    fn authed_state_lets_submit_event_through() {
+        // Once the connection is Authed, `submit_event` must reach the
+        // forward_event path. With a wired sink, that surfaces as
+        // `{accepted: true}` and the event landing on the receiver.
+        let (e, rx) = engine_with_sink();
+        let auth = AuthConfig::with_token("s3cret");
+        let req = submit(
+            method::SUBMIT_EVENT,
+            serde_json::json!({ "kind": { "DeckPlay": { "deck": "A" } } }),
+            14,
+        );
+        let (resp, new_state) = dispatch_with_auth(&e, &auth, AuthState::Authed, req);
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        assert_eq!(resp.result.unwrap()["accepted"], Value::Bool(true));
+        assert_eq!(new_state, AuthState::Authed);
+        let ev = rx.try_recv().expect("event forwarded onto sink");
+        match ev.kind {
+            EventKind::DeckPlay { deck: DeckId::A } => {}
+            other => panic!("unexpected event kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_hello_missing_params_is_invalid_params() {
+        let e = engine();
+        let auth = AuthConfig::with_token("s3cret");
+        let req = RpcRequest {
+            jsonrpc: JSONRPC_VERSION.into(),
+            method: method::AUTH_HELLO.into(),
+            params: None,
+            id: Some(RpcId::Num(15)),
+        };
+        let (resp, new_state) = dispatch_with_auth(&e, &auth, AuthState::PendingAuth, req);
+        assert_eq!(
+            resp.error.unwrap().code,
+            super::super::error::INVALID_PARAMS
+        );
+        assert_eq!(new_state, AuthState::PendingAuth);
     }
 }

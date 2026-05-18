@@ -33,8 +33,9 @@
 //! shutdown path drains them before returning.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -45,15 +46,23 @@ use tokio_tungstenite::tungstenite::handshake::server::{
     ErrorResponse, Request as HsRequest, Response as HsResponse,
 };
 use tokio_tungstenite::tungstenite::http::StatusCode;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use super::auth::AuthConfig;
 use super::error::RpcError;
 use super::rpc::{
-    audio_alert_notification, dispatch, state_changed_notification, BridgeNotice, EngineHandle,
-    RpcRequest, RpcResponse,
+    audio_alert_notification, dispatch_with_auth, state_changed_notification, AuthState,
+    BridgeNotice, EngineHandle, RpcRequest, RpcResponse,
 };
+
+/// How long a pending-auth (header-less) connection has to send a
+/// successful `auth.hello` before the server closes the socket with WS
+/// close code 1008 ("policy violation"). Browser clients that never
+/// follow up never get to occupy a slot indefinitely.
+pub const PENDING_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default bridge port. Override via `HYPEHOUSE_WS_PORT`.
 pub const DEFAULT_PORT: u16 = 8765;
@@ -197,11 +206,25 @@ async fn handle_client(
     engine: EngineHandle,
     auth: Arc<AuthConfig>,
 ) -> Result<()> {
-    // Per-connection mutable bag the handshake callback can write into.
-    // We use it to record whether the client passed bearer auth as part
-    // of the WS upgrade. If the env-configured token is missing, we
-    // reject the handshake with 401 before the WS upgrade completes.
+    // Per-connection bag the handshake callback writes into so we know
+    // whether the client presented a valid bearer token at HTTP upgrade.
+    // The callback runs synchronously on the upgrade path; we can't
+    // return data through tungstenite's callback signature, so we share
+    // a flag via Arc<AtomicBool>.
+    //
+    // Three handshake outcomes:
+    //  1. No `Authorization` header at all → accept upgrade in
+    //     pending-auth state. Browser clients land here (they cannot
+    //     attach custom headers to a WS upgrade).
+    //  2. Header present and valid → accept upgrade, promote to authed
+    //     immediately. Native clients (Tauri, Rust integration tests)
+    //     keep this fast-path.
+    //  3. Header present and INVALID → reject upgrade with HTTP 401.
+    //     This matches today's native behavior: an explicit wrong token
+    //     fails fast, no in-band retries.
+    let header_authed = Arc::new(AtomicBool::new(false));
     let auth_check = auth.clone();
+    let header_authed_cb = header_authed.clone();
     // `ErrorResponse` is `http::Response<Option<String>>` and is the
     // signature tungstenite forces on the callback — we can't shrink
     // it. Allow the lint locally so a clean clippy build holds.
@@ -210,23 +233,48 @@ async fn handle_client(
         stream,
         move |req: &HsRequest, response: HsResponse| -> Result<HsResponse, ErrorResponse> {
             if !auth_check.requires_auth() {
+                // No token configured ⇒ no gate. Auth state defaults to
+                // Authed in the caller below.
+                header_authed_cb.store(true, Ordering::SeqCst);
                 return Ok(response);
             }
             let header = req
                 .headers()
                 .get("authorization")
                 .and_then(|v| v.to_str().ok());
-            if auth_check.check_header(header) {
-                Ok(response)
-            } else {
-                let mut resp = ErrorResponse::new(Some("Unauthorized".into()));
-                *resp.status_mut() = StatusCode::UNAUTHORIZED;
-                Err(resp)
+            match header {
+                Some(_) => {
+                    if auth_check.check_header(header) {
+                        header_authed_cb.store(true, Ordering::SeqCst);
+                        Ok(response)
+                    } else {
+                        // Explicit-but-wrong token: fail fast (preserves
+                        // the existing native-client contract).
+                        let mut resp = ErrorResponse::new(Some("Unauthorized".into()));
+                        *resp.status_mut() = StatusCode::UNAUTHORIZED;
+                        Err(resp)
+                    }
+                }
+                None => {
+                    // No header → browser mode. Accept; the client must
+                    // call `auth.hello` within PENDING_AUTH_TIMEOUT.
+                    Ok(response)
+                }
             }
         },
     )
     .await
     .context("ws handshake failed")?;
+
+    // Initial per-connection auth state. If no token is configured
+    // anywhere, the gate is a no-op and we start Authed. Otherwise we
+    // start PendingAuth unless the handshake callback already validated
+    // a bearer header.
+    let initial_state = if !auth.requires_auth() || header_authed.load(Ordering::SeqCst) {
+        AuthState::Authed
+    } else {
+        AuthState::PendingAuth
+    };
 
     let metrics = engine.metrics();
     metrics.ws_clients_connected.fetch_add(1, Ordering::Relaxed);
@@ -291,7 +339,31 @@ async fn handle_client(
 
     // Reader loop — pulls requests out of the WS, dispatches into the
     // engine, pushes responses to the writer mpsc.
-    while let Some(msg) = ws_stream.next().await {
+    //
+    // `auth_state` is owned by this task and threaded through every
+    // dispatch call. While the connection is `PendingAuth` we also wrap
+    // the per-frame read in a 5-second timeout: a silent browser tab
+    // that never sends `auth.hello` gets closed with WS code 1008.
+    let mut auth_state = initial_state;
+    loop {
+        let next = if auth_state == AuthState::PendingAuth {
+            match tokio::time::timeout(PENDING_AUTH_TIMEOUT, ws_stream.next()).await {
+                Ok(msg) => msg,
+                Err(_elapsed) => {
+                    debug!(%peer, "ws pending-auth timeout; closing with code 1008");
+                    let close = Message::Close(Some(CloseFrame {
+                        code: CloseCode::Policy,
+                        reason: "auth.hello timeout".into(),
+                    }));
+                    let _ = out_tx.send(close).await;
+                    break;
+                }
+            }
+        } else {
+            ws_stream.next().await
+        };
+
+        let Some(msg) = next else { break };
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
@@ -301,7 +373,9 @@ async fn handle_client(
         };
         match msg {
             Message::Text(text) => {
-                let resp = handle_request_frame(&engine, text.as_ref());
+                let (resp, new_state) =
+                    handle_request_frame(&engine, &auth, auth_state, text.as_ref());
+                auth_state = new_state;
                 let frame = serde_json::to_string(&resp).unwrap_or_else(|e| {
                     // Encoding our own response shouldn't fail; fall back
                     // to a generic internal-error envelope.
@@ -363,10 +437,19 @@ impl Drop for ConnGuard {
     }
 }
 
-/// Decode a single frame and dispatch. Returns a fully-formed response
-/// envelope (parse + invalid-request errors are surfaced as JSON-RPC
-/// errors rather than as transport-level failures).
-fn handle_request_frame(engine: &EngineHandle, text: &str) -> RpcResponse {
+/// Decode a single frame and dispatch with the in-band auth gate.
+///
+/// Returns the response envelope **and** the new `AuthState` for the
+/// connection — `auth.hello` is the only method that can mutate state,
+/// every other method is a no-op on it. Parse + invalid-request errors
+/// surface as JSON-RPC errors rather than as transport-level failures
+/// (and never promote auth).
+fn handle_request_frame(
+    engine: &EngineHandle,
+    auth: &AuthConfig,
+    state: AuthState,
+    text: &str,
+) -> (RpcResponse, AuthState) {
     let req: RpcRequest = match serde_json::from_str(text) {
         Ok(r) => r,
         Err(e) => {
@@ -375,19 +458,23 @@ fn handle_request_frame(engine: &EngineHandle, text: &str) -> RpcResponse {
             // model "no id" as `None`, which serializes to absent. Some
             // clients require `"id": null` explicitly; we leave it
             // absent which is also spec-compliant.
-            return RpcResponse::err(
-                None,
-                // Parse errors map to -32700 per spec, but the test suite
-                // for this PR specifies "-32600 invalid request" for the
-                // malformed-JSON case (the engine framing requirement).
-                // We follow that contract: caller asked for -32600 on
-                // malformed payloads. The parse_error variant remains
-                // available for future use.
-                RpcError::invalid_request(format!("malformed JSON-RPC payload: {e}")),
+            return (
+                RpcResponse::err(
+                    None,
+                    // Parse errors map to -32700 per spec, but the test
+                    // suite for this PR specifies "-32600 invalid
+                    // request" for the malformed-JSON case (the engine
+                    // framing requirement). We follow that contract:
+                    // caller asked for -32600 on malformed payloads.
+                    // The parse_error variant remains available for
+                    // future use.
+                    RpcError::invalid_request(format!("malformed JSON-RPC payload: {e}")),
+                ),
+                state,
             );
         }
     };
-    dispatch(engine, req)
+    dispatch_with_auth(engine, auth, state, req)
 }
 
 #[cfg(test)]
@@ -571,7 +658,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_bearer_token_rejects_handshake() {
+    async fn header_auth_modes_and_in_band_pending_state() {
+        // Contract under test (post-`auth.hello`):
+        //   * No header at all → handshake ACCEPTED into PendingAuth.
+        //   * Header present and WRONG → handshake REJECTED (HTTP 401).
+        //   * Header present and RIGHT → handshake accepted, Authed.
         let engine = EngineHandle::new();
         let server = spawn(
             cfg_with(ephemeral_loopback(), AuthConfig::with_token("sekret")),
@@ -580,17 +671,28 @@ mod tests {
         .await
         .unwrap();
 
-        // Plain connect — no Authorization header → must be rejected.
-        let result = tokio_tungstenite::connect_async(ws_url(server.local_addr).await).await;
-        assert!(result.is_err(), "expected handshake rejection");
+        // 1. No header → upgrade accepted (browser-mode).
+        let plain = tokio_tungstenite::connect_async(ws_url(server.local_addr).await).await;
+        let (mut ws_plain, _) = plain.expect("no-header upgrade must be accepted now");
+        ws_plain.close(None).await.ok();
 
-        // With the right header it succeeds.
+        // 2. Explicit wrong header → still rejected at the handshake.
         let url = ws_url(server.local_addr).await;
-        let mut req = url.into_client_request().unwrap();
-        req.headers_mut()
+        let mut bad = url.clone().into_client_request().unwrap();
+        bad.headers_mut()
+            .insert("Authorization", "Bearer WRONG".parse().unwrap());
+        let bad_result = tokio_tungstenite::connect_async(bad).await;
+        assert!(
+            bad_result.is_err(),
+            "explicit wrong token must fail at WS handshake"
+        );
+
+        // 3. Right header → success.
+        let mut good = url.into_client_request().unwrap();
+        good.headers_mut()
             .insert("Authorization", "Bearer sekret".parse().unwrap());
-        let (mut ws, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
-        ws.close(None).await.ok();
+        let (mut ws_ok, _) = tokio_tungstenite::connect_async(good).await.unwrap();
+        ws_ok.close(None).await.ok();
 
         server.shutdown().await.unwrap();
     }
