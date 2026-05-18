@@ -158,7 +158,7 @@ export const EffectRack = ({
       aria-label={`effects-rack-${deck}`}
     >
       <span style={headerStyle}>EFFECTS</span>
-      <div style={rowStyle}>
+      <div className="hh-effect-rack-row" style={rowStyle}>
         {effects.map(
           (slot, i): JSX.Element => (
             <div

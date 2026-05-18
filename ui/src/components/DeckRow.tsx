@@ -14,21 +14,21 @@
 import { useEffect, useMemo, useState } from "react";
 import { Deck } from "./Deck";
 import { Crossfader } from "./Crossfader";
-import { Library } from "./Library";
 import { MasterControls } from "./MasterControls";
+import { MobileDeckSwiper } from "./MobileDeckSwiper";
 import { PerfDashboard } from "./PerfDashboard";
 import { PresetPanel } from "./PresetPanel";
-import { Sessions } from "./Sessions";
+import { SecondaryPanel, type SecondaryTab } from "./SecondaryPanel";
 import { JsonRpcWS } from "../ws/client";
 import { applyNotification, useEngineState } from "../store/engine";
 import { applyDecodeErrorNotification } from "../store/notifications";
 import { applyPerfNotification } from "../store/perf";
+import { useViewport } from "../hooks/useViewport";
+import { RESPONSIVE_CSS } from "./responsive.css";
 
-/** Which secondary surface the user is looking at — live mixing
- * (default) or the read-only past-sessions History panel. Lives at
- * the DeckRow level so the toggle button can stay in the main
- * decks chrome; only the bottom slot swaps. */
-type SecondaryTab = "live" | "history";
+// SecondaryTab type lives with SecondaryPanel — re-exported under the
+// same name from this module previously, so existing internal
+// references continue to compile.
 
 const wsUrl = (): string => {
   // Vite dev server proxies /ws to the Rust engine; prod build can
@@ -47,6 +47,10 @@ const token = (): string => {
   return env?.VITE_BRIDGE_TOKEN ?? "dev-token";
 };
 
+// Responsive CSS lives in ./responsive.css.ts so DeckRow.tsx stays
+// under the 250-line per-component budget. The string is injected
+// once at the root of the deck tree via a <style> tag.
+
 export interface DeckRowProps {
   /** Optional shared JSON-RPC client. When provided, DeckRow uses it
    * instead of constructing its own — the lifecycle (subscribe +
@@ -64,6 +68,12 @@ export const DeckRow = ({ client: external }: DeckRowProps = {}): JSX.Element =>
   );
   const state = useEngineState();
   const [tab, setTab] = useState<SecondaryTab>("live");
+  const viewport = useViewport();
+  // Mobile library drawer state. On desktop / tablet the library is a
+  // fixed bottom panel; on mobile it overlays the deck on demand to
+  // free up real-estate for the active deck. Default closed on first
+  // mount — user taps "Library" to reveal.
+  const [libraryOpen, setLibraryOpen] = useState<boolean>(false);
 
   const ownsClient = external === undefined;
   useEffect((): (() => void) => {
@@ -114,8 +124,41 @@ export const DeckRow = ({ client: external }: DeckRowProps = {}): JSX.Element =>
     };
   }, [client, state]);
 
+  // Viewport-aware deck region. Mobile uses MobileDeckSwiper (single
+  // deck + swipe). Tablet stacks the decks vertically. Desktop keeps
+  // the existing side-by-side flex row — explicitly the legacy path so
+  // the 259 baseline tests (which run in jsdom with default 1024 width)
+  // continue to find both decks side-by-side.
+  const deckRegion = ((): JSX.Element => {
+    if (viewport === "mobile") {
+      return (
+        <MobileDeckSwiper
+          decks={[state.decks[0], state.decks[1]]}
+          client={client}
+        />
+      );
+    }
+    // Tablet (stacked) + desktop (side-by-side) share the same JSX —
+    // CSS media query at 768-1023 px flips the flex-direction via the
+    // `.hh-deck-stack` class. Default (desktop) is row.
+    return (
+      <div
+        data-testid="deck-stack"
+        className="hh-deck-stack"
+        style={{ display: "flex", flex: 1, minHeight: 0 }}
+      >
+        <Deck deck={state.decks[0]} side="left" client={client} />
+        <Deck deck={state.decks[1]} side="right" client={client} />
+      </div>
+    );
+  })();
+
+  const isMobile = viewport === "mobile";
+
   return (
     <div
+      className="hh-responsive-root"
+      data-viewport={viewport}
       style={{
         display: "flex",
         flexDirection: "column",
@@ -123,10 +166,8 @@ export const DeckRow = ({ client: external }: DeckRowProps = {}): JSX.Element =>
         background: "#000",
       }}
     >
-      <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
-        <Deck deck={state.decks[0]} side="left" client={client} />
-        <Deck deck={state.decks[1]} side="right" client={client} />
-      </div>
+      <style>{RESPONSIVE_CSS}</style>
+      {deckRegion}
       <Crossfader client={client} value={state.crossfader} />
       <MasterControls
         client={client}
@@ -141,57 +182,14 @@ export const DeckRow = ({ client: external }: DeckRowProps = {}): JSX.Element =>
         decks={state.decks}
         crossfaderCurve={state.crossfader_curve}
       />
-      <div
-        style={{
-          display: "flex",
-          gap: 4,
-          padding: "4px 8px",
-          borderTop: "1px solid #222",
-          background: "#080808",
-        }}
-      >
-        <button
-          type="button"
-          onClick={(): void => setTab("live")}
-          data-testid="tab-live"
-          aria-pressed={tab === "live"}
-          style={{
-            background: tab === "live" ? "#1c2a3d" : "#0c0c0c",
-            color: "#cce0ff",
-            border: "1px solid #2c4361",
-            borderRadius: 3,
-            padding: "3px 12px",
-            fontSize: 11,
-            fontFamily: "monospace",
-            cursor: "pointer",
-          }}
-        >
-          Library
-        </button>
-        <button
-          type="button"
-          onClick={(): void => setTab("history")}
-          data-testid="tab-history"
-          aria-pressed={tab === "history"}
-          style={{
-            background: tab === "history" ? "#1c2a3d" : "#0c0c0c",
-            color: "#cce0ff",
-            border: "1px solid #2c4361",
-            borderRadius: 3,
-            padding: "3px 12px",
-            fontSize: 11,
-            fontFamily: "monospace",
-            cursor: "pointer",
-          }}
-        >
-          History
-        </button>
-      </div>
-      {tab === "live" ? (
-        <Library client={client} />
-      ) : (
-        <Sessions client={client} />
-      )}
+      <SecondaryPanel
+        client={client}
+        tab={tab}
+        setTab={setTab}
+        isMobile={isMobile}
+        libraryOpen={libraryOpen}
+        setLibraryOpen={setLibraryOpen}
+      />
     </div>
   );
 };
