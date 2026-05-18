@@ -22,7 +22,7 @@ fn ev(id: u64, kind: EventKind) -> Event {
 
 fn bench_event_to_commands(c: &mut Criterion) {
     let sample_rate: u32 = 48_000;
-    let mut decode = StubDecodeService::new();
+    let decode = StubDecodeService::new();
     let prev = EngineState::default();
 
     let e_play = ev(1, EventKind::DeckPlay { deck: DeckId::A });
@@ -72,7 +72,7 @@ fn bench_event_to_commands(c: &mut Criterion) {
                 black_box(&e_play),
                 black_box(0),
                 black_box(sample_rate),
-                black_box(&mut decode),
+                black_box(&decode),
             ))
         })
     });
@@ -85,7 +85,7 @@ fn bench_event_to_commands(c: &mut Criterion) {
                 black_box(&e_xfade),
                 black_box(0),
                 black_box(sample_rate),
-                black_box(&mut decode),
+                black_box(&decode),
             ))
         })
     });
@@ -98,7 +98,7 @@ fn bench_event_to_commands(c: &mut Criterion) {
                 black_box(&e_eq),
                 black_box(0),
                 black_box(sample_rate),
-                black_box(&mut decode),
+                black_box(&decode),
             ))
         })
     });
@@ -111,14 +111,14 @@ fn bench_event_to_commands(c: &mut Criterion) {
                 black_box(&e_takeover),
                 black_box(0),
                 black_box(sample_rate),
-                black_box(&mut decode),
+                black_box(&decode),
             ))
         })
     });
 
     // DeckLoad hits the stub decode service; we pre-warm so we don't
     // benchmark sine-wave generation in the steady state.
-    let _ = event_to_commands(&prev, &next_load, &e_load, 0, sample_rate, &mut decode);
+    let _ = event_to_commands(&prev, &next_load, &e_load, 0, sample_rate, &decode);
     c.bench_function("translator::deck_load_cached", |b| {
         b.iter(|| {
             black_box(event_to_commands(
@@ -127,7 +127,7 @@ fn bench_event_to_commands(c: &mut Criterion) {
                 black_box(&e_load),
                 black_box(0),
                 black_box(sample_rate),
-                black_box(&mut decode),
+                black_box(&decode),
             ))
         })
     });

@@ -31,8 +31,11 @@ pub mod ring;
 pub mod translator;
 
 pub use clock::{EngineClock, SharedClock};
-pub use command::{AudioCommand, AudioCommandKind, BufferId, RAMP_BUFFER_MAX};
-pub use decode::{DecodeService, DecodedBuffer, StubDecodeService};
+pub use command::{AudioCommand, AudioCommandKind, RAMP_BUFFER_MAX};
+pub use decode::{
+    DecodeError, DecodeHandle, DecodeService, StubDecodeService, SymphoniaDecodeService,
+    MAX_DECODE_SLOTS, MEM_PREFIX, RING_SAMPLES_500MS,
+};
 pub use mixer::AudioMixer;
 pub use ring::{AudioConsumer, AudioProducer, AudioRing, RING_CAPACITY};
 pub use translator::{event_to_commands, AudioCmdBatch, BAR_BEATS, DEFAULT_RAMP_MS};

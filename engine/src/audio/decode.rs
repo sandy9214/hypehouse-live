@@ -1,54 +1,703 @@
-//! Decode service — control-thread side.
+//! Decode service — symphonia-backed streaming.
 //!
-//! ADR-004 §"Why not put the reducer on the audio thread?" + §"Open
-//! implementation questions" both call out: **decoding stays on the
-//! control thread**. The audio thread only consumes pre-decoded `f32`
-//! buffers.
+//! # Architecture
 //!
-//! For v0.1 this is a stub that fabricates a sine-wave buffer per
-//! requested track. Real `symphonia` decode lands in a later PR; the
-//! contract is identical: `decode_track` returns a [`BufferId`] you can
-//! hand to the audio thread inside an `AudioCommandKind::DeckLoadBuffer`.
+//! ADR-004 forbids any heap allocation, syscall, or blocking primitive on
+//! the audio thread. Symphonia decode + rubato resample both allocate
+//! freely. The compromise this module enforces:
 //!
-//! The audio thread looks up `BufferId → Arc<DecodedBuffer>` in a
-//! separately-published registry (see [`BufferRegistry`]). That lookup
-//! is wait-free.
+//! ```text
+//!   control thread                 decoder thread (per track)
+//!   ┌────────────┐  spawn()        ┌─────────────────────────────┐
+//!   │ open(track)│ ───────────────▶│ symphonia decode → rubato → │
+//!   │            │                  │ stereo f32 interleaved      │
+//!   │            │                  │   push into SPSC ring       │
+//!   └────────────┘                  └──────────────┬──────────────┘
+//!                                                  │
+//!                                          ┌───────▼───────┐
+//!                                          │ ArrayQueue    │
+//!                                          │ (~500ms @48k) │
+//!                                          └───────┬───────┘
+//!                                                  │ (consumer side)
+//!                                                  ▼
+//!                                            audio thread
+//!                                            read(handle, buf):
+//!                                              pure lock-free pop
+//! ```
+//!
+//! The audio thread's `read(handle, &mut buf)` is alloc-free,
+//! syscall-free, and never blocks. If the decoder thread falls behind
+//! (slow disk, OS scheduling jitter), the ring underruns and `read`
+//! pads the remainder of the caller's buffer with `0.0` (silence) and
+//! increments `underrun_count` for observability.
+//!
+//! # DecodeHandle
+//!
+//! `DecodeHandle` is a `Copy` index into a fixed-size slot table held
+//! inside `SymphoniaDecodeService`. Both the control thread (open/close)
+//! and the audio thread (read) hold cheap `Arc` clones of the same
+//! service; the slot table is shared via atomics. Each slot owns its
+//! SPSC ring **for the lifetime of the service** — never re-allocated
+//! — so the audio thread can read `slot.queue` without any
+//! synchronization primitive beyond the ring's own lock-free pop.
+//!
+//! # Format support
+//!
+//! `symphonia` is built with `features = ["all"]`: mp3, m4a/aac, wav,
+//! flac, ogg/vorbis. Sample format is normalized to interleaved stereo
+//! f32 in `[-1.0, 1.0]`. Mono sources are duplicated to both channels;
+//! Channel counts above 2 are downmixed L=ch0, R=ch1 (v0.1 — rears are
+//! dropped, see ADR-002 council on multichannel handling).
+//!
+//! # Resampling
+//!
+//! When `source_sr != target_sr`, a per-track `rubato::SincFixedIn`
+//! resampler converts in fixed-size chunks. Settings match the
+//! symphonia upstream recommendation: `sinc_len=256`, `f_cutoff=0.95`,
+//! `oversampling_factor=256`, `interpolation=Linear`,
+//! `window=BlackmanHarris2`.
+//!
+//! See `docs/adr/ADR-004-audio-thread.md` for the full rationale.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::fs::File;
+use std::io::Cursor;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
-use crate::audio::command::BufferId;
+use crossbeam::queue::ArrayQueue;
+use rubato::{
+    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
+use symphonia::core::audio::AudioBufferRef;
+use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 
-/// A pre-decoded mono `f32` buffer the audio thread can render from.
-/// `Arc` so we can hand cheap clones out to the audio thread without
-/// copying samples.
+use crate::state::TrackRef;
+
+/// Maximum number of simultaneously-open decoder slots. The engine has
+/// 2 decks; we reserve headroom for queued preloads + future
+/// auxiliary decks. Bumping requires an ADR (audio-thread slot scan
+/// becomes hotter; per-slot fixed ring is pre-allocated).
+pub const MAX_DECODE_SLOTS: usize = 16;
+
+/// Ring capacity in **interleaved samples** — 500 ms @ 48 kHz stereo.
+/// = 48_000 frames * 0.5 s * 2 channels = 48_000 samples per slot.
+pub const RING_SAMPLES_500MS: usize = 48_000;
+
+/// In-memory test source prefix. Paths starting with `mem://<key>`
+/// look up `<key>` in the service's inline-source registry instead of
+/// touching the filesystem. Used by unit + smoke tests.
+pub const MEM_PREFIX: &str = "mem://";
+
+/// Errors from the decode pipeline. All variants are non-fatal at the
+/// engine level — a failed open returns an `Err` and the deck simply
+/// doesn't load.
+#[derive(Debug, thiserror::Error)]
+pub enum DecodeError {
+    #[error("decode slot table exhausted (max {MAX_DECODE_SLOTS})")]
+    NoFreeSlot,
+    #[error("io error opening {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("symphonia probe failed: {0}")]
+    Probe(String),
+    #[error("no default audio track in container")]
+    NoTrack,
+    #[error("rubato resampler init failed: {0}")]
+    Resampler(String),
+    #[error("track id `{0}` is reserved for inline test sources but no source registered")]
+    UnknownInlineSource(String),
+    #[error("failed to spawn decoder thread: {0}")]
+    Spawn(std::io::Error),
+}
+
+/// Opaque, `Copy` handle into the decoder slot table. Cheap to put
+/// inside an `AudioCommand` (POD).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DecodeHandle(pub u32);
+
+impl DecodeHandle {
+    /// Sentinel used to indicate "no track loaded".
+    pub const NONE: DecodeHandle = DecodeHandle(u32::MAX);
+
+    pub fn is_some(&self) -> bool {
+        self.0 != u32::MAX
+    }
+}
+
+/// Decoder-side trait. The control thread calls `open` + `close`; the
+/// audio thread calls `read` (alloc-free, no syscalls, no blocking).
+///
+/// Implementations are typically wrapped in `Arc` and cloned to both
+/// threads.
+pub trait DecodeService: Send + Sync {
+    /// Open a track. Spawns the decoder thread off the control plane.
+    /// Returns a handle whose subsequent `read`s pull stereo f32 frames.
+    /// **Control thread only** — may allocate, do I/O, etc.
+    fn open(&self, track: &TrackRef, target_sample_rate: u32) -> Result<DecodeHandle, DecodeError>;
+
+    /// Read up to `buf.len()` interleaved stereo f32 samples for the
+    /// given handle. Returns the number of f32 samples written.
+    /// Tail is filled with `0.0` on underrun.
+    ///
+    /// **Audio-thread safe**: no alloc, no syscalls, no blocking.
+    fn read(&self, handle: DecodeHandle, buf: &mut [f32]) -> usize;
+
+    /// Close the handle. Signals shutdown to the decoder thread and
+    /// joins it. **Control thread only.**
+    fn close(&self, handle: DecodeHandle);
+
+    /// Total underrun events across all handles since service start
+    /// (one event per render call that had to silence-pad).
+    fn underrun_count(&self) -> u64;
+}
+
+// ---------------------------------------------------------------------------
+// SymphoniaDecodeService
+// ---------------------------------------------------------------------------
+
+/// Per-slot state. The `queue` Arc is allocated ONCE at service
+/// construction and reused across opens — this is what lets the audio
+/// thread read without any lock or atomic swap.
+struct Slot {
+    /// `false` = free, `true` = open. Used by `open` to claim
+    /// (`compare_exchange`) and by `close` to release. The audio
+    /// thread checks this on `read` to short-circuit dead slots.
+    occupied: AtomicBool,
+    /// SPSC ring. The decoder thread holds an `Arc` clone, the audio
+    /// thread accesses via `&self`. `ArrayQueue::push` and `pop` are
+    /// lock-free.
+    queue: Arc<ArrayQueue<f32>>,
+    /// Per-decoder-thread shutdown flag.
+    shutdown: Arc<AtomicBool>,
+    /// JoinHandle for the per-slot decoder thread. Touched only on the
+    /// control thread (open/close); never on the audio thread.
+    join: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Slot {
+    fn new() -> Self {
+        Self {
+            occupied: AtomicBool::new(false),
+            queue: Arc::new(ArrayQueue::new(RING_SAMPLES_500MS)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            join: Mutex::new(None),
+        }
+    }
+}
+
+/// Shared inner state. Both the control-side handle and the
+/// audio-side handle hold `Arc<SymphoniaShared>` so the slot table is
+/// visible to both threads.
+struct SymphoniaShared {
+    slots: Vec<Slot>,
+    next_id: AtomicU64,
+    underruns: AtomicU64,
+    inline_sources: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl SymphoniaShared {
+    fn new() -> Self {
+        let mut slots = Vec::with_capacity(MAX_DECODE_SLOTS);
+        for _ in 0..MAX_DECODE_SLOTS {
+            slots.push(Slot::new());
+        }
+        Self {
+            slots,
+            next_id: AtomicU64::new(1),
+            underruns: AtomicU64::new(0),
+            inline_sources: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+/// Production decode service backed by symphonia + rubato.
+///
+/// Cloning is cheap (`Arc` refcount bump). Hand one clone to the
+/// control thread (for `open`/`close`) and another to the audio thread
+/// (for `read`).
 #[derive(Clone)]
-pub struct DecodedBuffer {
-    pub samples: Arc<Vec<f32>>,
-    pub sample_rate: u32,
+pub struct SymphoniaDecodeService {
+    inner: Arc<SymphoniaShared>,
 }
 
-/// Trait so the translator can be parameterized over real / stub /
-/// mock decode without leaking implementation details.
-pub trait DecodeService: Send {
-    /// Synchronously decode (or fetch from cache) a buffer for the
-    /// given track. Returns the registry handle. For real decode this
-    /// will return a placeholder id immediately and post the real
-    /// `DeckLoadBuffer` command once decode completes; the stub does
-    /// the work inline.
-    fn decode_track(&mut self, track_id: &str, path: &str, sample_rate: u32) -> BufferId;
-
-    /// Look up a buffer by id. Returns `None` if the id is unknown.
-    fn buffer(&self, id: BufferId) -> Option<DecodedBuffer>;
+impl Default for SymphoniaDecodeService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-/// Stub decode service: generates a 1-second 440Hz sine wave for any
-/// requested track and caches it by `track_id`. Adequate for the v0.1
-/// audio-thread wire-up; real decode comes in a follow-up PR.
+impl SymphoniaDecodeService {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(SymphoniaShared::new()),
+        }
+    }
+
+    /// Register an in-memory source under a synthetic `mem://<key>`
+    /// path. Used by tests to decode without touching the filesystem.
+    pub fn register_inline_source(&self, key: &str, bytes: Vec<u8>) {
+        let mut guard = self.inner.inline_sources.lock().expect("poisoned");
+        guard.insert(key.to_string(), bytes);
+    }
+
+    /// Number of currently-occupied slots. O(MAX_DECODE_SLOTS).
+    pub fn open_slot_count(&self) -> usize {
+        self.inner
+            .slots
+            .iter()
+            .filter(|s| s.occupied.load(Ordering::Acquire))
+            .count()
+    }
+}
+
+impl DecodeService for SymphoniaDecodeService {
+    fn open(&self, track: &TrackRef, target_sample_rate: u32) -> Result<DecodeHandle, DecodeError> {
+        // 1. Find a free slot via compare_exchange.
+        let slot_idx = self
+            .inner
+            .slots
+            .iter()
+            .position(|s| {
+                s.occupied
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            })
+            .ok_or(DecodeError::NoFreeSlot)?;
+
+        let slot = &self.inner.slots[slot_idx];
+
+        // 2. Reset the per-slot shutdown flag + drain any residual
+        //    samples from a previous owner. (queue is reused across
+        //    opens by design.)
+        slot.shutdown.store(false, Ordering::Release);
+        while slot.queue.pop().is_some() {}
+
+        // 3. Open the source (file or inline blob). Errors bubble up;
+        //    we must un-mark the slot in that case.
+        let mss = match open_media_source(&track.path, &self.inner.inline_sources) {
+            Ok(m) => m,
+            Err(e) => {
+                slot.occupied.store(false, Ordering::Release);
+                return Err(e);
+            }
+        };
+
+        // 4. Spawn the decoder thread.
+        let ring = Arc::clone(&slot.queue);
+        let shutdown = Arc::clone(&slot.shutdown);
+        let join = std::thread::Builder::new()
+            .name(format!("hh-decode-{}", track.id))
+            .spawn(move || {
+                decoder_thread_main(mss, target_sample_rate, ring, shutdown);
+            })
+            .map_err(|e| {
+                slot.occupied.store(false, Ordering::Release);
+                DecodeError::Spawn(e)
+            })?;
+
+        // 5. Store the join handle on the slot.
+        {
+            let mut guard = slot.join.lock().expect("slot join mutex poisoned");
+            *guard = Some(join);
+        }
+
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) as u32;
+        Ok(DecodeHandle(encode_handle(slot_idx, id)))
+    }
+
+    fn read(&self, handle: DecodeHandle, buf: &mut [f32]) -> usize {
+        if !handle.is_some() || buf.is_empty() {
+            return 0;
+        }
+        let (slot_idx, _id) = decode_handle(handle);
+        if slot_idx >= self.inner.slots.len() {
+            return 0;
+        }
+        let slot = &self.inner.slots[slot_idx];
+        if !slot.occupied.load(Ordering::Acquire) {
+            return 0;
+        }
+
+        // Pure lock-free pop loop — no allocation, no syscall.
+        let mut written = 0usize;
+        while written < buf.len() {
+            match slot.queue.pop() {
+                Some(sample) => {
+                    buf[written] = sample;
+                    written += 1;
+                }
+                None => break,
+            }
+        }
+        if written < buf.len() {
+            // Underrun: zero-fill the rest. Count one event per
+            // affected `read` call.
+            for s in &mut buf[written..] {
+                *s = 0.0;
+            }
+            self.inner.underruns.fetch_add(1, Ordering::Relaxed);
+        }
+        buf.len()
+    }
+
+    fn close(&self, handle: DecodeHandle) {
+        if !handle.is_some() {
+            return;
+        }
+        let (slot_idx, _id) = decode_handle(handle);
+        if slot_idx >= self.inner.slots.len() {
+            return;
+        }
+        let slot = &self.inner.slots[slot_idx];
+        if !slot.occupied.load(Ordering::Acquire) {
+            return;
+        }
+
+        // 1. Signal the decoder thread to exit. The decoder polls
+        //    shutdown between every packet + every push spin.
+        slot.shutdown.store(true, Ordering::Release);
+
+        // 2. Drain a bit of the queue so the decoder isn't blocked on
+        //    a full ring at the moment we signal shutdown. The
+        //    decoder also checks shutdown inside its push loop, so
+        //    this is belt-and-braces.
+        for _ in 0..(RING_SAMPLES_500MS / 8) {
+            if slot.queue.pop().is_none() {
+                break;
+            }
+        }
+
+        // 3. Take + join the thread.
+        let join = {
+            let mut g = slot.join.lock().expect("slot join mutex poisoned");
+            g.take()
+        };
+        if let Some(j) = join {
+            let _ = j.join();
+        }
+
+        // 4. Drain any leftover samples so the ring is empty for next
+        //    open().
+        while slot.queue.pop().is_some() {}
+
+        slot.occupied.store(false, Ordering::Release);
+    }
+
+    fn underrun_count(&self) -> u64 {
+        self.inner.underruns.load(Ordering::Relaxed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handle encoding
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn encode_handle(slot_idx: usize, id: u32) -> u32 {
+    // Top 4 bits = slot_idx (0..16); bottom 28 bits = id (per-handle
+    // generation counter so reuse of a slot doesn't collide if a stale
+    // handle leaks). Internally only slot_idx matters; id is logged.
+    debug_assert!(slot_idx < MAX_DECODE_SLOTS);
+    ((slot_idx as u32) << 28) | (id & 0x0FFF_FFFF)
+}
+
+#[inline]
+fn decode_handle(h: DecodeHandle) -> (usize, u32) {
+    let slot = (h.0 >> 28) as usize;
+    let id = h.0 & 0x0FFF_FFFF;
+    (slot, id)
+}
+
+// ---------------------------------------------------------------------------
+// Decoder thread
+// ---------------------------------------------------------------------------
+
+fn open_media_source(
+    path: &str,
+    inline: &Mutex<HashMap<String, Vec<u8>>>,
+) -> Result<MediaSourceStream, DecodeError> {
+    if let Some(key) = path.strip_prefix(MEM_PREFIX) {
+        let guard = inline.lock().expect("inline_sources poisoned");
+        let bytes = guard
+            .get(key)
+            .cloned()
+            .ok_or_else(|| DecodeError::UnknownInlineSource(key.to_string()))?;
+        let cursor = Cursor::new(bytes);
+        return Ok(MediaSourceStream::new(Box::new(cursor), Default::default()));
+    }
+    let file = File::open(Path::new(path)).map_err(|e| DecodeError::Io {
+        path: path.to_string(),
+        source: e,
+    })?;
+    Ok(MediaSourceStream::new(Box::new(file), Default::default()))
+}
+
+/// Body of the per-track decoder thread. Pushes interleaved stereo f32
+/// frames into `ring` until EOF or shutdown.
+fn decoder_thread_main(
+    mss: MediaSourceStream,
+    target_sr: u32,
+    ring: Arc<ArrayQueue<f32>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    if let Err(e) = decoder_thread_inner(mss, target_sr, &ring, &shutdown) {
+        tracing::warn!(target: "decode", error = ?e, "decoder thread exited with error");
+    }
+}
+
+fn decoder_thread_inner(
+    mss: MediaSourceStream,
+    target_sr: u32,
+    ring: &Arc<ArrayQueue<f32>>,
+    shutdown: &Arc<AtomicBool>,
+) -> Result<(), DecodeError> {
+    let probed = symphonia::default::get_probe()
+        .format(
+            &Hint::new(),
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| DecodeError::Probe(format!("{e}")))?;
+    let mut reader = probed.format;
+    let track = reader
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or(DecodeError::NoTrack)?;
+    let track_id = track.id;
+    let source_sr = track.codec_params.sample_rate.unwrap_or(target_sr);
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| DecodeError::Probe(format!("codec init: {e}")))?;
+
+    // Per-track resampler — `None` means passthrough.
+    let mut resampler: Option<SincFixedIn<f32>> = if source_sr != target_sr {
+        let params = SincInterpolationParameters {
+            sinc_len: 256,
+            f_cutoff: 0.95,
+            interpolation: SincInterpolationType::Linear,
+            oversampling_factor: 256,
+            window: WindowFunction::BlackmanHarris2,
+        };
+        let r = SincFixedIn::<f32>::new(
+            target_sr as f64 / source_sr as f64,
+            1.1, // max relative ratio
+            params,
+            1024,
+            2,
+        )
+        .map_err(|e| DecodeError::Resampler(format!("{e}")))?;
+        Some(r)
+    } else {
+        None
+    };
+
+    // Reusable scratch buffers (decoder thread can allocate freely).
+    let mut in_left: Vec<f32> = Vec::with_capacity(8192);
+    let mut in_right: Vec<f32> = Vec::with_capacity(8192);
+
+    while !shutdown.load(Ordering::Acquire) {
+        let packet = match reader.next_packet() {
+            Ok(p) => p,
+            Err(symphonia::core::errors::Error::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(symphonia::core::errors::Error::ResetRequired) => break,
+            Err(e) => {
+                tracing::warn!(target: "decode", error = ?e, "reader.next_packet failed");
+                break;
+            }
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
+            Err(e) => {
+                tracing::warn!(target: "decode", error = ?e, "decoder.decode failed");
+                break;
+            }
+        };
+
+        in_left.clear();
+        in_right.clear();
+        extract_stereo(decoded, &mut in_left, &mut in_right);
+
+        push_into_ring(&in_left, &in_right, resampler.as_mut(), ring, shutdown);
+    }
+    Ok(())
+}
+
+/// Copy any AudioBufferRef into two f32 planar channels. Mono sources
+/// duplicate to both channels; >2-channel sources keep L=ch0, R=ch1.
+fn extract_stereo(buf: AudioBufferRef<'_>, left: &mut Vec<f32>, right: &mut Vec<f32>) {
+    match buf {
+        AudioBufferRef::F32(b) => fill_stereo(&b, left, right, |s| *s),
+        AudioBufferRef::F64(b) => fill_stereo(&b, left, right, |s| *s as f32),
+        AudioBufferRef::S8(b) => {
+            let scale = 1.0_f32 / i8::MAX as f32;
+            fill_stereo(&b, left, right, |s| *s as f32 * scale)
+        }
+        AudioBufferRef::S16(b) => {
+            let scale = 1.0_f32 / i16::MAX as f32;
+            fill_stereo(&b, left, right, |s| *s as f32 * scale)
+        }
+        AudioBufferRef::S24(b) => {
+            let scale = 1.0_f32 / (1 << 23) as f32;
+            fill_stereo(&b, left, right, |s| s.inner() as f32 * scale)
+        }
+        AudioBufferRef::S32(b) => {
+            let scale = 1.0_f32 / i32::MAX as f32;
+            fill_stereo(&b, left, right, |s| *s as f32 * scale)
+        }
+        AudioBufferRef::U8(b) => fill_stereo(&b, left, right, |s| (*s as f32 - 128.0) / 128.0),
+        AudioBufferRef::U16(b) => fill_stereo(&b, left, right, |s| (*s as f32 - 32768.0) / 32768.0),
+        AudioBufferRef::U24(b) => {
+            let scale = 1.0_f32 / (1 << 23) as f32;
+            fill_stereo(&b, left, right, |s| {
+                (s.inner() as f32 - (1 << 23) as f32) * scale
+            })
+        }
+        AudioBufferRef::U32(b) => {
+            let half = (u32::MAX / 2) as f32;
+            fill_stereo(&b, left, right, |s| (*s as f32 - half) / half)
+        }
+    }
+}
+
+fn fill_stereo<S, F>(
+    b: &symphonia::core::audio::AudioBuffer<S>,
+    left: &mut Vec<f32>,
+    right: &mut Vec<f32>,
+    conv: F,
+) where
+    S: symphonia::core::sample::Sample,
+    F: Fn(&S) -> f32,
+{
+    use symphonia::core::audio::Signal;
+    let frames = b.frames();
+    let chans = b.spec().channels.count();
+    match chans {
+        0 => {}
+        1 => {
+            let l = b.chan(0);
+            for sample in l.iter().take(frames) {
+                let s = conv(sample);
+                left.push(s);
+                right.push(s);
+            }
+        }
+        _ => {
+            let l = b.chan(0);
+            let r = b.chan(1);
+            for (ls, rs) in l.iter().take(frames).zip(r.iter().take(frames)) {
+                left.push(conv(ls));
+                right.push(conv(rs));
+            }
+        }
+    }
+}
+
+/// Resample (if needed), interleave, and push into the ring. If the
+/// ring is full, the decoder thread spins with a tiny sleep — pushing
+/// is throttled by the audio thread's consumption rate.
+fn push_into_ring(
+    left: &[f32],
+    right: &[f32],
+    resampler: Option<&mut SincFixedIn<f32>>,
+    ring: &Arc<ArrayQueue<f32>>,
+    shutdown: &Arc<AtomicBool>,
+) {
+    if left.is_empty() {
+        return;
+    }
+    let (out_l, out_r): (Vec<f32>, Vec<f32>) = match resampler {
+        None => (left.to_vec(), right.to_vec()),
+        Some(r) => {
+            let want = r.input_frames_next();
+            let mut acc_l = Vec::with_capacity(left.len() * 2);
+            let mut acc_r = Vec::with_capacity(right.len() * 2);
+            let mut pos = 0usize;
+            while pos < left.len() && !shutdown.load(Ordering::Acquire) {
+                let end = (pos + want).min(left.len());
+                let mut chunk_l = left[pos..end].to_vec();
+                let mut chunk_r = right[pos..end].to_vec();
+                if chunk_l.len() < want {
+                    chunk_l.resize(want, 0.0);
+                    chunk_r.resize(want, 0.0);
+                }
+                let out = match r.process(&[&chunk_l, &chunk_r], None) {
+                    Ok(o) => o,
+                    Err(_) => break,
+                };
+                acc_l.extend_from_slice(&out[0]);
+                acc_r.extend_from_slice(&out[1]);
+                pos += want;
+            }
+            (acc_l, acc_r)
+        }
+    };
+    for (l, r) in out_l.iter().zip(out_r.iter()) {
+        push_blocking(ring, *l, shutdown);
+        push_blocking(ring, *r, shutdown);
+    }
+}
+
+#[inline]
+fn push_blocking(ring: &Arc<ArrayQueue<f32>>, sample: f32, shutdown: &Arc<AtomicBool>) {
+    let mut s = sample;
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        match ring.push(s) {
+            Ok(()) => return,
+            Err(returned) => {
+                s = returned;
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StubDecodeService — synthesises a sine wave; alloc-free `read`.
+// ---------------------------------------------------------------------------
+
+/// Test/dev stub that returns a 440 Hz stereo sine for any track. Used
+/// by translator unit tests + by integration tests that don't want to
+/// depend on symphonia decode.
+///
+/// Per-handle state lives in a fixed-size array indexed by handle id so
+/// `read` is alloc-free. Bench / hot-path tests should still prefer the
+/// stub over the symphonia service.
 pub struct StubDecodeService {
-    next_id: u32,
-    by_track: HashMap<String, BufferId>,
-    buffers: HashMap<u32, DecodedBuffer>,
+    inner: Arc<StubShared>,
+}
+
+struct StubShared {
+    next_id: AtomicU64,
+    underruns: AtomicU64,
+    // Per-slot phase + sample rate, packed as bit-shifted u64 atomics.
+    // Top 32 bits = sample_rate; bottom 32 bits = bit-pattern of phase f32.
+    // Audio thread reads + writes via Relaxed atomics — alloc-free + lock-free.
+    slots: Vec<AtomicU64>,
+    occupied: Vec<AtomicBool>,
 }
 
 impl Default for StubDecodeService {
@@ -59,73 +708,349 @@ impl Default for StubDecodeService {
 
 impl StubDecodeService {
     pub fn new() -> Self {
+        let mut slots = Vec::with_capacity(MAX_DECODE_SLOTS);
+        let mut occupied = Vec::with_capacity(MAX_DECODE_SLOTS);
+        for _ in 0..MAX_DECODE_SLOTS {
+            slots.push(AtomicU64::new(pack_state(48_000, 0.0)));
+            occupied.push(AtomicBool::new(false));
+        }
         Self {
-            next_id: 1, // 0 reserved as sentinel
-            by_track: HashMap::new(),
-            buffers: HashMap::new(),
-        }
-    }
-
-    /// Allocate a fresh 1-second 440Hz sine buffer at the given sample
-    /// rate.
-    fn make_sine(sample_rate: u32) -> DecodedBuffer {
-        let n = sample_rate as usize;
-        let mut samples = Vec::with_capacity(n);
-        let two_pi = std::f32::consts::TAU;
-        let freq = 440.0_f32;
-        for i in 0..n {
-            let t = i as f32 / sample_rate as f32;
-            samples.push((two_pi * freq * t).sin() * 0.2);
-        }
-        DecodedBuffer {
-            samples: Arc::new(samples),
-            sample_rate,
+            inner: Arc::new(StubShared {
+                next_id: AtomicU64::new(1),
+                underruns: AtomicU64::new(0),
+                slots,
+                occupied,
+            }),
         }
     }
 }
 
-impl DecodeService for StubDecodeService {
-    fn decode_track(&mut self, track_id: &str, _path: &str, sample_rate: u32) -> BufferId {
-        if let Some(existing) = self.by_track.get(track_id) {
-            return *existing;
+impl Clone for StubDecodeService {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
         }
-        let id = BufferId(self.next_id);
-        self.next_id += 1;
-        let buf = Self::make_sine(sample_rate);
-        self.buffers.insert(id.0, buf);
-        self.by_track.insert(track_id.to_string(), id);
-        id
+    }
+}
+
+#[inline]
+fn pack_state(sample_rate: u32, phase: f32) -> u64 {
+    ((sample_rate as u64) << 32) | (phase.to_bits() as u64)
+}
+
+#[inline]
+fn unpack_state(v: u64) -> (u32, f32) {
+    let sr = (v >> 32) as u32;
+    let phase = f32::from_bits((v & 0xFFFF_FFFF) as u32);
+    (sr, phase)
+}
+
+impl DecodeService for StubDecodeService {
+    fn open(
+        &self,
+        _track: &TrackRef,
+        target_sample_rate: u32,
+    ) -> Result<DecodeHandle, DecodeError> {
+        let slot_idx = self
+            .inner
+            .occupied
+            .iter()
+            .position(|o| {
+                o.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            })
+            .ok_or(DecodeError::NoFreeSlot)?;
+        self.inner.slots[slot_idx].store(pack_state(target_sample_rate, 0.0), Ordering::Release);
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) as u32;
+        Ok(DecodeHandle(encode_handle(slot_idx, id)))
     }
 
-    fn buffer(&self, id: BufferId) -> Option<DecodedBuffer> {
-        self.buffers.get(&id.0).cloned()
+    fn read(&self, handle: DecodeHandle, buf: &mut [f32]) -> usize {
+        if !handle.is_some() || buf.is_empty() {
+            return 0;
+        }
+        let (slot_idx, _id) = decode_handle(handle);
+        if slot_idx >= self.inner.slots.len() {
+            return 0;
+        }
+        if !self.inner.occupied[slot_idx].load(Ordering::Acquire) {
+            return 0;
+        }
+        // Generate a 440 Hz sine on both channels. Phase is held as an
+        // atomic so concurrent readers don't desync; in the engine's
+        // single-audio-thread model there's no real contention.
+        let (sr, mut phase) = unpack_state(self.inner.slots[slot_idx].load(Ordering::Relaxed));
+        let dphase = std::f32::consts::TAU * 440.0 / sr.max(1) as f32;
+        for chunk in buf.chunks_mut(2) {
+            let s = phase.sin() * 0.2;
+            for slot in chunk.iter_mut() {
+                *slot = s;
+            }
+            phase += dphase;
+            if phase > std::f32::consts::TAU {
+                phase -= std::f32::consts::TAU;
+            }
+        }
+        self.inner.slots[slot_idx].store(pack_state(sr, phase), Ordering::Relaxed);
+        buf.len()
+    }
+
+    fn close(&self, handle: DecodeHandle) {
+        if !handle.is_some() {
+            return;
+        }
+        let (slot_idx, _id) = decode_handle(handle);
+        if slot_idx >= self.inner.slots.len() {
+            return;
+        }
+        self.inner.occupied[slot_idx].store(false, Ordering::Release);
+    }
+
+    fn underrun_count(&self) -> u64 {
+        self.inner.underruns.load(Ordering::Relaxed)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn track(id: &str, path: &str) -> TrackRef {
+        TrackRef {
+            id: id.to_string(),
+            path: path.to_string(),
+        }
+    }
+
+    /// Build a tiny synthetic WAV file in memory: RIFF + fmt + data
+    /// chunks. PCM 16-bit, given channels + sample rate, `samples` is
+    /// already interleaved.
+    pub(crate) fn build_wav(channels: u16, sample_rate: u32, samples: &[i16]) -> Vec<u8> {
+        let bits_per_sample = 16u16;
+        let byte_rate = sample_rate * channels as u32 * bits_per_sample as u32 / 8;
+        let block_align = channels * bits_per_sample / 8;
+        let data_bytes = (samples.len() * 2) as u32;
+        let mut v = Vec::with_capacity(44 + samples.len() * 2);
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        v.extend_from_slice(b"WAVE");
+        v.extend_from_slice(b"fmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        v.extend_from_slice(&channels.to_le_bytes());
+        v.extend_from_slice(&sample_rate.to_le_bytes());
+        v.extend_from_slice(&byte_rate.to_le_bytes());
+        v.extend_from_slice(&block_align.to_le_bytes());
+        v.extend_from_slice(&bits_per_sample.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&data_bytes.to_le_bytes());
+        for s in samples {
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        v
+    }
+
+    pub(crate) fn sine_pcm16(freq: f32, sr: u32, secs: f32, channels: u16) -> Vec<i16> {
+        let n = (sr as f32 * secs) as usize;
+        let mut out = Vec::with_capacity(n * channels as usize);
+        let tau = std::f32::consts::TAU;
+        for i in 0..n {
+            let s = (tau * freq * (i as f32 / sr as f32)).sin();
+            let v = (s * 0.5 * i16::MAX as f32) as i16;
+            for _ in 0..channels {
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    // --- SymphoniaDecodeService -------------------------------------
 
     #[test]
-    fn stub_decode_caches_by_track_id() {
-        let mut svc = StubDecodeService::new();
-        let id1 = svc.decode_track("song-a", "/a.mp3", 48_000);
-        let id2 = svc.decode_track("song-a", "/a.mp3", 48_000);
-        assert_eq!(id1, id2);
+    fn handle_encoding_round_trip() {
+        for slot in 0..MAX_DECODE_SLOTS {
+            for id in [1u32, 7, 999, 0x0FFF_FFFE] {
+                let h = DecodeHandle(encode_handle(slot, id));
+                let (s2, i2) = decode_handle(h);
+                assert_eq!(s2, slot);
+                assert_eq!(i2, id);
+            }
+        }
     }
 
     #[test]
-    fn stub_decode_generates_one_second_buffer() {
-        let mut svc = StubDecodeService::new();
-        let id = svc.decode_track("song-b", "/b.mp3", 48_000);
-        let buf = svc.buffer(id).expect("buffer should be retrievable");
-        assert_eq!(buf.samples.len(), 48_000);
-        assert_eq!(buf.sample_rate, 48_000);
+    fn underrun_fills_zero_and_increments_counter() {
+        let svc = SymphoniaDecodeService::new();
+        // ~10 ms of input, then we'll over-drain.
+        let wav = build_wav(1, 48_000, &sine_pcm16(440.0, 48_000, 0.01, 1));
+        svc.register_inline_source("u", wav);
+        let h = svc.open(&track("u", "mem://u"), 48_000).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        let mut buf = [0.0_f32; 16384];
+        // Drain enough to definitely underrun.
+        for _ in 0..6 {
+            let _ = svc.read(h, &mut buf);
+        }
+        assert!(
+            svc.underrun_count() >= 1,
+            "expected underrun events, got {}",
+            svc.underrun_count()
+        );
+        // Last samples should be silence after underrun.
+        assert!(buf[buf.len() - 1].abs() < 1e-6);
+        svc.close(h);
     }
 
     #[test]
-    fn unknown_buffer_id_returns_none() {
+    fn mono_input_duplicates_to_stereo() {
+        let svc = SymphoniaDecodeService::new();
+        let wav = build_wav(1, 48_000, &sine_pcm16(1_000.0, 48_000, 0.2, 1));
+        svc.register_inline_source("mono", wav);
+        let h = svc.open(&track("mono", "mem://mono"), 48_000).unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+        let mut buf = [0.0_f32; 4096];
+        let _ = svc.read(h, &mut buf);
+        let mut mismatches = 0;
+        for i in (0..buf.len()).step_by(2) {
+            if (buf[i] - buf[i + 1]).abs() > 1e-6 {
+                mismatches += 1;
+            }
+        }
+        assert_eq!(mismatches, 0, "mono input must duplicate L=R");
+        assert!(
+            buf.iter().any(|s| s.abs() > 0.05),
+            "expected non-trivial audio energy"
+        );
+        svc.close(h);
+    }
+
+    #[test]
+    fn rate_conversion_22050_to_48000_passes_audio() {
+        let svc = SymphoniaDecodeService::new();
+        let wav = build_wav(1, 22_050, &sine_pcm16(440.0, 22_050, 1.0, 1));
+        svc.register_inline_source("rate", wav);
+        let h = svc.open(&track("rate", "mem://rate"), 48_000).unwrap();
+        // Give rubato + decoder enough wall time for at least a few
+        // 1024-frame chunks to traverse the pipeline.
+        std::thread::sleep(Duration::from_millis(900));
+        let mut buf = [0.0_f32; 24_000]; // 12k stereo frames
+        let _ = svc.read(h, &mut buf);
+        let energy: f32 = buf.iter().map(|s| s * s).sum::<f32>() / buf.len() as f32;
+        assert!(energy > 1e-4, "resampled signal energy too low: {energy}");
+        svc.close(h);
+    }
+
+    #[test]
+    fn close_stops_decoder_thread() {
+        let svc = SymphoniaDecodeService::new();
+        let wav = build_wav(2, 48_000, &sine_pcm16(440.0, 48_000, 5.0, 2));
+        svc.register_inline_source("long", wav);
+        let h = svc.open(&track("long", "mem://long"), 48_000).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(svc.open_slot_count(), 1);
+        svc.close(h);
+        assert_eq!(svc.open_slot_count(), 0);
+        // Idempotent close.
+        svc.close(h);
+        assert_eq!(svc.open_slot_count(), 0);
+    }
+
+    #[test]
+    fn open_close_reuses_slots() {
+        let svc = SymphoniaDecodeService::new();
+        for i in 0..(MAX_DECODE_SLOTS * 2) {
+            let key = format!("loop-{i}");
+            let wav = build_wav(1, 48_000, &sine_pcm16(440.0, 48_000, 0.05, 1));
+            svc.register_inline_source(&key, wav);
+            let h = svc
+                .open(&track(&key, &format!("mem://{key}")), 48_000)
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            svc.close(h);
+        }
+        assert_eq!(svc.open_slot_count(), 0);
+    }
+
+    #[test]
+    fn slot_exhaustion_returns_no_free_slot() {
+        let svc = SymphoniaDecodeService::new();
+        let mut handles = Vec::new();
+        for i in 0..MAX_DECODE_SLOTS {
+            let key = format!("ex-{i}");
+            let wav = build_wav(1, 48_000, &sine_pcm16(440.0, 48_000, 0.5, 1));
+            svc.register_inline_source(&key, wav);
+            let h = svc
+                .open(&track(&key, &format!("mem://{key}")), 48_000)
+                .unwrap();
+            handles.push(h);
+        }
+        let key = "ex-overflow";
+        let wav = build_wav(1, 48_000, &sine_pcm16(440.0, 48_000, 0.1, 1));
+        svc.register_inline_source(key, wav);
+        let res = svc.open(&track(key, &format!("mem://{key}")), 48_000);
+        assert!(matches!(res, Err(DecodeError::NoFreeSlot)));
+        for h in handles {
+            svc.close(h);
+        }
+    }
+
+    #[test]
+    fn read_on_none_handle_returns_zero() {
+        let svc = SymphoniaDecodeService::new();
+        let mut buf = [0.5_f32; 64];
+        let n = svc.read(DecodeHandle::NONE, &mut buf);
+        assert_eq!(n, 0);
+        assert!(buf.iter().all(|s| (*s - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn read_on_unknown_file_path_errors_at_open() {
+        let svc = SymphoniaDecodeService::new();
+        let res = svc.open(&track("ghost", "/nonexistent/file.wav"), 48_000);
+        assert!(
+            matches!(res, Err(DecodeError::Io { .. })),
+            "expected IO error, got {res:?}"
+        );
+        // Slot must be released back to the pool on error.
+        assert_eq!(svc.open_slot_count(), 0);
+    }
+
+    // --- Stub service ------------------------------------------------
+
+    #[test]
+    fn stub_open_returns_distinct_handles() {
         let svc = StubDecodeService::new();
-        assert!(svc.buffer(BufferId(999)).is_none());
+        let a = svc.open(&track("a", "/a.mp3"), 48_000).unwrap();
+        let b = svc.open(&track("b", "/b.mp3"), 48_000).unwrap();
+        assert_ne!(a, b);
+        svc.close(a);
+        svc.close(b);
+    }
+
+    #[test]
+    fn stub_read_generates_nonzero_stereo() {
+        let svc = StubDecodeService::new();
+        let h = svc.open(&track("t", "/t.mp3"), 48_000).unwrap();
+        let mut buf = [0.0_f32; 256];
+        let n = svc.read(h, &mut buf);
+        assert_eq!(n, buf.len());
+        let energy: f32 = buf.iter().map(|s| s * s).sum();
+        assert!(energy > 0.0);
+        for i in (0..buf.len()).step_by(2) {
+            assert!((buf[i] - buf[i + 1]).abs() < 1e-6);
+        }
+        svc.close(h);
+    }
+
+    #[test]
+    fn stub_read_is_alloc_free() {
+        let svc = StubDecodeService::new();
+        let h = svc.open(&track("t", "/t.mp3"), 48_000).unwrap();
+        let mut buf = [0.0_f32; 1024];
+        assert_no_alloc::assert_no_alloc(|| {
+            let _ = svc.read(h, &mut buf);
+        });
+        svc.close(h);
     }
 }

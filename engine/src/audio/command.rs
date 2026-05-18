@@ -12,6 +12,7 @@
 //!   `Arc<DecodedTrack>` etc. lives in a registry the audio thread reads
 //!   lock-free by index.
 
+use crate::audio::decode::DecodeHandle;
 use crate::state::DeckId;
 
 /// Maximum on-wire fixed-buffer length we allow inside an `AudioCommand`.
@@ -21,12 +22,13 @@ use crate::state::DeckId;
 /// than a slice / Vec / String.
 pub const RAMP_BUFFER_MAX: usize = 32;
 
-/// Opaque handle into the audio thread's pre-decoded buffer registry.
-/// Indexed lookup, never dereferenced into a pointer on the audio
-/// thread — the registry holds `Arc<DecodedTrack>` and the audio thread
-/// reads them via a lock-free index.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct BufferId(pub u32);
+/// Legacy alias kept for the `audio_command_is_copy_send_sync_static`
+/// test and any out-of-tree callers still importing `BufferId`. The
+/// streaming decode pipeline uses `DecodeHandle` directly inside
+/// `AudioCommandKind::DeckLoad`. This alias is `#[deprecated]` to flag
+/// downstream callers without breaking the build.
+#[deprecated(note = "use DecodeHandle from crate::audio::decode")]
+pub type BufferId = DecodeHandle;
 
 /// A command applied at an absolute sample frame (engine clock).
 ///
@@ -87,11 +89,12 @@ pub enum AudioCommandKind {
     LoopDisarm {
         deck: DeckId,
     },
-    /// The pre-decoded buffer is now ready; bind it to this deck so the
-    /// audio thread can render from it.
-    DeckLoadBuffer {
+    /// Streaming decode handle is now ready; bind it to this deck so
+    /// the audio thread can pull frames from it via
+    /// `DecodeService::read`.
+    DeckLoad {
         deck: DeckId,
-        buffer_id: BufferId,
+        handle: DecodeHandle,
     },
     DeckUnload {
         deck: DeckId,
@@ -125,7 +128,7 @@ mod tests {
         fn assert_bounds<T: Copy + Send + Sync + 'static>() {}
         assert_bounds::<AudioCommand>();
         assert_bounds::<AudioCommandKind>();
-        assert_bounds::<BufferId>();
+        assert_bounds::<DecodeHandle>();
     }
 
     #[test]
