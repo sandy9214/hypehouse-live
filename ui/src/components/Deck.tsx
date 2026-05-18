@@ -22,6 +22,10 @@ import {
 } from "./DeckControls";
 import { EffectRack } from "./EffectRack";
 import { useEffectsManifest } from "../store/effectsManifest";
+import {
+  noteLoadedTrack,
+  recordHotCueSet,
+} from "../store/hotCuePersist";
 
 export interface DeckProps {
   deck: DeckState;
@@ -98,10 +102,23 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
     submit(client, { EqAdjust: { deck: deck.id, band, value_db } });
   const onHotCueTrigger = (slot: number): void =>
     submit(client, { HotCueTrigger: { deck: deck.id, slot } });
-  const onHotCueSet = (slot: number): void =>
+  const onHotCueSet = (slot: number): void => {
+    // Engine-side: record the new cue in `Deck::hot_cues[slot]`.
     submit(client, {
       HotCueSet: { deck: deck.id, slot, position_ms: deck.position_ms },
     });
+    // Library-side: schedule a debounced `library.set_hot_cues` write
+    // so the cue survives a track reload. We project the *expected*
+    // post-event array locally (engine roundtrip is async) rather
+    // than waiting for `state_changed` — this keeps rapid pad-set
+    // bursts coalescing on a single timer without dropping the most
+    // recent slot.
+    const updated: Array<number | null> = Array.from(deck.hot_cues);
+    if (slot >= 0 && slot < updated.length) {
+      updated[slot] = deck.position_ms;
+    }
+    recordHotCueSet(client, deck.id, updated);
+  };
   const onLoopIn = (): void => submit(client, { LoopIn: { deck: deck.id } });
   const onLoopOut = (): void => submit(client, { LoopOut: { deck: deck.id } });
   const onCopilotToggle = (): void =>
@@ -140,8 +157,18 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
         bpm: track.bpm,
         beat_grid_anchor_ms: track.beat_grid_anchor_ms,
         downbeats_ms: track.downbeats_ms,
+        // Library-saved 8-slot hot-cue grid (hot-cue persistence PR).
+        // Materialise the readonly slice so the JSON wire shape is a
+        // plain mutable array — engine deserialiser doesn't care
+        // about TS readonly markers but the runtime serializer might
+        // attach extra metadata if we hand it the proxy directly.
+        hot_cues: Array.from(track.hot_cues),
       },
     });
+    // Tell the hot-cue persistence bridge which library row this deck
+    // is now bound to. Subsequent `HotCueSet` events for this deck
+    // will debounce-write back to this `track_id`.
+    noteLoadedTrack(deck.id, track.id);
   };
 
   return (

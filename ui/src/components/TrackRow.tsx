@@ -6,12 +6,17 @@
 //
 // DeckLoad wire shape lives in `engine/src/state.rs` —
 // externally-tagged enum, so the payload is
-// ``{ DeckLoad: { deck, track, bpm, beat_grid_anchor_ms, downbeats_ms } }``.
+// ``{ DeckLoad: { deck, track, bpm, beat_grid_anchor_ms,
+// downbeats_ms, hot_cues } }``. The ``hot_cues`` field was added in
+// the hot-cue persistence PR — it carries the library's saved 8-slot
+// cue array so a track always loads with the cues it was last saved
+// with (engine reducer copies it directly onto ``Deck::hot_cues``).
 
 import type { CSSProperties, DragEvent as ReactDragEvent, JSX } from "react";
 import type { JsonRpcWS } from "../ws/client";
 import type { DeckId } from "../store/engine";
 import type { LibraryTrack } from "../store/library";
+import { noteLoadedTrack } from "../store/hotCuePersist";
 
 export interface TrackRowProps {
   track: LibraryTrack;
@@ -84,6 +89,11 @@ const submitDeckLoad = (
       bpm: track.bpm,
       beat_grid_anchor_ms: track.beat_grid_anchor_ms,
       downbeats_ms: track.downbeats_ms,
+      // 8-slot hot-cue grid from the library row — engine reducer
+      // populates `Deck::hot_cues` directly. `Array.from` materialises
+      // the readonly slice into a fresh array so JSON serialization
+      // doesn't accidentally include `readonly` markers.
+      hot_cues: Array.from(track.hot_cues),
     },
   });
 };
@@ -94,6 +104,11 @@ export const TrackRow = ({
   onLoaded,
 }: TrackRowProps): JSX.Element => {
   const handleLoad = (deck: DeckId): void => {
+    // Bind the deck to this library track *before* the RPC resolves —
+    // a fast HotCueSet immediately after click should still find the
+    // right `track_id`. Engine roundtrip is async; persistence
+    // routing isn't.
+    noteLoadedTrack(deck, track.id);
     void submitDeckLoad(client, deck, track)
       .then((): void => {
         onLoaded?.(deck, track);

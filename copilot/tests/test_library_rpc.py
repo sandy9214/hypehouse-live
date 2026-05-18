@@ -264,7 +264,132 @@ def test_handler_handles_and_namespace_match() -> None:
     handler._library = None  # type: ignore[attr-defined]
     assert handler.handles("library.list_tracks")
     assert handler.handles("library.search_tracks")
+    assert handler.handles("library.set_hot_cues")
     assert not handler.handles("engine.list_effects")
     assert handler.NAMESPACE == "library"
+
+
+# ---- set_hot_cues (hot-cue persistence PR) -------------------------
+
+
+@_asyncio
+async def test_set_hot_cues_persists_array_and_returns_track(
+    library: TrackLibrary,
+):
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    cues = [0, 1500, None, 8000, None, None, 60_000, None]
+    result = await handler.dispatch(
+        "library.set_hot_cues",
+        {"track_id": "alpha", "hot_cues": cues},
+    )
+    assert result["track"]["id"] == "alpha"
+    assert result["track"]["hot_cues"] == cues
+    # Read-back via the library confirms persistence (not just echo).
+    fetched = library.get("alpha")
+    assert fetched is not None
+    assert fetched.hot_cues == cues
+
+
+@_asyncio
+async def test_set_hot_cues_unknown_track_id_returns_invalid_params(
+    library: TrackLibrary,
+):
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    with pytest.raises(RpcError) as exc:
+        await handler.dispatch(
+            "library.set_hot_cues",
+            {"track_id": "does-not-exist", "hot_cues": [None] * 8},
+        )
+    assert exc.value.code == JSONRPC_INVALID_PARAMS
+    assert "not found" in str(exc.value).lower()
+
+
+@_asyncio
+async def test_set_hot_cues_rejects_wrong_length(library: TrackLibrary):
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    with pytest.raises(RpcError) as exc:
+        await handler.dispatch(
+            "library.set_hot_cues",
+            {"track_id": "alpha", "hot_cues": [None, None, None]},  # only 3
+        )
+    assert exc.value.code == JSONRPC_INVALID_PARAMS
+
+
+@_asyncio
+async def test_set_hot_cues_rejects_non_list(library: TrackLibrary):
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    with pytest.raises(RpcError) as exc:
+        await handler.dispatch(
+            "library.set_hot_cues",
+            {"track_id": "alpha", "hot_cues": "not-a-list"},
+        )
+    assert exc.value.code == JSONRPC_INVALID_PARAMS
+
+
+@_asyncio
+async def test_set_hot_cues_rejects_negative_position(library: TrackLibrary):
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    cues = [None, None, -5, None, None, None, None, None]
+    with pytest.raises(RpcError) as exc:
+        await handler.dispatch(
+            "library.set_hot_cues",
+            {"track_id": "alpha", "hot_cues": cues},
+        )
+    assert exc.value.code == JSONRPC_INVALID_PARAMS
+
+
+@_asyncio
+async def test_set_hot_cues_rejects_bool_value(library: TrackLibrary):
+    """bool subclasses int in Python — would silently become 0/1 ms."""
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    cues = [True, None, None, None, None, None, None, None]
+    with pytest.raises(RpcError) as exc:
+        await handler.dispatch(
+            "library.set_hot_cues",
+            {"track_id": "alpha", "hot_cues": cues},
+        )
+    assert exc.value.code == JSONRPC_INVALID_PARAMS
+
+
+# ---- hot_cues field on list / search responses ---------------------
+
+
+@_asyncio
+async def test_list_tracks_includes_hot_cues_field(library: TrackLibrary):
+    """Every TrackRef in list_tracks must carry an 8-slot hot_cues array."""
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.list_tracks", {})
+    for t in result["tracks"]:
+        assert "hot_cues" in t
+        assert isinstance(t["hot_cues"], list)
+        assert len(t["hot_cues"]) == 8
+        # Default = all-None for tracks that haven't had cues set.
+        assert all(c is None for c in t["hot_cues"])
+
+
+@_asyncio
+async def test_search_tracks_includes_hot_cues_after_set(
+    library: TrackLibrary,
+):
+    """set_hot_cues persistence must surface through search results."""
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    cues = [100, 200, None, None, None, None, None, 99_999]
+    await handler.dispatch(
+        "library.set_hot_cues",
+        {"track_id": "alpha", "hot_cues": cues},
+    )
+    result = await handler.dispatch(
+        "library.search_tracks", {"query": "alpha"}
+    )
+    assert [t["id"] for t in result["tracks"]] == ["alpha"]
+    assert result["tracks"][0]["hot_cues"] == cues
 
 

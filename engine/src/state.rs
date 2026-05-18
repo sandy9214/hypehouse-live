@@ -70,6 +70,16 @@ pub enum EventKind {
         /// comfortably; the cap protects the inline `SmallVec` budget.
         #[serde(default)]
         downbeats_ms: Vec<u32>,
+        /// 8-slot hot-cue grid sourced from the copilot's library
+        /// (added in the hot-cue persistence PR). `Some(ms)` = saved
+        /// cue position relative to track start, `None` = empty slot.
+        /// Optional so pre-this-PR `DeckLoad` payloads still
+        /// deserialize via serde's default (all None) — they just
+        /// load a track with no preset hot-cues. The shape mirrors
+        /// `Deck::hot_cues` exactly so the reducer's assignment is a
+        /// direct copy.
+        #[serde(default = "default_hot_cues")]
+        hot_cues: [Option<u64>; 8],
     },
     /// ADR review Groq: explicit DeckUnload so the engine can free buffers
     /// and clear state cleanly (vs. relying on DeckLoad implicit replace).
@@ -316,6 +326,15 @@ fn default_tempo_ratio() -> f32 {
     1.0
 }
 
+/// Serde default for `EventKind::DeckLoad.hot_cues` — 8 empty slots.
+/// Used when an old payload (pre hot-cue persistence PR) omits the
+/// field; the reducer then leaves the deck's cue grid untouched of
+/// new entries. Tuple-style `[None; 8]` would require `Copy` semantics
+/// the function form sidesteps cleanly.
+fn default_hot_cues() -> [Option<u64>; 8] {
+    [None; 8]
+}
+
 impl Default for EngineState {
     fn default() -> Self {
         Self {
@@ -342,6 +361,7 @@ impl EngineState {
                 bpm,
                 beat_grid_anchor_ms,
                 downbeats_ms,
+                hot_cues,
             } => {
                 let d = next.deck_mut(*id);
                 d.loaded = Some(track.clone());
@@ -363,6 +383,13 @@ impl EngineState {
                 // size via a giant downbeats array.
                 let take = downbeats_ms.len().min(DOWNBEATS_INLINE_CAPACITY);
                 d.downbeats = DownbeatGrid::from_slice(&downbeats_ms[..take]);
+                // Replace the per-deck hot-cue grid wholesale. Loading
+                // a new track always overwrites any in-memory cues
+                // (matches the prior "DeckLoad replaces deck state"
+                // contract); pre-PR payloads come in with all-None
+                // via the serde default and so behave exactly like
+                // before.
+                d.hot_cues = *hot_cues;
             }
             EventKind::DeckUnload { deck: id } => {
                 *next.deck_mut(*id) = Deck::default();
@@ -675,6 +702,7 @@ mod tests {
                 bpm: 128.0,
                 beat_grid_anchor_ms: 220,
                 downbeats_ms: vec![],
+                hot_cues: [None; 8],
             },
         ));
         assert_eq!(s.deck_a.bpm, 128.0);
@@ -697,6 +725,7 @@ mod tests {
                 bpm: f32::NAN,
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: vec![],
+                hot_cues: [None; 8],
             },
         ));
         assert_eq!(s.deck_a.bpm, 120.0);
@@ -716,6 +745,7 @@ mod tests {
                 bpm: 120.0,
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: vec![],
+                hot_cues: [None; 8],
             },
         ));
         let s = s.apply(&ev(2, EventKind::DeckPlay { deck: DeckId::A }));
@@ -742,6 +772,7 @@ mod tests {
                 bpm: 120.0,
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: downbeats.clone(),
+                hot_cues: [None; 8],
             },
         ));
         assert_eq!(s.deck_b.downbeats.len(), downbeats.len());
@@ -767,6 +798,7 @@ mod tests {
                 bpm: 120.0,
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: downbeats,
+                hot_cues: [None; 8],
             },
         ));
         assert_eq!(s.deck_a.downbeats.len(), DOWNBEATS_INLINE_CAPACITY);
@@ -792,6 +824,7 @@ mod tests {
                 bpm: 120.0,
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: vec![0, 2000, 4000, 6000],
+                hot_cues: [None; 8],
             },
         ));
         assert_eq!(s.deck_a.downbeats.len(), 4);
@@ -809,10 +842,144 @@ mod tests {
                 bpm: 128.0,
                 beat_grid_anchor_ms: 100,
                 downbeats_ms: vec![100, 1975, 3850],
+                hot_cues: [None; 8],
             },
         ));
         assert_eq!(s.deck_a.downbeats.len(), 3);
         assert_eq!(s.deck_a.downbeats[0], 100);
+    }
+
+    #[test]
+    fn deck_load_populates_hot_cues_from_payload() {
+        // Hot-cue persistence PR: DeckLoad now carries an 8-slot
+        // hot-cue array (library → engine). The reducer copies it
+        // verbatim onto the deck so a track always loads with the
+        // cues it was last saved with.
+        let s = EngineState::default();
+        let cues = [
+            Some(0_u64),
+            Some(1_500),
+            None,
+            Some(8_000),
+            None,
+            None,
+            Some(60_000),
+            None,
+        ];
+        let s = s.apply(&ev(
+            1,
+            EventKind::DeckLoad {
+                deck: DeckId::A,
+                track: TrackRef {
+                    id: "with-cues".into(),
+                    path: "/p.mp3".into(),
+                },
+                bpm: 120.0,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![],
+                hot_cues: cues,
+            },
+        ));
+        assert_eq!(s.deck_a.hot_cues, cues);
+        // Per-deck only — deck B must be untouched.
+        assert!(s.deck_b.hot_cues.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn deck_load_default_hot_cues_is_all_none() {
+        // Wire-compat: an old DeckLoad payload (pre hot-cue
+        // persistence) deserializes with `hot_cues` defaulting to
+        // all-None via serde. Construct one explicitly here to mirror
+        // that semantic (the default function under test).
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::DeckLoad {
+                deck: DeckId::B,
+                track: TrackRef {
+                    id: "no-cues".into(),
+                    path: "/p.mp3".into(),
+                },
+                bpm: 120.0,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![],
+                hot_cues: super::default_hot_cues(),
+            },
+        ));
+        assert!(s.deck_b.hot_cues.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn deck_load_replaces_existing_hot_cues_wholesale() {
+        // Loading a *new* track on a deck must overwrite any prior
+        // hot-cues — otherwise stale cues from the previous track
+        // would phantom-trigger when the user hits a pad on the new
+        // track. Mirrors the same contract as `downbeats` reset.
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::DeckLoad {
+                deck: DeckId::A,
+                track: TrackRef {
+                    id: "t1".into(),
+                    path: "/a.mp3".into(),
+                },
+                bpm: 120.0,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![],
+                hot_cues: [
+                    Some(1_000),
+                    Some(2_000),
+                    Some(3_000),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+            },
+        ));
+        assert_eq!(s.deck_a.hot_cues[0], Some(1_000));
+        // Load a different track with a different cue layout — old
+        // values must NOT persist.
+        let s = s.apply(&ev(
+            2,
+            EventKind::DeckLoad {
+                deck: DeckId::A,
+                track: TrackRef {
+                    id: "t2".into(),
+                    path: "/b.mp3".into(),
+                },
+                bpm: 128.0,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![],
+                hot_cues: [None, None, None, None, None, None, None, Some(99_000)],
+            },
+        ));
+        assert_eq!(s.deck_a.hot_cues[0], None);
+        assert_eq!(s.deck_a.hot_cues[7], Some(99_000));
+    }
+
+    #[test]
+    fn deck_load_hot_cues_serde_roundtrip_with_default() {
+        // Serde-default behaviour: an *omitted* `hot_cues` field in
+        // a JSON payload still deserializes (default = all-None).
+        // This catches accidental removal of `#[serde(default = ...)]`.
+        let json = r#"{
+            "DeckLoad": {
+                "deck": "A",
+                "track": { "id": "t1", "path": "/p.mp3" },
+                "bpm": 120.0,
+                "beat_grid_anchor_ms": 0
+            }
+        }"#;
+        let kind: EventKind = serde_json::from_str(json).expect("deserialize");
+        match kind {
+            EventKind::DeckLoad { hot_cues, .. } => {
+                assert!(hot_cues.iter().all(Option::is_none));
+            }
+            other => panic!("expected DeckLoad, got {other:?}"),
+        }
     }
 
     #[test]

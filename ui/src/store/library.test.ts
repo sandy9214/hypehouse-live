@@ -20,6 +20,7 @@ const makeTrack = (id: string, extra: Partial<LibraryTrack> = {}): LibraryTrack 
   beat_grid_anchor_ms: 0,
   beat_period_ms: 60_000.0 / 124.0,
   downbeats_ms: [],
+  hot_cues: [null, null, null, null, null, null, null, null],
   ...extra,
 });
 

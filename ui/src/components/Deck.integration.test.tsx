@@ -7,6 +7,10 @@ import { Deck } from "./Deck";
 import type { Deck as DeckState } from "../store/engine";
 import type { JsonRpcWS } from "../ws/client";
 import { __resetEffectsManifest } from "../store/effectsManifest";
+import {
+  __resetHotCuePersist,
+  noteLoadedTrack,
+} from "../store/hotCuePersist";
 
 interface MockBundle {
   client: JsonRpcWS;
@@ -55,11 +59,13 @@ describe("Deck (integration)", () => {
   beforeEach((): void => {
     vi.useFakeTimers();
     __resetEffectsManifest();
+    __resetHotCuePersist();
   });
   afterEach((): void => {
     vi.useRealTimers();
     cleanup();
     __resetEffectsManifest();
+    __resetHotCuePersist();
   });
 
   it("emits DeckPlay when play button is clicked on a paused loaded deck", (): void => {
@@ -234,6 +240,53 @@ describe("Deck (integration)", () => {
       { HotCueTrigger: { deck: "A", slot: 2 } },
       { HotCueSet: { deck: "A", slot: 2, position_ms: 7777 } },
     ]);
+  });
+
+  it("HotCueSet (long-press) triggers library.set_hot_cues after 500ms debounce", (): void => {
+    const mb = makeClient();
+    // Pretend a library track is loaded on deck A — Deck.tsx's drop
+    // handler / TrackRow click normally registers this binding.
+    noteLoadedTrack("A", "song-7");
+    render(
+      <Deck
+        deck={loadedDeck({ position_ms: 7777 })}
+        side="left"
+        client={mb.client}
+      />,
+    );
+    const pad = screen.getByTestId("cue-A-2");
+
+    // Long press → HotCueSet (engine-side) + queued library write.
+    fireEvent.pointerDown(pad);
+    vi.advanceTimersByTime(500);
+    fireEvent.pointerUp(pad);
+
+    // Engine event fired immediately.
+    const engineEvents = submittedEvents(mb);
+    expect(engineEvents).toEqual([
+      { HotCueSet: { deck: "A", slot: 2, position_ms: 7777 } },
+    ]);
+
+    // Library write hasn't fired yet — debounce window is 500ms.
+    const libCallsBefore = mb.call.mock.calls.filter(
+      (c): boolean => c[0] === "library.set_hot_cues",
+    );
+    expect(libCallsBefore).toHaveLength(0);
+
+    // After the debounce window, the library write fires once.
+    vi.advanceTimersByTime(550);
+    const libCalls = mb.call.mock.calls.filter(
+      (c): boolean => c[0] === "library.set_hot_cues",
+    );
+    expect(libCalls).toHaveLength(1);
+    const params = libCalls[0][1] as {
+      track_id: string;
+      hot_cues: ReadonlyArray<number | null>;
+    };
+    expect(params.track_id).toBe("song-7");
+    // Slot 2 set to current position; other slots untouched (null).
+    expect(params.hot_cues[2]).toBe(7777);
+    expect(params.hot_cues.filter((v): boolean => v !== null)).toEqual([7777]);
   });
 
   it("emits CopilotEngage when off and CopilotDisengage when on", (): void => {
