@@ -29,8 +29,25 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     p.add_argument(
         "--engine-ws",
+        "--engine-url",
+        dest="engine_ws",
         default=os.environ.get("HYPEHOUSE_ENGINE_WS"),
-        help="engine WebSocket URL (overrides $HYPEHOUSE_ENGINE_WS).",
+        help="engine WebSocket URL (overrides $HYPEHOUSE_ENGINE_WS). "
+        "Default: ws://127.0.0.1:8765.",
+    )
+    p.add_argument(
+        "--bridge-token",
+        default=os.environ.get("HYPEHOUSE_BRIDGE_TOKEN", ""),
+        help="bearer token for in-band auth.hello (default: $HYPEHOUSE_BRIDGE_TOKEN).",
+    )
+    p.add_argument(
+        "--legacy-loop",
+        action="store_true",
+        help=(
+            "use the legacy aiohttp-based service loop instead of the "
+            "EngineClient + TransitionProposer wiring. "
+            "Default is the new loop (PR copilot-engine-ws-subscribe)."
+        ),
     )
     p.add_argument(
         "--library-db",
@@ -55,7 +72,12 @@ async def _run(args: argparse.Namespace) -> int:
     log = logging.getLogger("copilot.main")
     log.info("opening library at %s", args.library_db)
     library = TrackLibrary(args.library_db)
-    service = CoPilotService(library, engine_ws_url=args.engine_ws)
+    service = CoPilotService(
+        library,
+        engine_ws_url=args.engine_ws,
+        bridge_token=args.bridge_token,
+    )
+    run_coro = service.run() if args.legacy_loop else service.run_with_proposer()
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -71,7 +93,7 @@ async def _run(args: argparse.Namespace) -> int:
             # Windows / non-mainloop — fall back to default handlers.
             signal.signal(sig, _request_stop)
 
-    runner = asyncio.create_task(service.run(), name="copilot-service-run")
+    runner = asyncio.create_task(run_coro, name="copilot-service-run")
     waiter = asyncio.create_task(stop.wait(), name="copilot-stop-waiter")
     try:
         done, _pending = await asyncio.wait(

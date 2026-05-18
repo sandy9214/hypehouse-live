@@ -20,7 +20,11 @@ dependencies = [
     "pydub>=0.25.1",
     "pyloudnorm>=0.1.1",
     # Network — JSON-RPC WebSocket client to the Rust engine.
+    # aiohttp drives the legacy ``CoPilotService.run()`` loop; the
+    # ``websockets`` library drives the modern ``EngineClient`` path
+    # introduced in PR copilot-engine-ws-subscribe.
     "aiohttp>=3.9",
+    "websockets>=13.0,<17",
     # Envelope validation. pydantic v2 — engine ships matching schema in
     # `engine/src/state.rs` via serde_json so we validate the wire shape here.
     "pydantic>=2.5,<3",
@@ -53,6 +57,9 @@ package-dir = { copilot = ".", "copilot.vendor" = "vendor", "copilot.tests" = "t
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "integration: end-to-end tests that spawn the real engine binary. Skipped if the binary is missing.",
+]
 filterwarnings = [
     # librosa pulls audioread which warns under py3.12; not actionable here.
     "ignore::DeprecationWarning:audioread.*",
