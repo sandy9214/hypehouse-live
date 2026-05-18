@@ -134,6 +134,44 @@ impl DecodeHandle {
     }
 }
 
+/// 4-up handle for stem-aware playback (vocals/drums/bass/other).
+///
+/// Each entry is an independent `DecodeHandle` into the underlying
+/// service's slot table — the stem-aware playback path opens four
+/// regular decode slots (one per WAV) and bundles them in a single
+/// POD struct for the audio thread. The thread reads each stem via
+/// [`DecodeService::read_stem`] (which dispatches to the underlying
+/// `read` for the indexed slot) and mixes them per-block with the
+/// deck's `stem_gains` envelope.
+///
+/// `Copy + Send + Sync + 'static` so it fits in an `AudioCommand`
+/// variant. Total size = 4 × 4 bytes = 16 bytes; the per-stem
+/// `DecodeHandle::NONE` sentinel marks unused slots (today we always
+/// fill all four — partial fills are a future-proofing concession).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StemHandle(pub [DecodeHandle; 4]);
+
+impl StemHandle {
+    /// Sentinel "no stems loaded".
+    pub const NONE: StemHandle = StemHandle([DecodeHandle::NONE; 4]);
+
+    /// True if at least one stem slot is filled.
+    pub fn is_some(&self) -> bool {
+        self.0.iter().any(|h| h.is_some())
+    }
+
+    /// Borrow the underlying `DecodeHandle` for `stem_idx` (0..4).
+    /// Returns `DecodeHandle::NONE` for out-of-range indices.
+    #[inline]
+    pub fn get(&self, stem_idx: usize) -> DecodeHandle {
+        if stem_idx < 4 {
+            self.0[stem_idx]
+        } else {
+            DecodeHandle::NONE
+        }
+    }
+}
+
 /// Decoder-side trait. The control thread calls `open` + `close`; the
 /// audio thread calls `read` (alloc-free, no syscalls, no blocking).
 ///
@@ -159,6 +197,81 @@ pub trait DecodeService: Send + Sync {
     /// Total underrun events across all handles since service start
     /// (one event per render call that had to silence-pad).
     fn underrun_count(&self) -> u64;
+
+    /// Open four stem WAVs (vocals/drums/bass/other) as a single
+    /// bundled handle. Each stem is opened via the same path as a
+    /// regular `open` so the underlying slot table is shared — this
+    /// consumes **4 slots**. If any single stem open fails, ALL
+    /// previously-opened stems in the same call are closed before
+    /// the error is returned (atomic open guarantee).
+    ///
+    /// **Control thread only.**
+    ///
+    /// Default implementation delegates to `open()` four times +
+    /// rolls back on partial failure; production services may
+    /// override for batching but the contract is identical.
+    fn open_stems(
+        &self,
+        track: &TrackRef,
+        stem_paths: &[String; 4],
+        target_sample_rate: u32,
+    ) -> Result<StemHandle, DecodeError> {
+        let mut handles = [DecodeHandle::NONE; 4];
+        for (i, path) in stem_paths.iter().enumerate() {
+            // Decorate the track id so the spawned decoder thread
+            // has a recognisable name (`hh-decode-<id>::stem<i>`)
+            // and trace-level diagnostics distinguish stems.
+            let stem_ref = TrackRef {
+                id: format!("{}::stem{}", track.id, i),
+                path: path.clone(),
+            };
+            match self.open(&stem_ref, target_sample_rate) {
+                Ok(h) => handles[i] = h,
+                Err(e) => {
+                    // Roll back any stems already opened in this call.
+                    for h in handles.iter().take(i) {
+                        if h.is_some() {
+                            self.close(*h);
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(StemHandle(handles))
+    }
+
+    /// Read `buf.len()` interleaved stereo f32 samples from the
+    /// `stem_idx`-th stem in `handle`. Returns the number of samples
+    /// written. Tail filled with `0.0` on underrun (or silently if
+    /// the requested stem is unbound — `DecodeHandle::NONE`).
+    ///
+    /// **Audio-thread safe**: alloc-free; defers to the underlying
+    /// `read()` for the indexed `DecodeHandle`.
+    fn read_stem(&self, handle: StemHandle, stem_idx: usize, buf: &mut [f32]) -> usize {
+        let h = handle.get(stem_idx);
+        if !h.is_some() {
+            // Silent zero-fill so the mixer can MAC against a quiet
+            // buffer instead of branching per sample.
+            for s in buf.iter_mut() {
+                *s = 0.0;
+            }
+            return buf.len();
+        }
+        self.read(h, buf)
+    }
+
+    /// Close all 4 stems in `handle`. Idempotent — calling on an
+    /// already-closed handle is a no-op.
+    ///
+    /// **Control thread only.**
+    fn close_stems(&self, handle: StemHandle) {
+        for h in handle.0.iter() {
+            if h.is_some() {
+                self.close(*h);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -812,7 +925,7 @@ impl DecodeService for StubDecodeService {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::time::Duration;
 

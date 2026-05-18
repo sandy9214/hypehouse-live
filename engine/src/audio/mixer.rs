@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use crate::audio::clock::SharedClock;
 use crate::audio::command::{AudioCommand, AudioCommandKind};
-use crate::audio::decode::{DecodeHandle, DecodeService};
+use crate::audio::decode::{DecodeHandle, DecodeService, StemHandle};
 use crate::audio::effects::{FxBank, EFFECT_NONE};
 use crate::audio::limiter::MasterLimiter;
 use crate::audio::pitch_tempo::{PitchTempo, CHUNK_FRAMES as PT_CHUNK_FRAMES};
@@ -75,6 +75,15 @@ struct DeckHot {
     /// frames from the decode service instead of running the
     /// fallback oscillator.
     loaded: DecodeHandle,
+    /// Stem-aware playback handle. `StemHandle::NONE` if the deck is
+    /// in regular full-mix mode. When set, takes priority over
+    /// `loaded` — the mixer pulls 4 per-stem streams and mixes them
+    /// with `stem_gains` instead of pulling the full mix.
+    stem_handle: StemHandle,
+    /// Per-stem linear gain (vocals/drums/bass/other). Default
+    /// `[1, 1, 1, 1]` = all stems audible = ~ full mix. Updated by
+    /// `AudioCommandKind::SetStemGain`.
+    stem_gains: [f32; 4],
 }
 
 impl DeckHot {
@@ -86,6 +95,8 @@ impl DeckHot {
             gain: 1.0,
             handoff_until_frame: 0,
             loaded: DecodeHandle::NONE,
+            stem_handle: StemHandle::NONE,
+            stem_gains: [1.0; 4],
         }
     }
 }
@@ -115,6 +126,14 @@ pub struct AudioMixer {
     /// Per-render scratch buffer for stereo pulls. Allocated once at
     /// construction; the render loop only writes into a prefix of it.
     stereo_scratch: [f32; MAX_STEREO_SCRATCH],
+    /// Per-render scratch buffer for one stem pull, re-used across
+    /// the 4 stems × 2 decks inside `render()`. Sized to one
+    /// `STEREO_PULL_FRAMES` chunk of interleaved-stereo (= 512 f32
+    /// = 2 KB). The mixer pulls stem N into this slice, MACs it into
+    /// the deck slice with `stem_gains[N]`, then re-uses for stem
+    /// N+1 — keeping the audio-thread footprint constant regardless
+    /// of stem count. No allocation on the hot path.
+    stem_scratch: [f32; STEREO_PULL_FRAMES * 2],
     /// ADR-006 — per-deck 3-slot effects chain. Pre-allocated:
     /// every slot owns all 4 effect instances and dispatches by
     /// `effect_id`. Audio-thread alloc-free; switching effects just
@@ -174,6 +193,7 @@ impl AudioMixer {
             deck_b: DeckHot::new(220.0),
             decode: None,
             stereo_scratch: [0.0; MAX_STEREO_SCRATCH],
+            stem_scratch: [0.0; STEREO_PULL_FRAMES * 2],
             effects_a: [mk_bank(), mk_bank(), mk_bank()],
             effects_b: [mk_bank(), mk_bank(), mk_bank()],
             pitch_tempo_a: PitchTempo::new(DeckId::A),
@@ -261,11 +281,37 @@ impl AudioMixer {
                 // v0.1: loops require buffer playback; no-op.
             }
             AudioCommandKind::DeckLoad { deck, handle } => {
-                self.deck_mut(deck).loaded = handle;
+                let d = self.deck_mut(deck);
+                d.loaded = handle;
+                // Switching back to full-mix mode clears any prior
+                // stem-handle (mutually exclusive playback paths).
+                d.stem_handle = StemHandle::NONE;
+                d.stem_gains = [1.0; 4];
+            }
+            AudioCommandKind::DeckLoadStems { deck, stems } => {
+                // Stem-mode load — clear the full-mix handle so the
+                // render path picks up the stem pull instead. Reset
+                // stem_gains to the all-audible baseline (mirrors
+                // the reducer; both must agree because the audio
+                // thread can drop a `SetStemGain` command if the
+                // ring is briefly saturated).
+                let d = self.deck_mut(deck);
+                d.loaded = DecodeHandle::NONE;
+                d.stem_handle = stems;
+                d.stem_gains = [1.0; 4];
+            }
+            AudioCommandKind::SetStemGain { deck, stem, gain } => {
+                // Defensive: clamp gain and silent-ignore an
+                // out-of-range stem index (matches reducer).
+                if (stem as usize) < 4 {
+                    self.deck_mut(deck).stem_gains[stem as usize] = gain.clamp(0.0, 1.0);
+                }
             }
             AudioCommandKind::DeckUnload { deck } => {
                 let d = self.deck_mut(deck);
                 d.loaded = DecodeHandle::NONE;
+                d.stem_handle = StemHandle::NONE;
+                d.stem_gains = [1.0; 4];
                 d.playing = false;
             }
             AudioCommandKind::ArmHandoff { deck, until_frame } => {
@@ -369,8 +415,15 @@ impl AudioMixer {
             // Borrow-checker dance: do A then B via split_at_mut so
             // each call has its own &mut slice.
             let (a_slice, b_slice) = self.stereo_scratch[..b_end].split_at_mut(a_end);
-            let a_pulled = pull_deck(&self.decode, &self.deck_a, a_slice);
-            let b_pulled = pull_deck(&self.decode, &self.deck_b, b_slice);
+            // Stem-mode path takes priority over the full-mix path:
+            // if the deck holds a `StemHandle`, mix its 4 stems into
+            // the deck slice with `stem_gains`. Otherwise fall back
+            // to the regular single-handle pull (or the oscillator
+            // if no handle either).
+            let a_pulled =
+                pull_deck_or_stems(&self.decode, &self.deck_a, a_slice, &mut self.stem_scratch);
+            let b_pulled =
+                pull_deck_or_stems(&self.decode, &self.deck_b, b_slice, &mut self.stem_scratch);
 
             // Materialize each deck as interleaved stereo into its
             // scratch slice. If the decoder didn't supply data, run
@@ -575,20 +628,75 @@ impl AudioMixer {
 
 /// Try to pull `dest.len()` (interleaved stereo) samples into `dest`
 /// for the given deck. Returns `true` if the decode pipeline supplied
-/// the data (i.e., deck is playing + has a loaded handle + a service
-/// is wired); `false` if the caller should fall back to the
-/// oscillator path.
+/// the data (i.e., deck is playing + has either a full-mix handle or
+/// a stem-handle bound + a service is wired); `false` if the caller
+/// should fall back to the oscillator path.
+///
+/// **Stem-aware dispatch**: when the deck has a `StemHandle` bound,
+/// the function pulls each of the 4 stems into `stem_scratch` and
+/// MACs them into `dest` weighted by `deck.stem_gains[i]`. This
+/// implements the "kill the vocals" / "drums only" tricks unlocked
+/// by the demucs analyzer (see ADR-TBD stem-aware mixer).
 ///
 /// `dest` is overwritten regardless — on `false` it's left in
 /// whatever state the caller can ignore.
+///
+/// **Audio-thread safe**: alloc-free. `stem_scratch` is the mixer's
+/// pre-allocated 1-stem scratch (sized `STEREO_PULL_FRAMES * 2`); we
+/// re-use it across the 4 stems via simple slice-borrow rotation.
 #[inline]
-fn pull_deck(decode: &Option<Arc<dyn DecodeService>>, deck: &DeckHot, dest: &mut [f32]) -> bool {
-    if !deck.playing || !deck.loaded.is_some() {
+fn pull_deck_or_stems(
+    decode: &Option<Arc<dyn DecodeService>>,
+    deck: &DeckHot,
+    dest: &mut [f32],
+    stem_scratch: &mut [f32],
+) -> bool {
+    if !deck.playing {
         return false;
     }
     let Some(svc) = decode.as_ref() else {
         return false;
     };
+    // Stem-mode takes priority. Mutual exclusivity is enforced at
+    // command-apply time, so at most one of the two handles is
+    // populated; the check ordering here is therefore semantically
+    // redundant but defensive.
+    if deck.stem_handle.is_some() {
+        // Zero the destination so we can accumulate via MAC instead
+        // of a per-stem overwrite-then-merge. One memset is cheap
+        // (`STEREO_PULL_FRAMES * 2 = 512` f32) and keeps the inner
+        // loop branch-free.
+        for s in dest.iter_mut() {
+            *s = 0.0;
+        }
+        let n = dest.len().min(stem_scratch.len());
+        let dest_n = &mut dest[..n];
+        let scratch_n = &mut stem_scratch[..n];
+        for stem_idx in 0..4 {
+            let gain = deck.stem_gains[stem_idx];
+            // Skip muted stems entirely — saves an entire ring drain
+            // + N MACs for the canonical "kill vocals" case where
+            // gain[0] = 0. Real-world: a paused stem's underlying
+            // decoder thread is still pushing, so the ring stays
+            // populated even when we skip its pop here; no risk of
+            // long-term ring fill drift.
+            if gain == 0.0 {
+                continue;
+            }
+            // Pull this stem into the shared single-stem scratch.
+            // `read_stem` zero-fills if the stem slot is NONE so
+            // the MAC stays well-behaved.
+            let _ = svc.read_stem(deck.stem_handle, stem_idx, scratch_n);
+            // MAC: dest[i] += gain * scratch[i].
+            for (d, s) in dest_n.iter_mut().zip(scratch_n.iter()) {
+                *d += gain * *s;
+            }
+        }
+        return true;
+    }
+    if !deck.loaded.is_some() {
+        return false;
+    }
     let _ = svc.read(deck.loaded, dest);
     true
 }
@@ -1172,6 +1280,117 @@ mod tests {
             curve: CrossfaderCurve::Scratch,
         }));
         assert_eq!(m.crossfader_curve(), CrossfaderCurve::Scratch);
+    }
+
+    // -----------------------------------------------------------------
+    // Stem-aware playback (engine-stem-aware-mixer PR)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn render_with_stem_handle_active_is_alloc_free() {
+        // ADR-004 — when a deck is in stem-mode the mixer pulls 4
+        // separate decoder rings + MACs them with the per-stem gain
+        // envelope. The hot path must remain alloc-free, just like
+        // the regular full-mix path. We exercise the path with the
+        // production `SymphoniaDecodeService` so we're testing the
+        // same `read_stem` dispatch the real audio thread uses
+        // (`StubDecodeService` would skip the realistic ring pop).
+        use crate::audio::decode::{DecodeService, SymphoniaDecodeService};
+        use crate::state::TrackRef;
+        use std::sync::Arc;
+
+        let svc = SymphoniaDecodeService::new();
+        // Build four short WAV stems + register inline so we don't
+        // touch the filesystem.
+        for (key, freq) in [
+            ("voc", 440.0_f32),
+            ("drm", 220.0),
+            ("bas", 110.0),
+            ("oth", 880.0),
+        ] {
+            let wav = crate::audio::decode::tests::build_wav(
+                2,
+                48_000,
+                &crate::audio::decode::tests::sine_pcm16(freq, 48_000, 0.5, 2),
+            );
+            svc.register_inline_source(key, wav);
+        }
+        let track = TrackRef {
+            id: "stem-track".into(),
+            path: "mem://voc".into(),
+        };
+        let stem_paths = [
+            "mem://voc".into(),
+            "mem://drm".into(),
+            "mem://bas".into(),
+            "mem://oth".into(),
+        ];
+        let stems = svc
+            .open_stems(&track, &stem_paths, 48_000)
+            .expect("open_stems should succeed");
+        // Give the decoder threads a moment to populate the rings.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+
+        let svc_arc: Arc<dyn DecodeService> = Arc::new(svc.clone());
+        let mut m = AudioMixer::with_decode(48_000, svc_arc);
+        // Bind the stem handle to deck A + start playing.
+        m.apply(cmd(AudioCommandKind::DeckLoadStems {
+            deck: DeckId::A,
+            stems,
+        }));
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::A }));
+        // Default gains = all-audible; one set-stem-gain to vary
+        // the inner-loop branch (some stems active, some muted)
+        // so the alloc-free gate covers the skip path too.
+        m.apply(cmd(AudioCommandKind::SetStemGain {
+            deck: DeckId::A,
+            stem: 0,
+            gain: 0.0,
+        }));
+
+        let mut buf = [0.0_f32; 1024];
+        // Prime — first render fills rubato's polynomial state if
+        // present. (For default pitch/tempo it'll short-circuit but
+        // we prime anyway to model the production hot loop.)
+        m.render(&mut buf);
+        assert_no_alloc::assert_no_alloc(|| {
+            m.render(&mut buf);
+        });
+        // Sanity: the rendered buffer must contain audible energy
+        // from the un-muted stems (a regression that quietly broke
+        // the MAC path would silently leave `buf` at zero).
+        let energy: f32 = buf.iter().map(|s| s * s).sum::<f32>() / buf.len() as f32;
+        assert!(
+            energy > 1e-6,
+            "stem mix should produce audible energy; got {energy}"
+        );
+        // Latency probe — 1024-frame render with the 4-stem MAC path
+        // active. ADR-004 budget for the audio callback at
+        // 1024 / 48 kHz = 21.3 ms wall-clock; we want render() to
+        // stay well inside that even with the per-stem accumulation.
+        let mut worst = std::time::Duration::ZERO;
+        for _ in 0..50 {
+            let t = std::time::Instant::now();
+            m.render(&mut buf);
+            let dt = t.elapsed();
+            if dt > worst {
+                worst = dt;
+            }
+        }
+        eprintln!("[stem-latency] 1024-frame render w/ 4-stem MAC + 1 muted: worst = {worst:?}");
+        // Use the same 3 ms release / 15 ms debug budget as the
+        // pitch+tempo latency test — same audio-thread contract.
+        let budget = if cfg!(debug_assertions) {
+            std::time::Duration::from_millis(15)
+        } else {
+            std::time::Duration::from_millis(3)
+        };
+        assert!(
+            worst <= budget,
+            "stem render exceeded latency budget: worst {worst:?} > {budget:?}"
+        );
+
+        svc.close_stems(stems);
     }
 
     #[test]

@@ -12,7 +12,7 @@
 //!   `Arc<DecodedTrack>` etc. lives in a registry the audio thread reads
 //!   lock-free by index.
 
-use crate::audio::decode::DecodeHandle;
+use crate::audio::decode::{DecodeHandle, StemHandle};
 use crate::state::{CrossfaderCurve, DeckId};
 
 /// Maximum on-wire fixed-buffer length we allow inside an `AudioCommand`.
@@ -117,6 +117,29 @@ pub enum AudioCommandKind {
     DeckLoad {
         deck: DeckId,
         handle: DecodeHandle,
+    },
+    /// Stem-aware deck load — 4 stem handles (vocals/drums/bass/other)
+    /// bundled into a single `StemHandle`. The audio thread pulls
+    /// each stem independently via `DecodeService::read_stem` and
+    /// mixes with the deck's `stem_gains` envelope. Mutually
+    /// exclusive with `DeckLoad` on the same deck: this variant
+    /// clears any existing `DecodeHandle` on the deck's hot state,
+    /// `DeckLoad` clears any existing `StemHandle`.
+    ///
+    /// Size: `at_frame` (8) + tag (~1) + `DeckId` (~1) + `StemHandle`
+    /// (16 = 4×u32) = 26 bytes — comfortably inside the 64-byte
+    /// `AudioCommand` ceiling pinned by `command_size_is_bounded`.
+    DeckLoadStems {
+        deck: DeckId,
+        stems: StemHandle,
+    },
+    /// Per-stem linear gain (clamped to `[0, 1]`). Stem indexing:
+    /// 0=vocals, 1=drums, 2=bass, 3=other. Out-of-range indices are
+    /// silent no-ops on the audio side too.
+    SetStemGain {
+        deck: DeckId,
+        stem: u8,
+        gain: f32,
     },
     DeckUnload {
         deck: DeckId,
