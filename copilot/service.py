@@ -26,7 +26,9 @@ import aiohttp
 from pydantic import ValidationError
 
 from .decisions import NextTrackPlan, next_track_decision, transition_plan
+from .engine_client import EngineClient
 from .library import TrackLibrary
+from .proposer import Proposal, TransitionProposer
 from .schemas import (
     DeckId,
     EngineState,
@@ -63,12 +65,17 @@ class CoPilotService:
         engine_ws_url: str | None = None,
         *,
         end_of_track_trigger_ms: int = _END_OF_TRACK_TRIGGER_MS,
+        bridge_token: str = "",
+        proposer: TransitionProposer | None = None,
     ):
         self._library = library
         self._engine_ws_url = engine_ws_url or os.environ.get(
             "HYPEHOUSE_ENGINE_WS", DEFAULT_ENGINE_WS
         )
         self._end_of_track_trigger_ms = end_of_track_trigger_ms
+        self._bridge_token = bridge_token or os.environ.get(
+            "HYPEHOUSE_BRIDGE_TOKEN", ""
+        )
 
         # Per-deck "decision already submitted for this transition" guards.
         # Cleared when the deck no longer satisfies the trigger condition
@@ -83,6 +90,11 @@ class CoPilotService:
 
         # The active websocket — set inside ``run()``.
         self._ws: aiohttp.ClientWebSocketResponse | None = None
+
+        # Proposer for the new run_with_proposer() loop. Created lazily
+        # when not injected so unit tests that only exercise
+        # handle_notification() don't pay the cost.
+        self._proposer: TransitionProposer | None = proposer
 
     # ----- public surface for tests + callers -----
 
@@ -251,3 +263,77 @@ class CoPilotService:
             elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
                 log.info("engine WS closed")
                 break
+
+    # ----- proposer-based loop (PR #N: copilot-engine-ws-subscribe) -----
+
+    @property
+    def proposer(self) -> TransitionProposer:
+        """Lazy-init the proposer so tests not exercising it skip the cost."""
+        if self._proposer is None:
+            self._proposer = TransitionProposer(self._library)
+        return self._proposer
+
+    async def run_with_proposer(self) -> None:
+        """Modern wiring: :class:`EngineClient` + :class:`TransitionProposer`.
+
+        Differences from the legacy :meth:`run`:
+
+        * Uses the ``websockets`` transport with explicit ``auth.hello``.
+        * Funnels state-changed through the proposer's hysteresis filter
+          rather than the per-deck "decision in flight" guard.
+        * Submits events via ``EngineClient.call("engine.submit_event")``
+          and awaits the response — easier to surface engine-side errors
+          (e.g. ``-32000 ENGINE_OFFLINE``) than the fire-and-forget
+          ``ws.send_str`` legacy path.
+
+        Either ``run()`` *or* ``run_with_proposer()`` should be in flight
+        at a time — they share the same proposer / decision bookkeeping.
+        """
+        client = EngineClient(self._engine_ws_url, token=self._bridge_token)
+        proposer = self.proposer
+
+        async def on_state(state: EngineState) -> None:
+            self._last_state = state
+            proposal: Proposal | None = proposer.on_state(state)
+            if proposal is None:
+                return
+            # Per-deck copilot_engaged gate — proposer doesn't enforce
+            # this (it's pure on library compatibility) so we check
+            # here. The receiving deck is `target_deck`.
+            target_deck = proposal.transition_plan.target_deck
+            if not state.deck(target_deck).copilot_engaged:
+                # The *current* state's target deck may be co-pilot-off
+                # even if the playing deck has co-pilot on. We respect
+                # the receiving deck's engagement, not the playing one,
+                # to keep the operator's "this deck is mine" toggle
+                # authoritative.
+                log.debug(
+                    "proposer fired for deck %s but copilot_engaged=False; suppressed",
+                    target_deck.value,
+                )
+                return
+            log.info(
+                "proposer: load %s on deck %s (confidence=%.2f) — %d events",
+                proposal.next_track_id,
+                target_deck.value,
+                proposal.confidence,
+                len(proposal.events),
+            )
+            for ev in proposal.events:
+                try:
+                    await client.call(
+                        "engine.submit_event",
+                        {"event": ev.model_dump(mode="json")},
+                    )
+                except (RuntimeError, asyncio.TimeoutError) as exc:
+                    log.warning(
+                        "submit_event failed (%s); abandoning rest of plan",
+                        exc,
+                    )
+                    return
+
+        await client.subscribe(on_state)
+        try:
+            await client.run()
+        finally:
+            await client.aclose()
