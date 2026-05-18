@@ -1,27 +1,43 @@
 name: copilot-ci
 
 # Python AI co-pilot service (JSON-RPC client → engine).
-# Runs only when copilot/ changes. mypy starts non-blocking; promote to
-# blocking once the codebase is fully type-annotated.
+# mypy starts non-blocking; promote to blocking once the codebase is
+# fully type-annotated.
+#
+# Trigger note: workflow-level `paths:` was removed (#24) so this
+# workflow runs on every PR. The test job is skipped when no copilot
+# paths changed; the final `summary` job always reports so branch
+# protection can require it.
 
 on:
   push:
     branches: [main]
-    paths:
-      - 'copilot/**'
-      - '.github/workflows/copilot-ci.yml'
   pull_request:
     branches: [main]
-    paths:
-      - 'copilot/**'
-      - '.github/workflows/copilot-ci.yml'
 
 permissions:
   contents: read
 
 jobs:
+  changes:
+    name: detect-copilot-changes
+    runs-on: ubuntu-latest
+    outputs:
+      copilot: ${{ steps.filter.outputs.copilot }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            copilot:
+              - 'copilot/**'
+              - '.github/workflows/copilot-ci.yml'
+
   test:
     name: copilot lint + test (ubuntu / py3.11)
+    needs: changes
+    if: needs.changes.outputs.copilot == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -53,3 +69,17 @@ jobs:
 
       - name: pytest
         run: pytest
+
+  summary:
+    name: copilot-ci-summary
+    needs: [test]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - name: report
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "Upstream copilot-ci job failed"
+            exit 1
+          fi
+          echo "all upstream succeeded or skipped — ok"

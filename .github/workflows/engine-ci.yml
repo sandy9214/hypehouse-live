@@ -1,19 +1,22 @@
 name: engine-ci
 
 # Rust audio engine — sub-5ms latency, no_alloc audio thread.
-# Matrix across the 3 supported desktop hosts. Runs only when engine/ changes.
+# Matrix across the 3 supported desktop hosts.
+#
+# Trigger note: this workflow used to be `paths:`-filtered at the trigger
+# level so it only ran when `engine/**` changed. That left branch
+# protection unable to require any check from this workflow (the check
+# never reported on PRs touching only ui/ or copilot/). Issue #24 moves
+# the path filter inside the workflow: the workflow now runs on every
+# PR, but the heavy matrix job is skipped when no engine paths changed,
+# and a final `summary` job ALWAYS reports so branch protection can
+# require it.
 
 on:
   push:
     branches: [main]
-    paths:
-      - 'engine/**'
-      - '.github/workflows/engine-ci.yml'
   pull_request:
     branches: [main]
-    paths:
-      - 'engine/**'
-      - '.github/workflows/engine-ci.yml'
 
 permissions:
   contents: read
@@ -25,8 +28,25 @@ env:
   RUST_TOOLCHAIN: "1.85"
 
 jobs:
+  changes:
+    name: detect-engine-changes
+    runs-on: ubuntu-latest
+    outputs:
+      engine: ${{ steps.filter.outputs.engine }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            engine:
+              - 'engine/**'
+              - '.github/workflows/engine-ci.yml'
+
   check:
     name: ${{ matrix.os }} / rust ${{ matrix.rust }}
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -74,3 +94,17 @@ jobs:
       - name: cargo build --release (ubuntu only — release-binary smoke)
         if: runner.os == 'Linux'
         run: cargo build --release
+
+  summary:
+    name: engine-ci-summary
+    needs: [check]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - name: report
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "Upstream engine-ci job failed"
+            exit 1
+          fi
+          echo "all upstream succeeded or skipped — ok"

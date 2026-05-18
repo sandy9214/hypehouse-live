@@ -1,27 +1,41 @@
 name: ui-ci
 
-# TypeScript frontend (Vite + React + Vitest). Runs only when ui/ changes.
-# ui/ scaffold lands via a separate PR; this workflow no-ops until then thanks
-# to the paths filter (no triggers fire on docs-only PRs).
+# TypeScript frontend (Vite + React + Vitest).
+#
+# Trigger note: workflow-level `paths:` was removed (#24) so this
+# workflow runs on every PR. The build job is skipped when no ui paths
+# changed; the final `summary` job always reports so branch protection
+# can require it.
 
 on:
   push:
     branches: [main]
-    paths:
-      - 'ui/**'
-      - '.github/workflows/ui-ci.yml'
   pull_request:
     branches: [main]
-    paths:
-      - 'ui/**'
-      - '.github/workflows/ui-ci.yml'
 
 permissions:
   contents: read
 
 jobs:
+  changes:
+    name: detect-ui-changes
+    runs-on: ubuntu-latest
+    outputs:
+      ui: ${{ steps.filter.outputs.ui }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            ui:
+              - 'ui/**'
+              - '.github/workflows/ui-ci.yml'
+
   build:
     name: ui build + test (ubuntu / node 20)
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -47,3 +61,17 @@ jobs:
 
       - name: build
         run: npm run build
+
+  summary:
+    name: ui-ci-summary
+    needs: [build]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - name: report
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "Upstream ui-ci job failed"
+            exit 1
+          fi
+          echo "all upstream succeeded or skipped — ok"
