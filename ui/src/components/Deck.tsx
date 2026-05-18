@@ -12,6 +12,8 @@ import type { JsonRpcWS } from "../ws/client";
 import type { Deck as DeckState } from "../store/engine";
 import { extrapolatedPosition, setDeckDuration } from "../store/engine";
 import type { LibraryTrack } from "../store/library";
+import { useAutoMix } from "../store/autoMix";
+import { AutoMixButton } from "./AutoMixButton";
 import { Waveform } from "./Waveform";
 import {
   fmtMs,
@@ -79,6 +81,9 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
   const hasLoopIn = deck.loop_in_ms !== null;
   const looping = loopActive(deck);
   const manifest = useEffectsManifest(client);
+  // Subscribe to the auto-mix state machine for this deck. The hook
+  // re-renders only when the per-deck snapshot reference changes.
+  const autoMixSnapshot = useAutoMix(deck.id);
 
   // Track the library track id currently bound to this deck so we can
   // fetch peaks. `noteLoadedTrack` (fired from the drop handler below)
@@ -288,6 +293,12 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
         onLoopIn={onLoopIn}
         onLoopOut={onLoopOut}
         onCopilotToggle={onCopilotToggle}
+      />
+
+      <AutoMixButton
+        deck={deck.id}
+        client={client}
+        snapshot={autoMixSnapshot}
       />
 
       <KnobRow
