@@ -11,12 +11,19 @@
 // The MIDI keyboard mapping is the source of truth for production
 // use; this is a convenience overlay for the desktop browser preview.
 
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Deck } from "./Deck";
 import { Crossfader } from "./Crossfader";
 import { Library } from "./Library";
+import { Sessions } from "./Sessions";
 import { JsonRpcWS } from "../ws/client";
 import { applyNotification, useEngineState } from "../store/engine";
+
+/** Which secondary surface the user is looking at — live mixing
+ * (default) or the read-only past-sessions History panel. Lives at
+ * the DeckRow level so the toggle button can stay in the main
+ * decks chrome; only the bottom slot swaps. */
+type SecondaryTab = "live" | "history";
 
 const wsUrl = (): string => {
   // Vite dev server proxies /ws to the Rust engine; prod build can
@@ -41,6 +48,7 @@ export const DeckRow = (): JSX.Element => {
     [],
   );
   const state = useEngineState();
+  const [tab, setTab] = useState<SecondaryTab>("live");
 
   useEffect((): (() => void) => {
     const unsubscribe = client.subscribe(applyNotification);
@@ -95,7 +103,57 @@ export const DeckRow = (): JSX.Element => {
         <Deck deck={state.decks[1]} side="right" client={client} />
       </div>
       <Crossfader client={client} value={state.crossfader} />
-      <Library client={client} />
+      <div
+        style={{
+          display: "flex",
+          gap: 4,
+          padding: "4px 8px",
+          borderTop: "1px solid #222",
+          background: "#080808",
+        }}
+      >
+        <button
+          type="button"
+          onClick={(): void => setTab("live")}
+          data-testid="tab-live"
+          aria-pressed={tab === "live"}
+          style={{
+            background: tab === "live" ? "#1c2a3d" : "#0c0c0c",
+            color: "#cce0ff",
+            border: "1px solid #2c4361",
+            borderRadius: 3,
+            padding: "3px 12px",
+            fontSize: 11,
+            fontFamily: "monospace",
+            cursor: "pointer",
+          }}
+        >
+          Library
+        </button>
+        <button
+          type="button"
+          onClick={(): void => setTab("history")}
+          data-testid="tab-history"
+          aria-pressed={tab === "history"}
+          style={{
+            background: tab === "history" ? "#1c2a3d" : "#0c0c0c",
+            color: "#cce0ff",
+            border: "1px solid #2c4361",
+            borderRadius: 3,
+            padding: "3px 12px",
+            fontSize: 11,
+            fontFamily: "monospace",
+            cursor: "pointer",
+          }}
+        >
+          History
+        </button>
+      </div>
+      {tab === "live" ? (
+        <Library client={client} />
+      ) : (
+        <Sessions client={client} />
+      )}
     </div>
   );
 };
