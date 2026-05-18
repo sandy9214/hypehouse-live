@@ -35,6 +35,16 @@ use crate::state::{EngineState, Event, EventKind, EventSource};
 
 use super::auth::AuthConfig;
 use super::error::RpcError;
+use super::library_proxy;
+
+/// Method-name prefix that triggers the library proxy hop.
+///
+/// Any RPC whose name starts with `library.` is forwarded by
+/// [`dispatch_with_auth_async`] to the copilot service via
+/// [`library_proxy::forward_library_call`] instead of being dispatched
+/// against the in-process [`EngineHandle`]. Centralising the prefix here
+/// keeps the routing rule in one place.
+pub const LIBRARY_PREFIX: &str = "library.";
 
 // ---------------------------------------------------------------------
 // JSON-RPC 2.0 wire envelopes
@@ -573,6 +583,58 @@ pub fn dispatch_with_auth(
     (dispatch(engine, req), state)
 }
 
+/// Async sibling of [`dispatch_with_auth`].
+///
+/// Adds one extra rule on top of the sync version: methods whose name
+/// starts with [`LIBRARY_PREFIX`] are forwarded over HTTP to the copilot
+/// service via [`library_proxy::forward_library_call`]. Everything else
+/// falls through to the synchronous dispatcher, which still runs on the
+/// caller's task (the work is pure CPU on the engine handle).
+///
+/// The auth gate is enforced **before** the library-proxy hop — the proxy
+/// never receives a frame from a `PendingAuth` connection, so an
+/// unauthenticated UI cannot trigger outbound HTTP traffic.
+pub async fn dispatch_with_auth_async(
+    engine: &EngineHandle,
+    auth: &AuthConfig,
+    state: AuthState,
+    req: RpcRequest,
+) -> (RpcResponse, AuthState) {
+    if !req.is_valid() {
+        return (
+            RpcResponse::err(
+                req.id,
+                RpcError::invalid_request("jsonrpc must be \"2.0\" and method non-empty"),
+            ),
+            state,
+        );
+    }
+
+    if req.method == method::AUTH_HELLO {
+        return dispatch_auth_hello(auth, state, req);
+    }
+
+    if state == AuthState::PendingAuth {
+        return (
+            RpcResponse::err(req.id, RpcError::auth_rejected("authentication required")),
+            state,
+        );
+    }
+
+    if req.method.starts_with(LIBRARY_PREFIX) {
+        let id = req.id.clone();
+        let method = req.method.clone();
+        let params = req.params.unwrap_or(Value::Null);
+        let resp = match library_proxy::forward_library_call(&method, params).await {
+            Ok(result) => RpcResponse::ok(id, result),
+            Err(e) => RpcResponse::err(id, e),
+        };
+        return (resp, state);
+    }
+
+    (dispatch(engine, req), state)
+}
+
 /// Static list of registered (id, name) pairs the manifest exposes.
 ///
 /// Kept inline here (not on the registry) because the wire-facing name
@@ -770,6 +832,10 @@ pub fn audio_alert_notification(kind: &str, details: &str) -> RpcNotification {
 }
 
 #[cfg(test)]
+// The async dispatch tests hold `std::sync::MutexGuard` across `.await`
+// points (the shared env-var lock). Under the default `tokio::test`
+// `current_thread` runtime that's safe; relax the lint module-wide.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::state::{DeckId, EventKind};
@@ -1424,6 +1490,140 @@ mod tests {
         );
         std::env::remove_var(super::super::super::persistence::ENV_LOG_DIR);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---------------------------------------------------------------
+    // library.* proxy routing via dispatch_with_auth_async.
+    //
+    // These tests cover the integration between the bridge dispatch and
+    // the library_proxy module. They share process env
+    // (`HYPEHOUSE_COPILOT_URL`) with the library_proxy unit tests, so we
+    // serialize the env mutations through the same lock pattern.
+    // ---------------------------------------------------------------
+
+    fn proxy_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        // Shared with `library_proxy::tests` — the env var is process
+        // global so both modules must serialize through one Mutex.
+        super::super::library_proxy::copilot_env_lock()
+    }
+
+    #[tokio::test]
+    async fn dispatch_async_routes_library_methods_to_proxy() {
+        // With proxy disabled, every `library.*` call must surface
+        // `-32000 engine offline` — proving the dispatch routed to the
+        // proxy rather than the engine handle (which would have
+        // returned `method_not_found` for `library.list_tracks`).
+        let _g = proxy_env_lock();
+        std::env::set_var(super::super::library_proxy::ENV_COPILOT_URL, "");
+        let e = engine();
+        let auth = AuthConfig::with_token("s3cret");
+        let req = submit(
+            "library.list_tracks",
+            serde_json::json!({ "limit": 100 }),
+            50,
+        );
+        let (resp, new_state) = dispatch_with_auth_async(&e, &auth, AuthState::Authed, req).await;
+        std::env::remove_var(super::super::library_proxy::ENV_COPILOT_URL);
+        assert_eq!(new_state, AuthState::Authed);
+        let err = resp.error.expect("proxy disabled must error");
+        assert_eq!(err.code, super::super::error::ENGINE_OFFLINE);
+    }
+
+    #[tokio::test]
+    async fn dispatch_async_passes_non_library_methods_to_local_engine() {
+        // `engine.submit_event` must still dispatch in-process — the
+        // proxy hop is library-only. Engine ack confirms the local
+        // path ran. With proxy disabled we also prove the local path
+        // is not accidentally short-circuited by the routing rule.
+        let _g = proxy_env_lock();
+        std::env::set_var(super::super::library_proxy::ENV_COPILOT_URL, "");
+        let (e, rx) = engine_with_sink();
+        let auth = AuthConfig::with_token("s3cret");
+        let req = submit(
+            method::SUBMIT_EVENT,
+            serde_json::json!({ "kind": { "DeckPlay": { "deck": "A" } } }),
+            51,
+        );
+        let (resp, new_state) = dispatch_with_auth_async(&e, &auth, AuthState::Authed, req).await;
+        std::env::remove_var(super::super::library_proxy::ENV_COPILOT_URL);
+        assert_eq!(new_state, AuthState::Authed);
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        assert_eq!(resp.result.unwrap()["accepted"], Value::Bool(true));
+        let ev = rx.try_recv().expect("event forwarded onto local sink");
+        match ev.kind {
+            EventKind::DeckPlay { deck: DeckId::A } => {}
+            other => panic!("unexpected event kind: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_async_enforces_auth_gate_before_proxy_hop() {
+        // Pending-auth connections must NOT trigger an outbound proxy
+        // call — the gate fires first. We assert by setting the env to
+        // a URL that would otherwise reach a listener; the test passes
+        // because the dispatch short-circuits with auth_rejected and
+        // we never touch the network.
+        let _g = proxy_env_lock();
+        std::env::set_var(
+            super::super::library_proxy::ENV_COPILOT_URL,
+            "http://127.0.0.1:1/rpc", // would refuse on connect
+        );
+        let e = engine();
+        let auth = AuthConfig::with_token("s3cret");
+        let req = submit("library.list_tracks", serde_json::json!({}), 52);
+        let (resp, new_state) =
+            dispatch_with_auth_async(&e, &auth, AuthState::PendingAuth, req).await;
+        std::env::remove_var(super::super::library_proxy::ENV_COPILOT_URL);
+        let err = resp.error.expect("expected auth_rejected");
+        assert_eq!(err.code, super::super::error::AUTH_REJECTED);
+        assert_eq!(new_state, AuthState::PendingAuth);
+    }
+
+    #[tokio::test]
+    async fn dispatch_async_routes_all_library_methods_uniformly() {
+        // Every `library.*` method must traverse the proxy — not just
+        // `library.list_tracks`. We sample the full method surface
+        // (per `copilot/library_rpc.py::LibraryRpcHandler::METHODS`)
+        // and assert each one comes back with the proxy-disabled
+        // error envelope.
+        let _g = proxy_env_lock();
+        std::env::set_var(super::super::library_proxy::ENV_COPILOT_URL, "");
+        let e = engine();
+        let auth = AuthConfig::with_token("s3cret");
+        for (method_name, params) in [
+            ("library.list_tracks", serde_json::json!({})),
+            ("library.search_tracks", serde_json::json!({ "query": "" })),
+            ("library.add_track", serde_json::json!({ "path": "/x" })),
+            (
+                "library.add_track_from_directory",
+                serde_json::json!({ "path": "/x" }),
+            ),
+            (
+                "library.set_hot_cues",
+                serde_json::json!({
+                    "track_id": "x",
+                    "hot_cues": [null, null, null, null, null, null, null, null]
+                }),
+            ),
+            (
+                "library.get_waveform",
+                serde_json::json!({ "track_id": "x" }),
+            ),
+        ] {
+            let req = submit(method_name, params, 60);
+            let (resp, _new_state) =
+                dispatch_with_auth_async(&e, &auth, AuthState::Authed, req).await;
+            let err = resp
+                .error
+                .unwrap_or_else(|| panic!("expected error for {method_name}"));
+            assert_eq!(
+                err.code,
+                super::super::error::ENGINE_OFFLINE,
+                "method {method_name} did not route to proxy (got code {})",
+                err.code
+            );
+        }
+        std::env::remove_var(super::super::library_proxy::ENV_COPILOT_URL);
     }
 
     #[test]
