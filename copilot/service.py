@@ -25,11 +25,13 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from pydantic import ValidationError
 
+from .auto_mix import AutoMixController, AutoMixStatus
 from .decisions import NextTrackPlan, next_track_decision, transition_plan
 from .engine_client import EngineClient
 from .http_server import JsonRpcHttpServer, build_default_server
 from .library import TrackLibrary
 from .library_rpc import LibraryRpcHandler
+from .library_rpc import RpcError as LibraryRpcError
 from .proposer import Proposal, TransitionProposer
 from .schemas import (
     DeckId,
@@ -102,6 +104,19 @@ class CoPilotService:
         # transport wires them up (UI WS server, future engine proxy).
         # Owned by the service so it shares the library handle + lifetime.
         self._library_rpc = LibraryRpcHandler(library)
+
+        # Auto-Mix controller — lazy-init in the proposer property below
+        # so unit tests that don't exercise auto-mix avoid the cost.
+        # Owned by the service so its lifetime tracks the engine WS loop.
+        self._auto_mix: AutoMixController | None = None
+
+        # Subscribers for ``copilot.auto_mix_state_changed`` notifications.
+        # Each entry is an async callable receiving the wire-shaped params
+        # dict. The UI WebSocket bridge registers itself here; pure unit
+        # tests can register a list-collector callable to assert ordering.
+        self._auto_mix_subscribers: list[
+            Callable[[dict[str, Any]], Awaitable[None]]
+        ] = []
 
     @property
     def library_rpc(self) -> LibraryRpcHandler:
@@ -285,6 +300,116 @@ class CoPilotService:
             self._proposer = TransitionProposer(self._library)
         return self._proposer
 
+    @property
+    def auto_mix(self) -> AutoMixController:
+        """Lazy-init the auto-mix controller.
+
+        Bound to the same proposer instance the engine loop uses, so
+        the controller's hysteresis bookkeeping stays in sync. The
+        controller's ``submit_event`` callable is wired *here* — the
+        legacy ``run()`` path doesn't use auto-mix at all.
+        """
+        if self._auto_mix is None:
+            async def _placeholder_submit(_ev: Event) -> None:
+                # The actual submit_event closure is bound inside
+                # ``run_with_proposer`` where the EngineClient lives.
+                # When the controller is exercised outside that loop
+                # (e.g. unit tests for set_auto_mix RPC), the placeholder
+                # acts as a no-op so a missing wire doesn't crash.
+                log.warning(
+                    "auto-mix submit_event called before run_with_proposer; "
+                    "event dropped"
+                )
+
+            self._auto_mix = AutoMixController(
+                self.proposer,
+                _placeholder_submit,
+                state_changed=self._dispatch_auto_mix_change,
+            )
+        return self._auto_mix
+
+    # ----- copilot.auto_mix.* RPC wiring -----
+
+    def subscribe_auto_mix(
+        self, handler: Callable[[dict[str, Any]], Awaitable[None]]
+    ) -> Callable[[], None]:
+        """Register a notification subscriber for auto-mix state changes.
+
+        Returns an unsubscribe callable mirroring the
+        :class:`asyncio.Event` registration pattern. The handler
+        receives the wire-shaped params dict ready for a
+        ``copilot.auto_mix_state_changed`` JSON-RPC notification.
+        """
+        self._auto_mix_subscribers.append(handler)
+
+        def _unsubscribe() -> None:
+            try:
+                self._auto_mix_subscribers.remove(handler)
+            except ValueError:
+                pass
+
+        return _unsubscribe
+
+    async def _dispatch_auto_mix_change(
+        self,
+        deck_id: DeckId,
+        status: AutoMixStatus,
+        seconds_to_mix: int | None,
+    ) -> None:
+        """Fan one auto-mix state change out to every subscriber."""
+        if not self._auto_mix_subscribers:
+            return
+        params: dict[str, Any] = {
+            "deck": deck_id.value,
+            "status": status.value,
+            "seconds_to_mix": seconds_to_mix,
+        }
+        # Snapshot the list first — a subscriber may unsubscribe inside
+        # its handler (e.g. UI WS reconnect) and mutating mid-iteration
+        # would skip a peer.
+        for sub in list(self._auto_mix_subscribers):
+            try:
+                await sub(params)
+            except Exception:  # noqa: BLE001
+                log.exception("auto-mix subscriber raised; continuing")
+
+    def handle_copilot_rpc(
+        self,
+        method: str,
+        params: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Dispatch ``copilot.*`` RPC methods.
+
+        Returns the result dict ready for the JSON-RPC response. Raises
+        :class:`LibraryRpcError` with the appropriate code on shape
+        errors — the HTTP transport translates the error to a wire
+        envelope identically to ``library.*``.
+        """
+        params = params or {}
+        if method == "copilot.set_auto_mix":
+            return self._rpc_set_auto_mix(params)
+        if method == "copilot.get_auto_mix":
+            return self._rpc_get_auto_mix(params)
+        raise LibraryRpcError(-32601, f"method not found: {method}")
+
+    def _rpc_set_auto_mix(self, params: dict[str, Any]) -> dict[str, Any]:
+        deck = self._coerce_deck(params.get("deck"))
+        enabled = params.get("enabled")
+        if not isinstance(enabled, bool):
+            raise LibraryRpcError(-32602, "enabled must be a bool")
+        self.auto_mix.set_auto_mix(deck, enabled)
+        return self.auto_mix.get_auto_mix(deck)
+
+    def _rpc_get_auto_mix(self, params: dict[str, Any]) -> dict[str, Any]:
+        deck = self._coerce_deck(params.get("deck"))
+        return self.auto_mix.get_auto_mix(deck)
+
+    @staticmethod
+    def _coerce_deck(raw: object) -> DeckId:
+        if isinstance(raw, str) and raw in ("A", "B"):
+            return DeckId(raw)
+        raise LibraryRpcError(-32602, "deck must be 'A' or 'B'")
+
     async def run_with_proposer(self) -> None:
         """Modern wiring: :class:`EngineClient` + :class:`TransitionProposer`.
 
@@ -303,9 +428,37 @@ class CoPilotService:
         """
         client = EngineClient(self._engine_ws_url, token=self._bridge_token)
         proposer = self.proposer
+        auto_mix = self.auto_mix
+
+        async def _submit_event(ev: Event) -> None:
+            try:
+                await client.call(
+                    "engine.submit_event",
+                    {"event": ev.model_dump(mode="json")},
+                )
+            except (RuntimeError, asyncio.TimeoutError) as exc:
+                log.warning(
+                    "auto-mix submit_event failed (%s); abandoning rest of plan",
+                    exc,
+                )
+                raise
+
+        # Re-bind the controller's submit closure to the live EngineClient.
+        # The placeholder set in the ``auto_mix`` property is replaced now
+        # that we actually have a transport.
+        auto_mix._submit_event = _submit_event  # noqa: SLF001
 
         async def on_state(state: EngineState) -> None:
             self._last_state = state
+            # Auto-mix runs ALONGSIDE the proposer suggestion path —
+            # if either deck is opted into auto-mix we let the controller
+            # take ownership of the execution pipeline. Suggestions for
+            # decks NOT opted in fall through to the legacy proposer path.
+            try:
+                await auto_mix.tick(state)
+            except Exception:  # noqa: BLE001
+                log.exception("auto-mix tick raised; falling back to proposer")
+
             proposal: Proposal | None = proposer.on_state(state)
             if proposal is None:
                 return
@@ -361,15 +514,17 @@ class CoPilotService:
         """Construct the JSON-RPC HTTP server bound to this service's handlers.
 
         Kept as a method so ``CoPilotService`` owns the wiring (it
-        knows which handlers to register). Today only ``library.*`` is
-        wired; future namespaces (e.g. ``copilot.*`` for proposer
-        introspection) can be added here without touching ``main.py``.
+        knows which handlers to register). Today ``library.*`` and
+        ``copilot.*`` (auto-mix opt-in toggles) are wired.
         """
         if host is not None:
             server = JsonRpcHttpServer(host=host, port=port)
             server.register_handler(self._library_rpc)
+            server.register_handler(_CopilotRpcAdapter(self))
             return server
-        return build_default_server(self._library_rpc, port=port)
+        server = build_default_server(self._library_rpc, port=port)
+        server.register_handler(_CopilotRpcAdapter(self))
+        return server
 
     async def run_with_http_server(
         self,
@@ -398,3 +553,33 @@ class CoPilotService:
             await engine_coro
         finally:
             await server.stop()
+
+
+class _CopilotRpcAdapter:
+    """Tiny adapter to bridge :class:`CoPilotService` into the HTTP server's
+    handler protocol (``handles`` / async ``dispatch``).
+
+    Kept as a free class instead of folding the protocol into
+    :class:`CoPilotService` directly so the service's surface stays
+    readable: ``library.*`` and ``copilot.*`` are routed through the
+    same JSON-RPC machinery without bleeding handler-shape concerns
+    into the service's public API.
+    """
+
+    NAMESPACE = "copilot"
+    METHODS = ("set_auto_mix", "get_auto_mix")
+
+    def __init__(self, service: "CoPilotService") -> None:
+        self._service = service
+
+    def handles(self, method: str) -> bool:
+        return method in (f"{self.NAMESPACE}.{m}" for m in self.METHODS)
+
+    async def dispatch(
+        self, method: str, params: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        # Dispatch is sync today (mutation is in-memory); wrap in async
+        # to satisfy the protocol. If a future method needs to await
+        # (e.g. engine ack on toggle), promote the inner handler to
+        # async without touching the transport.
+        return self._service.handle_copilot_rpc(method, params)
