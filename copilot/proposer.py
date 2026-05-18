@@ -43,6 +43,7 @@ from .decisions import (
 )
 from .library import TrackLibrary
 from .schemas import (
+    Deck,
     DeckId,
     EngineState,
     Event,
@@ -57,6 +58,34 @@ _HYSTERESIS_BEATS = 8
 # Fallback beat period when the playing deck reports bpm <= 0. 120 BPM
 # is the v1 default and the safest middle-of-the-road dance value.
 _DEFAULT_BEAT_PERIOD_MS = 500.0
+
+
+def next_downbeat_after(
+    position_ms: int, downbeats_ms: list[int] | tuple[int, ...]
+) -> int | None:
+    """Return the first downbeat strictly after ``position_ms``.
+
+    ``None`` if the track has no future downbeats (already past the last
+    one — i.e. the track is in its outro). The proposer treats ``None``
+    as "use current position" so the transition still fires; the engine
+    will then crossfade without bar-alignment, which is the v0.1 fallback
+    documented in the ws-protocol Beat-grid section.
+
+    Strict inequality (>, not ≥) so a hit *exactly* on a downbeat skips
+    to the next one. Otherwise a position landing on a bar boundary
+    would cause the engine to "align" to the same instant — useless.
+    """
+    if not downbeats_ms:
+        return None
+    # The grid is monotonically non-decreasing (the analyzer guarantees
+    # this; the engine truncates but preserves order). Bisect is O(log n)
+    # vs a linear scan — matters when proposer runs every state_changed.
+    import bisect
+
+    idx = bisect.bisect_right(downbeats_ms, position_ms)
+    if idx >= len(downbeats_ms):
+        return None
+    return int(downbeats_ms[idx])
 
 
 @dataclass(frozen=True)
@@ -199,7 +228,7 @@ class TransitionProposer:
             transition_plan(state, plan, transition_bars=self._transition_bars)
         )
 
-        shape = self._build_shape(plan, beat_period_ms)
+        shape = self._build_shape(plan, beat_period_ms, playing_deck)
 
         # Record bookkeeping for next call.
         per_deck.last_proposal_at_monotonic = now
@@ -228,7 +257,10 @@ class TransitionProposer:
         return (self._hysteresis_beats * beat_period_ms) / 1000.0
 
     def _build_shape(
-        self, plan: NextTrackPlan, beat_period_ms: float
+        self,
+        plan: NextTrackPlan,
+        beat_period_ms: float,
+        playing_deck: Deck,
     ) -> TransitionPlanShape:
         target = plan.target_deck
         from_value = 0.0 if target == DeckId.B else 1.0
@@ -239,10 +271,18 @@ class TransitionProposer:
         # ramp — that's the v0.1 fixed policy; a stem-aware plan in v0.2
         # will compute this from the outgoing track's last-chorus end.
         eq_swap_at_ms = ramp_ms // 2
-        # Beat-align: align the incoming start to the next downbeat. The
-        # engine resolves "next downbeat" against its own clock; we tag
-        # the event with intent rather than an absolute timestamp.
-        beat_align_at_ms = 0
+        # Beat-align: pick the first downbeat strictly after the
+        # currently-playing deck's position. The engine schedules the
+        # `CrossfaderRamp` to start at this absolute track-time so the
+        # transition sits on a bar boundary. Fallback (no future
+        # downbeats, e.g. track is in its outro) = current position; the
+        # engine still rolls the transition but without bar alignment.
+        next_db = next_downbeat_after(
+            playing_deck.position_ms, list(playing_deck.downbeats)
+        )
+        beat_align_at_ms = (
+            next_db if next_db is not None else playing_deck.position_ms
+        )
         return TransitionPlanShape(
             target_deck=target,
             crossfader_from=from_value,
@@ -257,4 +297,5 @@ __all__ = [
     "Proposal",
     "TransitionPlanShape",
     "TransitionProposer",
+    "next_downbeat_after",
 ]

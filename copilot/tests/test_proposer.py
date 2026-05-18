@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from copilot.library import TrackLibrary, TrackRef
-from copilot.proposer import Proposal, TransitionProposer
+from copilot.proposer import Proposal, TransitionProposer, next_downbeat_after
 from copilot.schemas import (
     Deck,
     DeckId,
@@ -180,3 +180,126 @@ def test_proposer_different_track_bypasses_hysteresis(
         "proposer should re-fire when the picked track changes"
     )
     assert second.next_track_id != "best"
+
+
+# -------- beat-align logic --------
+
+
+def test_next_downbeat_after_picks_first_future_downbeat() -> None:
+    downbeats = [0, 2000, 4000, 6000, 8000, 10_000, 12_000]
+    # Mid-bar — pick the next bar boundary.
+    assert next_downbeat_after(5_500, downbeats) == 6000
+    # Exactly on a downbeat — strict-greater-than skips to the next one.
+    assert next_downbeat_after(6000, downbeats) == 8000
+    # Before any downbeat — first downbeat wins.
+    assert next_downbeat_after(-1, downbeats) == 0
+
+
+def test_next_downbeat_after_returns_none_when_past_grid() -> None:
+    downbeats = [0, 2000, 4000]
+    # Position past the last downbeat — no future bar boundary.
+    assert next_downbeat_after(5_000, downbeats) is None
+    # Empty grid — no alignment possible.
+    assert next_downbeat_after(1000, []) is None
+
+
+def test_proposer_beat_align_uses_next_downbeat(
+    proposer_library: TrackLibrary,
+) -> None:
+    """Loaded deck reports a downbeat grid; proposer's beat_align_at_ms
+    must land on the next downbeat strictly after position_ms."""
+    proposer = TransitionProposer(proposer_library)
+    # 124 BPM ≈ 484ms/beat, 4 beats/bar = 1935ms/bar. Synthesize 30
+    # downbeats: 0, 1935, 3870, ...
+    bar_ms = round(60_000 / 124.0 * 4)  # ≈ 1935
+    downbeats = [i * bar_ms for i in range(30)]
+    state = EngineState(
+        deck_a=Deck(
+            loaded=EngineTrackRef(id="playing", path="/playing.mp3"),
+            playing=True,
+            position_ms=10_000,
+            copilot_engaged=True,
+            bpm=124.0,
+            downbeats=downbeats,
+        ),
+        deck_b=Deck(copilot_engaged=True),
+        session_active=True,
+    )
+    out = proposer.on_state(state)
+    assert out is not None
+    # Expected: first downbeat strictly > 10_000ms.
+    expected = next(d for d in downbeats if d > 10_000)
+    assert out.transition_plan.beat_align_at_ms == expected
+    # Sanity: alignment falls between the current position and one bar
+    # past it.
+    assert 10_000 < out.transition_plan.beat_align_at_ms <= 10_000 + bar_ms
+
+
+def test_proposer_beat_align_falls_back_when_no_future_downbeats(
+    proposer_library: TrackLibrary,
+) -> None:
+    """If the playing track has no future downbeats (outro), beat_align
+    falls back to current position so the transition still happens."""
+    proposer = TransitionProposer(proposer_library)
+    # Position is past the last downbeat in the (sparse) grid.
+    state = EngineState(
+        deck_a=Deck(
+            loaded=EngineTrackRef(id="playing", path="/playing.mp3"),
+            playing=True,
+            position_ms=200_000,  # 3m20s in
+            copilot_engaged=True,
+            bpm=124.0,
+            # Grid stops at 180s.
+            downbeats=[0, 60_000, 120_000, 180_000],
+        ),
+        deck_b=Deck(copilot_engaged=True),
+        session_active=True,
+    )
+    out = proposer.on_state(state)
+    assert out is not None
+    assert out.transition_plan.beat_align_at_ms == 200_000
+
+
+def test_proposer_propagates_downbeats_into_deckload_event(
+    proposer_library: TrackLibrary,
+) -> None:
+    """The DeckLoad event the proposer emits must carry the incoming
+    track's downbeats so the engine populates Deck::downbeats on load."""
+    lib = TrackLibrary(":memory:")
+    try:
+        lib.add_track(
+            TrackRef(
+                "playing", "/playing.mp3", 124.0, "8B", 0.20, 210.0,
+                beat_grid_anchor_ms=0, beat_period_ms=60_000 / 124.0,
+                downbeats_ms=[0, 2000, 4000],
+            )
+        )
+        lib.add_track(
+            TrackRef(
+                "incoming", "/incoming.mp3", 125.0, "8B", 0.22, 220.0,
+                beat_grid_anchor_ms=50,
+                beat_period_ms=60_000 / 125.0,
+                downbeats_ms=[50, 1970, 3890, 5810],
+            )
+        )
+        proposer = TransitionProposer(lib)
+        state = EngineState(
+            deck_a=Deck(
+                loaded=EngineTrackRef(id="playing", path="/playing.mp3"),
+                playing=True,
+                position_ms=1000,
+                copilot_engaged=True,
+                bpm=124.0,
+                downbeats=[0, 2000, 4000],
+            ),
+            deck_b=Deck(copilot_engaged=True),
+            session_active=True,
+        )
+        out = proposer.on_state(state)
+        assert out is not None
+        deckload = out.events[0].kind.model_dump()
+        assert deckload["kind"] == "DeckLoad"
+        assert deckload["downbeats_ms"] == [50, 1970, 3890, 5810]
+        assert deckload["beat_grid_anchor_ms"] == 50
+    finally:
+        lib.close()

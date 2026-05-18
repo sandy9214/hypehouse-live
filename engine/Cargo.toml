@@ -36,7 +36,7 @@ crossbeam = "0.8"
 
 # Small stack-allocated vectors — used by the control→audio translator to
 # emit 0..N AudioCommands without heap allocation on the hot path.
-smallvec = "1"
+smallvec = { version = "1", features = ["serde"] }
 
 # Logging — structured JSON via tracing.
 tracing = "0.1"

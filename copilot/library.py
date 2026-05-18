@@ -1,30 +1,52 @@
-"""Track library — read-only SQLite-backed catalog of analyzed tracks.
+"""Track library — SQLite-backed catalog of analyzed tracks.
 
-The library stores the **already-analyzed** track metadata (BPM, Camelot key,
-energy, duration). Analysis itself happens out-of-band, either via HypeHouse
-v1's CLI or via a future ingestion job — the co-pilot never analyzes inline
-because librosa.load can deadlock on cold-container starts (see HypeHouse v1
-postmortem on Cloud Run audio decode).
+The library stores per-track features:
+
+* BPM + Camelot key (compatibility gates for the proposer).
+* Energy + duration (mashability score + UI display).
+* Beat-grid anchor + beat period (engine `DeckLoad` event payload).
+* Downbeats (JSON-encoded list of ms positions) — drives phrase-aligned
+  transitions in the proposer + engine. See ``docs/api/ws-protocol.md``
+  "Beat-grid + downbeats" for the alignment model.
 
 Schema::
 
     CREATE TABLE tracks (
-        track_id     TEXT PRIMARY KEY,
-        path         TEXT NOT NULL,
-        bpm          REAL NOT NULL,
-        camelot_key  TEXT NOT NULL,
-        energy       REAL NOT NULL,
-        duration_s   REAL NOT NULL
+        track_id            TEXT PRIMARY KEY,
+        path                TEXT NOT NULL,
+        bpm                 REAL NOT NULL,
+        camelot_key         TEXT NOT NULL,
+        energy              REAL NOT NULL,
+        duration_s          REAL NOT NULL,
+        beat_grid_anchor_ms INTEGER NOT NULL DEFAULT 0,
+        beat_period_ms      REAL NOT NULL DEFAULT 500.0,
+        downbeats_json      TEXT NOT NULL DEFAULT '[]'
     );
+
+Schema migration: ``TRACK_SCHEMA_VERSION`` is bumped whenever the columns
+change. ``_init_schema`` reads the current version from the
+``schema_version`` PRAGMA-style table and ALTERs missing columns in place
+so existing local DBs keep working without a full rebuild.
+
+Analysis path: ``add_track_from_path(path)`` invokes the vendored v1
+analyzer (madmom DBNBeatTracker for beats/downbeats, falls back to
+librosa) and persists the result. Tests bypass this slow path with
+``add_track`` which accepts a pre-built ``TrackRef``.
 
 The default DB lives at ``~/.hypehouse-live/library.db``; tests inject a
 ``:memory:`` DB via the ``db_path`` constructor argument.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+# Bumped to v2 in the beat-grid analysis PR (this one). Stamped into the
+# DB on first init; migrations dispatch on the gap between this constant
+# and the value recorded in the ``schema_version`` table.
+TRACK_SCHEMA_VERSION = 2
 
 # Camelot wheel ordering — same convention as HypeHouse v1 analyzer.py.
 # Index = (number-1) * 2 + (0 if A else 1). Used for circular distance only.
@@ -33,7 +55,21 @@ _CAMELOT_NUMBERS = list(range(1, 13))  # 1..12
 
 @dataclass(frozen=True)
 class TrackRef:
-    """A library entry, shape-compatible with what the engine expects."""
+    """A library entry, shape-compatible with what the engine expects.
+
+    The first six fields are positional for backwards compatibility with
+    pre-beat-grid call sites (``TrackRef(id, path, bpm, key, energy, dur)``).
+    New beat-grid fields are keyword-only with sensible defaults so adding
+    them didn't churn every test fixture.
+
+    * ``beat_grid_anchor_ms``: first beat position in ms (= 0 for most
+      tracks where the analyzer locks beat 0 to t=0).
+    * ``beat_period_ms``: 60_000 / bpm. Derived but stored so the engine
+      doesn't re-compute on every load.
+    * ``downbeats_ms``: list of bar-start positions in ms. Empty list
+      when analysis hasn't run yet — proposer falls back to current
+      position in that case (see ``copilot.proposer.next_downbeat_after``).
+    """
 
     track_id: str
     path: str
@@ -41,6 +77,9 @@ class TrackRef:
     camelot_key: str  # e.g. "8B", "10A"
     energy: float  # 0..~1, RMS of the analyzed window
     duration_s: float
+    beat_grid_anchor_ms: int = 0
+    beat_period_ms: float = 500.0  # 120 BPM default
+    downbeats_ms: list[int] = field(default_factory=list)
 
 
 # Hard compatibility gates. Tracks outside these can sometimes mix but the
@@ -120,6 +159,10 @@ class TrackLibrary:
         self._init_schema()
 
     def _init_schema(self) -> None:
+        # Base table — always create. New columns (beat_grid_anchor_ms,
+        # beat_period_ms, downbeats_json) are migrated in via ALTER TABLE
+        # below so older DBs (schema v1, pre this PR) upgrade in place
+        # rather than getting recreated, which would lose user data.
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS tracks (
@@ -130,9 +173,40 @@ class TrackLibrary:
                 energy      REAL NOT NULL,
                 duration_s  REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY
+            );
             CREATE INDEX IF NOT EXISTS tracks_bpm_idx ON tracks (bpm);
             CREATE INDEX IF NOT EXISTS tracks_key_idx ON tracks (camelot_key);
             """
+        )
+        # Add new columns idempotently. PRAGMA table_info is cheaper than
+        # rescuing a sqlite3.OperationalError per ALTER attempt and is the
+        # canonical SQLite migration pattern.
+        cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(tracks)")
+        }
+        if "beat_grid_anchor_ms" not in cols:
+            self._conn.execute(
+                "ALTER TABLE tracks "
+                "ADD COLUMN beat_grid_anchor_ms INTEGER NOT NULL DEFAULT 0"
+            )
+        if "beat_period_ms" not in cols:
+            self._conn.execute(
+                "ALTER TABLE tracks "
+                "ADD COLUMN beat_period_ms REAL NOT NULL DEFAULT 500.0"
+            )
+        if "downbeats_json" not in cols:
+            self._conn.execute(
+                "ALTER TABLE tracks "
+                "ADD COLUMN downbeats_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        # Stamp the current schema version. Multiple-row safety via
+        # INSERT OR REPLACE; the table only ever holds one row.
+        self._conn.execute(
+            "INSERT OR REPLACE INTO schema_version (version) VALUES (?)",
+            (TRACK_SCHEMA_VERSION,),
         )
         self._conn.commit()
 
@@ -144,8 +218,9 @@ class TrackLibrary:
     def add_track(self, track: TrackRef) -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO tracks "
-            "(track_id, path, bpm, camelot_key, energy, duration_s) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(track_id, path, bpm, camelot_key, energy, duration_s, "
+            " beat_grid_anchor_ms, beat_period_ms, downbeats_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 track.track_id,
                 track.path,
@@ -153,9 +228,70 @@ class TrackLibrary:
                 track.camelot_key,
                 float(track.energy),
                 float(track.duration_s),
+                int(track.beat_grid_anchor_ms),
+                float(track.beat_period_ms),
+                json.dumps([int(d) for d in track.downbeats_ms]),
             ),
         )
         self._conn.commit()
+
+    def add_track_from_path(
+        self,
+        path: str | Path,
+        *,
+        track_id: str | None = None,
+        cache_dir: Path | None = None,
+        quick: bool = False,
+    ) -> TrackRef:
+        """Run the vendored v1 analyzer on ``path`` and persist the result.
+
+        Heavy import path (librosa + optional madmom) — kept lazy so the
+        co-pilot service can import :mod:`copilot.library` without
+        paying the librosa cold-start tax. Tests mock at this boundary
+        (see ``test_library_analysis.py``).
+
+        ``cache_dir`` defaults to a ``cache/`` sibling of the SQLite DB so
+        analyzer JSON survives library rebuilds.
+        """
+        # Lazy import — librosa pulls numba which takes ~3s to import.
+        from .vendor.analyzer import analyze  # type: ignore[import-not-found]
+
+        path_obj = Path(path)
+        if cache_dir is None:
+            if isinstance(self._db_path, str) and self._db_path == ":memory:":
+                cache_dir = Path.cwd() / "_copilot_analysis_cache"
+            else:
+                cache_dir = Path(self._db_path).parent / "analysis_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        analysis = analyze(path_obj, cache_dir, quick=quick)
+
+        # Beat-grid anchor = first detected beat × 1000 (ms). If the
+        # analyzer found no beats (silent track / decode failure), anchor
+        # to 0 and let the engine fall back to its default grid.
+        first_beat_s = (
+            float(analysis.beats[0]) if analysis.beats else 0.0
+        )
+        beat_grid_anchor_ms = int(round(first_beat_s * 1000.0))
+
+        safe_bpm = float(analysis.bpm) if analysis.bpm > 0 else 120.0
+        beat_period_ms = 60_000.0 / safe_bpm
+
+        downbeats_s = list(analysis.downbeats or [])
+        downbeats_ms = [int(round(float(t) * 1000.0)) for t in downbeats_s]
+
+        ref = TrackRef(
+            track_id=track_id or path_obj.stem,
+            path=str(path_obj),
+            bpm=safe_bpm,
+            camelot_key=analysis.camelot or "?",
+            energy=float(analysis.energy),
+            duration_s=float(analysis.duration),
+            beat_grid_anchor_ms=beat_grid_anchor_ms,
+            beat_period_ms=beat_period_ms,
+            downbeats_ms=downbeats_ms,
+        )
+        self.add_track(ref)
+        return ref
 
     # --- read path --------------------------------------------------------
 
@@ -212,11 +348,35 @@ class TrackLibrary:
 
     @staticmethod
     def _row_to_ref(r: sqlite3.Row) -> TrackRef:
+        # New columns are NOT NULL DEFAULT so they're always present, but
+        # we tolerate row shapes lacking them (e.g. an older driver path)
+        # by falling back to TrackRef defaults.
+        keys = set(r.keys())
+        downbeats_raw = r["downbeats_json"] if "downbeats_json" in keys else "[]"
+        try:
+            downbeats_ms = [int(x) for x in json.loads(downbeats_raw or "[]")]
+        except (ValueError, TypeError, json.JSONDecodeError):
+            # Defensive: a corrupted downbeats_json shouldn't make the
+            # whole row unreadable. Log path is the caller's concern.
+            downbeats_ms = []
+        bpm = float(r["bpm"])
+        beat_period_default = 60_000.0 / bpm if bpm > 0 else 500.0
         return TrackRef(
             track_id=r["track_id"],
             path=r["path"],
-            bpm=float(r["bpm"]),
+            bpm=bpm,
             camelot_key=r["camelot_key"],
             energy=float(r["energy"]),
             duration_s=float(r["duration_s"]),
+            beat_grid_anchor_ms=(
+                int(r["beat_grid_anchor_ms"])
+                if "beat_grid_anchor_ms" in keys
+                else 0
+            ),
+            beat_period_ms=(
+                float(r["beat_period_ms"])
+                if "beat_period_ms" in keys
+                else beat_period_default
+            ),
+            downbeats_ms=downbeats_ms,
         )
