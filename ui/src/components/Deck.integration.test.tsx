@@ -46,6 +46,8 @@ const loadedDeck = (overrides: Partial<DeckState> = {}): DeckState => ({
   loop_out_ms: null,
   copilot_enabled: false,
   effects: [emptySlot(), emptySlot(), emptySlot()],
+  stem_gains: [1, 1, 1, 1],
+  stem_mode: false,
   ...overrides,
 });
 
