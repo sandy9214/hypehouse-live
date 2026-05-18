@@ -25,6 +25,7 @@
 pub mod clock;
 pub mod command;
 pub mod decode;
+pub mod effects;
 pub mod io;
 pub mod mixer;
 pub mod ring;
@@ -35,6 +36,11 @@ pub use command::{AudioCommand, AudioCommandKind, RAMP_BUFFER_MAX};
 pub use decode::{
     DecodeError, DecodeHandle, DecodeService, StubDecodeService, SymphoniaDecodeService,
     MAX_DECODE_SLOTS, MEM_PREFIX, RING_SAMPLES_500MS,
+};
+pub use effects::{
+    descriptors as effect_descriptors, resolve_param as resolve_effect_param, Effect, EffectId,
+    EffectParams, FxBank, ParamDescriptor, EFFECT_ECHO, EFFECT_FILTER, EFFECT_GATE, EFFECT_NONE,
+    EFFECT_REVERB, MAX_PARAMS as EFFECT_MAX_PARAMS,
 };
 pub use mixer::AudioMixer;
 pub use ring::{AudioConsumer, AudioProducer, AudioRing, RING_CAPACITY};

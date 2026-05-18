@@ -14,8 +14,10 @@
 
 use std::sync::Arc;
 
+use crate::audio::clock::SharedClock;
 use crate::audio::command::{AudioCommand, AudioCommandKind};
 use crate::audio::decode::{DecodeHandle, DecodeService};
+use crate::audio::effects::{FxBank, EFFECT_NONE};
 use crate::state::DeckId;
 
 /// Per-callback scratch stride used when pulling stereo samples from
@@ -80,10 +82,24 @@ pub struct AudioMixer {
     /// Per-render scratch buffer for stereo pulls. Allocated once at
     /// construction; the render loop only writes into a prefix of it.
     stereo_scratch: [f32; MAX_STEREO_SCRATCH],
+    /// ADR-006 — per-deck 3-slot effects chain. Pre-allocated:
+    /// every slot owns all 4 effect instances and dispatches by
+    /// `effect_id`. Audio-thread alloc-free; switching effects just
+    /// `reset()`s the target instance.
+    effects_a: [FxBank; 3],
+    effects_b: [FxBank; 3],
 }
 
 impl AudioMixer {
     pub fn new(sample_rate: u32) -> Self {
+        Self::with_clock(sample_rate, SharedClock::new(), 120.0)
+    }
+
+    /// Construct with a shared clock + master BPM (needed by the
+    /// beat-synced Gate effect). Production: pass the same
+    /// `SharedClock` the cpal callback bumps + the session BPM.
+    pub fn with_clock(sample_rate: u32, clock: SharedClock, master_bpm: f32) -> Self {
+        let mk_bank = || FxBank::new(sample_rate, clock.clone(), master_bpm);
         Self {
             sample_rate,
             crossfader: 0.5,
@@ -91,6 +107,8 @@ impl AudioMixer {
             deck_b: DeckHot::new(220.0),
             decode: None,
             stereo_scratch: [0.0; MAX_STEREO_SCRATCH],
+            effects_a: [mk_bank(), mk_bank(), mk_bank()],
+            effects_b: [mk_bank(), mk_bank(), mk_bank()],
         }
     }
 
@@ -159,6 +177,50 @@ impl AudioMixer {
                 // audio-thread state needs touching here. Kept as a
                 // distinct variant so the audit log is explicit.
             }
+            // ADR-006 — effects chain commands. Each mutates a slot in
+            // the deck's `FxBank` array. All paths alloc-free.
+            AudioCommandKind::EffectAssign {
+                deck,
+                slot,
+                effect_id,
+            } => {
+                if let Some(s) = self.effects_mut(deck).get_mut(slot as usize) {
+                    if effect_id == EFFECT_NONE {
+                        s.clear();
+                    } else {
+                        s.assign(effect_id);
+                    }
+                }
+            }
+            AudioCommandKind::EffectClear { deck, slot } => {
+                if let Some(s) = self.effects_mut(deck).get_mut(slot as usize) {
+                    s.clear();
+                }
+            }
+            AudioCommandKind::EffectParam {
+                deck,
+                slot,
+                param_id,
+                value,
+            } => {
+                if let Some(s) = self.effects_mut(deck).get_mut(slot as usize) {
+                    s.set_param(param_id, value);
+                }
+            }
+            AudioCommandKind::EffectWetDry { deck, slot, value } => {
+                if let Some(s) = self.effects_mut(deck).get_mut(slot as usize) {
+                    s.wet_dry = value.clamp(0.0, 1.0);
+                }
+            }
+            AudioCommandKind::EffectEnable {
+                deck,
+                slot,
+                enabled,
+            } => {
+                if let Some(s) = self.effects_mut(deck).get_mut(slot as usize) {
+                    s.enabled = enabled;
+                }
+            }
         }
     }
 
@@ -190,22 +252,74 @@ impl AudioMixer {
             let a_pulled = pull_deck(&self.decode, &self.deck_a, a_slice);
             let b_pulled = pull_deck(&self.decode, &self.deck_b, b_slice);
 
+            // Materialize each deck as interleaved stereo into its
+            // scratch slice. If the decoder didn't supply data, run
+            // the v0.1 oscillator (mono → duplicate into L+R).
+            if !a_pulled {
+                for i in 0..chunk {
+                    let s = render_deck(&mut self.deck_a, sr);
+                    a_slice[i * 2] = s;
+                    a_slice[i * 2 + 1] = s;
+                }
+            } else {
+                // Apply per-deck gain to the pulled samples in place.
+                let g = self.deck_a.gain;
+                for s in a_slice[..a_end].iter_mut() {
+                    *s *= g;
+                }
+            }
+            if !b_pulled {
+                for i in 0..chunk {
+                    let s = render_deck(&mut self.deck_b, sr);
+                    b_slice[i * 2] = s;
+                    b_slice[i * 2 + 1] = s;
+                }
+            } else {
+                let g = self.deck_b.gain;
+                for s in b_slice[..(chunk * 2)].iter_mut() {
+                    *s *= g;
+                }
+            }
+
+            // ADR-006 — run each deck's effects chain in slot order.
+            // The bank is alloc-free + audio-thread-safe.
+            let sr_u = self.sample_rate;
+            for slot in self.effects_a.iter_mut() {
+                slot.process(&mut a_slice[..a_end], sr_u);
+            }
+            for slot in self.effects_b.iter_mut() {
+                slot.process(&mut b_slice[..(chunk * 2)], sr_u);
+            }
+
+            // Downmix to mono + crossfade. Reuses the v0.1 contract
+            // (the engine output is mono until a separate stereo PR).
             for i in 0..chunk {
-                let a = if a_pulled {
-                    0.5 * (a_slice[i * 2] + a_slice[i * 2 + 1]) * self.deck_a.gain
-                } else {
-                    render_deck(&mut self.deck_a, sr)
-                };
-                let b = if b_pulled {
-                    0.5 * (b_slice[i * 2] + b_slice[i * 2 + 1]) * self.deck_b.gain
-                } else {
-                    render_deck(&mut self.deck_b, sr)
-                };
+                let a = 0.5 * (a_slice[i * 2] + a_slice[i * 2 + 1]);
+                let b = 0.5 * (b_slice[i * 2] + b_slice[i * 2 + 1]);
                 let mix = a * (1.0 - self.crossfader) + b * self.crossfader;
                 out[written + i] = mix;
             }
             written += chunk;
         }
+    }
+
+    /// Return a mutable borrow of the per-deck effects chain.
+    #[inline]
+    fn effects_mut(&mut self, id: DeckId) -> &mut [FxBank; 3] {
+        match id {
+            DeckId::A => &mut self.effects_a,
+            DeckId::B => &mut self.effects_b,
+        }
+    }
+
+    /// Read accessor for tests/UI manifest: which effect occupies a
+    /// given (deck, slot).
+    pub fn effect_id(&self, id: DeckId, slot: u8) -> u32 {
+        let bank = match id {
+            DeckId::A => &self.effects_a,
+            DeckId::B => &self.effects_b,
+        };
+        bank.get(slot as usize).map(|s| s.effect_id).unwrap_or(0)
     }
 
     fn deck_mut(&mut self, id: DeckId) -> &mut DeckHot {

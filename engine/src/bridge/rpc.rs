@@ -119,6 +119,9 @@ pub mod method {
     pub const SNAPSHOT: &str = "engine.snapshot";
     pub const EVENT_LOG: &str = "engine.event_log";
     pub const HEALTH: &str = "engine.health";
+    /// ADR-006 — effect manifest. Stubbed: returns `[]` until the full
+    /// manifest plumbing lands (issue TBD).
+    pub const LIST_EFFECTS: &str = "engine.list_effects";
     /// In-band bearer-token auth for browser WS clients that cannot set
     /// the `Authorization` header at upgrade. See `auth::AuthState`.
     pub const AUTH_HELLO: &str = "auth.hello";
@@ -582,6 +585,12 @@ pub fn dispatch(engine: &EngineHandle, req: RpcRequest) -> RpcResponse {
             }
         }
         method::HEALTH => RpcResponse::ok(id, engine.health()),
+        // ADR-006 — effect manifest stub. Returns an empty array
+        // until the registry → JSON wiring lands. The UI may call
+        // this and treat `[]` as "no effects available".
+        // TODO(#TBD): emit the full effect descriptor list from
+        //             `crate::audio::effects::descriptors()`.
+        method::LIST_EFFECTS => RpcResponse::ok(id, serde_json::json!([])),
         other => RpcResponse::err(id, RpcError::method_not_found(other)),
     }
 }
