@@ -103,6 +103,12 @@ const categoryLabel = (category: string): string => {
       return "Unknown source";
     case "decoder_thread_spawn":
       return "Decoder thread spawn failed";
+    // PR #56 follow-up — surface mid-stream / decoder-thread-panic
+    // events with distinct user-facing copy.
+    case "mid_stream_decode_failure":
+      return "Decode failed mid-stream";
+    case "decoder_thread_panic":
+      return "Decoder thread crashed";
     default:
       return "Decode error";
   }

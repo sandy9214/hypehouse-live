@@ -37,8 +37,9 @@ pub mod wsola;
 pub use clock::{ClockSource, EngineClock, SharedClock};
 pub use command::{AudioCommand, AudioCommandKind, RAMP_BUFFER_MAX};
 pub use decode::{
-    DecodeError, DecodeHandle, DecodeService, StubDecodeService, SymphoniaDecodeService,
-    MAX_DECODE_SLOTS, MEM_PREFIX, RING_SAMPLES_500MS,
+    DecodeError, DecodeHandle, DecodeService, MidStreamFailure, MidStreamFailureKind,
+    StubDecodeService, SymphoniaDecodeService, DECODER_THREAD_PANIC_CATEGORY, MAX_DECODE_SLOTS,
+    MEM_PREFIX, MID_STREAM_CATEGORY, MID_STREAM_FAILURE_CAPACITY, RING_SAMPLES_500MS,
 };
 pub use effects::{
     descriptors as effect_descriptors, resolve_param as resolve_effect_param, Effect, EffectId,
