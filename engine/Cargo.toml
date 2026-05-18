@@ -93,6 +93,10 @@ assert_no_alloc = "1"
 # the copilot HTTP RPC endpoint in-process without depending on the
 # real copilot service.
 wiremock = "0.6"
+# Cross-platform file-mtime setter — needed by the retention tests to
+# back-date synthetic session directories so the prune cutoff has a
+# deterministic signal independent of wall-clock skew.
+filetime = "0.2"
 
 [[bench]]
 name = "translator"

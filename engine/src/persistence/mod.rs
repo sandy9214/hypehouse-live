@@ -43,6 +43,7 @@
 //!   the test suite + ephemeral runs.
 
 pub mod replay;
+pub mod retention;
 pub mod sessions;
 
 use crate::state::Event;
@@ -197,7 +198,11 @@ impl Drop for EventLog {
 /// 1. `HYPEHOUSE_EVENT_LOG_DIR` env var
 /// 2. `$XDG_DATA_HOME/hypehouse-live/sessions`
 /// 3. `$HOME/.local/share/hypehouse-live/sessions`
-fn resolve_log_root() -> Result<PathBuf> {
+///
+/// Exposed at `pub` so `main.rs` (and the retention sweep it triggers
+/// at boot) can resolve the same root the writer uses without
+/// duplicating the env-var precedence rules.
+pub fn resolve_log_root() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var(ENV_LOG_DIR) {
         if !dir.trim().is_empty() {
             return Ok(PathBuf::from(dir));

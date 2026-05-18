@@ -445,6 +445,15 @@ resolved persistence root (`$HYPEHOUSE_EVENT_LOG_DIR` →
 `$XDG_DATA_HOME/hypehouse-live/sessions` → `~/.local/share/...`)
 and returns one summary per directory. Used by the UI History panel.
 
+> **Retention note**: The engine prunes stale session directories at
+> boot — entries returned here are already filtered by the retention
+> policy (default: drop directories older than 30 days, but always
+> keep the 50 most-recent regardless of age). The sweep is **not** a
+> protocol surface; it runs once per process start in `main.rs` after
+> `EventLog::new`. Tuned via `HYPEHOUSE_LOG_MAX_DAYS`,
+> `HYPEHOUSE_LOG_MIN_KEEP`, and `HYPEHOUSE_LOG_RETENTION_DISABLED=1`.
+> See ADR-003 §Retention.
+
 **Params**: none.
 **Result**: object with a `sessions` array, sorted by `started_at_micros`
 descending (most recent first). Capped at 50 entries. Sessions with an

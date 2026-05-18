@@ -22,7 +22,7 @@ use hypehouse_engine::audio::{
 };
 use hypehouse_engine::bridge::{self, EngineHandle};
 use hypehouse_engine::clock_sync::{LinkStub, PeerClock};
-use hypehouse_engine::persistence::{new_session_id, EventLog};
+use hypehouse_engine::persistence::{new_session_id, resolve_log_root, retention, EventLog};
 use hypehouse_engine::recording::MasterRecorder;
 use hypehouse_engine::state::{EngineState, Event, EventKind};
 use hypehouse_engine::telemetry;
@@ -204,6 +204,26 @@ async fn main() -> Result<()> {
             None
         }
     };
+
+    // Event-log retention sweep (issue #41). Runs AFTER `EventLog::new`
+    // so the current session directory already has a fresh mtime —
+    // newest-first sort therefore keeps it out of the deletion
+    // candidate set automatically. `prune_from_env` honours
+    // `HYPEHOUSE_LOG_MAX_DAYS` / `HYPEHOUSE_LOG_MIN_KEEP` /
+    // `HYPEHOUSE_LOG_RETENTION_DISABLED` and logs a single info line
+    // with the summary; failures are non-fatal.
+    match resolve_log_root() {
+        Ok(root) => match retention::prune_from_env(&root) {
+            Ok(summary) => info!(
+                deleted = summary.deleted,
+                retained = summary.retained,
+                bytes_freed = summary.bytes_freed,
+                "event log retention: pruned"
+            ),
+            Err(e) => warn!(error = %e, "event log retention: sweep failed — continuing"),
+        },
+        Err(e) => warn!(error = %e, "event log retention: skipped — root unresolved"),
+    }
 
     // Bridge handle is wired to the control-loop event channel so every
     // accepted `engine.submit_event` RPC flows into `event_rx`. Cloning
