@@ -15,6 +15,13 @@ const makeClient = (): JsonRpcWS => {
   } as unknown as JsonRpcWS;
 };
 
+const emptySlot = (): DeckState["effects"][number] => ({
+  effect_id: 0,
+  params: {},
+  wet_dry: 0.5,
+  enabled: false,
+});
+
 const baseDeck = (): DeckState => ({
   id: "A",
   track_title: null,
@@ -29,6 +36,7 @@ const baseDeck = (): DeckState => ({
   loop_in_ms: null,
   loop_out_ms: null,
   copilot_enabled: false,
+  effects: [emptySlot(), emptySlot(), emptySlot()],
 });
 
 describe("Deck (render)", () => {

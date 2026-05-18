@@ -17,6 +17,8 @@ import {
   TransportRow,
   type EqBand,
 } from "./DeckControls";
+import { EffectRack } from "./EffectRack";
+import { useEffectsManifest } from "../store/effectsManifest";
 
 export interface DeckProps {
   deck: DeckState;
@@ -66,6 +68,7 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
   const loaded = isLoaded(deck);
   const hasLoopIn = deck.loop_in_ms !== null;
   const looping = loopActive(deck);
+  const manifest = useEffectsManifest(client);
 
   const onPlayPause = (): void => {
     if (!loaded) return;
@@ -149,6 +152,13 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
         loaded={loaded}
         onTrigger={onHotCueTrigger}
         onSet={onHotCueSet}
+      />
+
+      <EffectRack
+        deck={deck.id}
+        effects={deck.effects}
+        manifest={manifest}
+        client={client}
       />
     </section>
   );
