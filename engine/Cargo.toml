@@ -58,6 +58,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 ringbuf = "0.4"
 crossbeam = "0.8"
 
+# Safe, zero-cost POD slice reinterpretation — used by the recording
+# writer thread to view `&[f32]` as `&[u8]` without copying. Replaces a
+# previously-handwritten `unsafe` block (issue #45). The `Pod` +
+# `AnyBitPattern` trait bounds enforce at compile time that the cast is
+# sound, and `cast_slice` itself contains no `unsafe` at the call site.
+bytemuck = "1.18"
+
 # Small stack-allocated vectors — used by the control→audio translator to
 # emit 0..N AudioCommands without heap allocation on the hot path.
 smallvec = { version = "1", features = ["serde"] }

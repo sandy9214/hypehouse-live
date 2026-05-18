@@ -308,7 +308,14 @@ fn spawn_writer(
             loop {
                 let n = consumer.pop_slice(&mut scratch);
                 if n > 0 {
-                    let bytes = bytemuck_cast(&scratch[..n]);
+                    // `bytemuck::cast_slice` reinterprets `&[f32]` as
+                    // `&[u8]` with zero cost (no copy, no alloc — same
+                    // contract the audio thread relies on). The cast is
+                    // trait-checked at compile time via `Pod` +
+                    // `AnyBitPattern` on `f32`; no `unsafe` lives at
+                    // the call site, satisfying CLAUDE.md's "no unsafe
+                    // without an ADR" rule. Issue #45.
+                    let bytes: &[u8] = bytemuck::cast_slice(&scratch[..n]);
                     writer.write_all(bytes).context("write PCM body")?;
                     total_bytes += bytes.len() as u64;
                 }
@@ -330,26 +337,6 @@ fn spawn_writer(
         })
         .context("spawning recording writer thread")?;
     Ok(handle)
-}
-
-/// Reinterpret `&[f32]` as `&[u8]` without copying. The two slices
-/// share lifetime + alignment requirements; `f32` is `Copy` + has
-/// well-defined LE byte order on every supported target.
-///
-/// We inline this instead of pulling `bytemuck` because the engine
-/// already keeps its dependency surface tight and this is the only
-/// place in the crate that needs the cast.
-#[inline]
-fn bytemuck_cast(buf: &[f32]) -> &[u8] {
-    // SAFETY: `f32` is plain-old-data with no padding; we're producing
-    // a read-only view of `buf` with byte alignment 1, which is always
-    // satisfied. Length scales by sizeof(f32) = 4. The slice borrow
-    // lifetime ties the &[u8] to &[f32] so no UAF.
-    //
-    // ADR-004 carve-out: `unsafe` is permitted only in a clearly-bound
-    // primitive like this one. No surrounding code uses unsafe; this
-    // is a single transmute-equivalent with zero behavioural surface.
-    unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), std::mem::size_of_val(buf)) }
 }
 
 /// Write the WAV header for a PCM-IEEE-float stereo file. The size
@@ -633,6 +620,54 @@ mod tests {
         );
         rec.stop().expect("stop");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 8b (issue #45): `bytemuck::cast_slice::<f32, u8>` produces the
+    /// exact same byte sequence we would get from explicit per-sample
+    /// `f32::to_le_bytes` encoding. This pins down the contract the
+    /// previous handwritten `unsafe` slice-reinterpret was satisfying,
+    /// so the swap is a behaviour-preserving cleanup (not a format
+    /// change). Targets are all little-endian (x86_64 / aarch64
+    /// macOS / aarch64 Linux); if a future target adds a big-endian
+    /// host, this test will fail loudly and we revisit the cast.
+    #[test]
+    fn bytemuck_cast_matches_raw_bytes() {
+        // Mixed-sign, sub-normal, NaN-free signal — exercises the full
+        // mantissa range without relying on bit-pattern equality of
+        // NaNs (which is impl-defined).
+        let samples: Vec<f32> = vec![
+            0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            std::f32::consts::PI,
+            -std::f32::consts::E,
+            1e-9,
+            1e9,
+            f32::EPSILON,
+        ];
+
+        // Reference: per-sample little-endian encoding.
+        let mut expected = Vec::with_capacity(samples.len() * 4);
+        for s in &samples {
+            expected.extend_from_slice(&s.to_le_bytes());
+        }
+
+        // Under test: bytemuck zero-copy view.
+        let got: &[u8] = bytemuck::cast_slice(&samples);
+
+        assert_eq!(
+            got.len(),
+            samples.len() * std::mem::size_of::<f32>(),
+            "cast_slice length must scale by sizeof(f32)"
+        );
+        assert_eq!(
+            got, expected,
+            "bytemuck::cast_slice bytes must match f32::to_le_bytes encoding on this target"
+        );
     }
 
     /// 8: Push after stop — the sink can still accept pushes without

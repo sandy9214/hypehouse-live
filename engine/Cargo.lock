@@ -926,6 +926,7 @@ dependencies = [
  "anyhow",
  "assert_no_alloc",
  "bincode",
+ "bytemuck",
  "cpal",
  "criterion",
  "crossbeam",
