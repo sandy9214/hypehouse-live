@@ -70,3 +70,17 @@ Postgres / sqlite for live audio events would add network latency to the hot pat
 ## Open implementation questions
 
 - ADR-005 will define the co-pilot RPC: does the co-pilot return events directly into the log, or commands that the engine translates into events? Leaning toward events-direct so the audit trail is uniform.
+
+## Implementation: event log persists to JSONL per-session under XDG_DATA_HOME
+
+Landed in PR `engine-event-log-persistence`. The append-only log is now durable:
+
+- **Location**: `$HYPEHOUSE_EVENT_LOG_DIR` → `$XDG_DATA_HOME/hypehouse-live/sessions/<session_id>/events.jsonl` → `~/.local/share/hypehouse-live/sessions/<session_id>/events.jsonl` (priority order).
+- **Format**: one JSON-serialized `Event` per line (JSONL). Stable on-disk shape — every line has `id`, `ts_micros`, `source`, `kind`. `jq`-friendly for post-mortem analysis.
+- **Session id**: `YYYYMMDDTHHMMSSZ-XXXX` where `XXXX` is 4 hex chars derived from process entropy. Generated once on engine boot.
+- **Threading**: append runs on the **control thread only** after each reducer apply. Audio thread is untouched (ADR-004 contract preserved).
+- **Buffering**: `BufWriter` flushes every `FLUSH_EVERY_N=100` events plus a final flush on `Drop` and on graceful shutdown. Worst-case tail loss on hard crash = <100 events ≈ <10s of live activity.
+- **Disable**: `HYPEHOUSE_EVENT_LOG_DISABLED=1` skips writes entirely. Used by CI + ephemeral runs.
+- **Replay primitive**: `persistence::replay::EventReplay` streams events back; `replay_state(&events)` re-folds into `EngineState`. Used by tests today; restart-recovery flow will compose it in a follow-up PR.
+- **Retention**: not yet implemented. Tracked as a follow-up issue ("Event log pruning + retention policy").
+- **Snapshot**: the bincode snapshot + offset-pointer recovery flow described above remains a future PR; JSONL replay is the v0.1 primitive.
