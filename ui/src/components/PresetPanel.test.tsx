@@ -52,6 +52,8 @@ const emptyDeck = (id: "A" | "B"): Deck => ({
     { effect_id: 0, params: {}, wet_dry: 0.5, enabled: false },
     { effect_id: 0, params: {}, wet_dry: 0.5, enabled: false },
   ],
+  stem_gains: [1, 1, 1, 1],
+  stem_mode: false,
 });
 
 const populatedDeck = (id: "A" | "B"): Deck => ({
