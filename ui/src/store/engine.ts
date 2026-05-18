@@ -121,6 +121,84 @@ const emptyEngineState = (): EngineState => ({
 let current: EngineState = emptyEngineState();
 const listeners = new Set<Listener>();
 
+/**
+ * Per-deck record of the last `engine.state_changed` push for a given
+ * deck — wall-clock timestamp + the `position_ms` we received. The
+ * rAF-driven waveform extrapolates between server pushes using:
+ *   pos_now ≈ last_position_ms + (now - last_update_ts) × tempo_ratio
+ *
+ * Why two records (not one): each deck advances independently; deck A
+ * might be paused while deck B is playing. Server pushes are sparse
+ * (~5 Hz) but rAF runs ~60 Hz, so extrapolation hides the gap.
+ *
+ * Track-id keyed: we'd ideally re-zero on track change, but the engine
+ * state mirror has no track_id field. Caller (Deck.tsx) clears the
+ * provider when the deck unloads, so a stale record never feeds the
+ * visualiser.
+ */
+interface PositionAnchor {
+  positionMs: number;
+  updateTs: number;
+  durationMs: number;
+  tempoRatio: number;
+  playing: boolean;
+}
+const positionAnchors = new Map<DeckId, PositionAnchor>();
+
+/** Override for `now()` so tests can advance time deterministically. */
+let nowFn: () => number = (): number => Date.now();
+export const __setNowForTest = (fn: () => number): void => {
+  nowFn = fn;
+};
+export const __resetNowForTest = (): void => {
+  nowFn = (): number => Date.now();
+};
+
+const updateAnchor = (deck: Deck, durationMs: number): void => {
+  positionAnchors.set(deck.id, {
+    positionMs: deck.position_ms,
+    updateTs: nowFn(),
+    durationMs,
+    tempoRatio: deck.tempo_ratio,
+    playing: deck.playing,
+  });
+};
+
+/**
+ * Smoothed playhead position for `deckId`. Returns the last known
+ * `position_ms` advanced by `(now - last_update_ts) × tempo_ratio` —
+ * unless the deck is paused, in which case the static position is
+ * returned. Clamped to `[0, durationMs]` so the playhead never falls
+ * off the visible end.
+ *
+ * `durationMsHint` overrides the anchor's stored duration — covers the
+ * common case where the UI has duration from the LibraryTrack payload
+ * but the anchor was set before the deck knew its duration.
+ */
+export const extrapolatedPosition = (
+  deckId: DeckId,
+  durationMsHint?: number,
+): number => {
+  const anchor = positionAnchors.get(deckId);
+  if (!anchor) return 0;
+  const duration =
+    typeof durationMsHint === "number" && durationMsHint > 0
+      ? durationMsHint
+      : anchor.durationMs;
+  if (!anchor.playing) {
+    return duration > 0
+      ? Math.max(0, Math.min(anchor.positionMs, duration))
+      : Math.max(0, anchor.positionMs);
+  }
+  const dtMs = Math.max(0, nowFn() - anchor.updateTs);
+  const advanced = anchor.positionMs + dtMs * anchor.tempoRatio;
+  if (duration > 0) return Math.max(0, Math.min(advanced, duration));
+  return Math.max(0, advanced);
+};
+
+/** Reset position anchors (test/internal). */
+export const __resetPositionAnchors = (): void => positionAnchors.clear();
+
 const subscribe = (l: Listener): (() => void) => {
   listeners.add(l);
   return (): void => {
@@ -158,6 +236,13 @@ export const applyNotification = (n: JsonRpcNotification): void => {
   const params = n.params as StateChangedPayload | undefined;
   if (!params || !params.state) return;
   const next = mergeState(current, params);
+  // Refresh position anchors on every push — even if the merged state is
+  // shallow-equal we still want the timestamp to advance so future
+  // extrapolation re-bases off the latest server-reported position.
+  for (const d of next.decks) {
+    const anchor = positionAnchors.get(d.id);
+    updateAnchor(d, anchor?.durationMs ?? 0);
+  }
   if (next !== current) {
     current = next;
     notifyListeners();
@@ -201,5 +286,31 @@ export const useEngineState = (): EngineState =>
 /** Test/internal hook — reset back to empty state. */
 export const __resetEngineState = (): void => {
   current = emptyEngineState();
+  positionAnchors.clear();
   notifyListeners();
+};
+
+/**
+ * Public anchor helper for components that own a deck's duration (the
+ * engine state mirror doesn't carry it — see Deck.tsx). Lets Deck.tsx
+ * register the duration once at DeckLoad so the clamp inside
+ * `extrapolatedPosition` works correctly.
+ */
+export const setDeckDuration = (deckId: DeckId, durationMs: number): void => {
+  const anchor = positionAnchors.get(deckId);
+  if (anchor) {
+    positionAnchors.set(deckId, { ...anchor, durationMs });
+    return;
+  }
+  // No anchor yet — synthesise one from the current snapshot so a
+  // pre-state_changed call from Deck still primes the extrapolator.
+  const deck = current.decks.find((d): boolean => d.id === deckId);
+  if (!deck) return;
+  positionAnchors.set(deckId, {
+    positionMs: deck.position_ms,
+    updateTs: nowFn(),
+    durationMs,
+    tempoRatio: deck.tempo_ratio,
+    playing: deck.playing,
+  });
 };
