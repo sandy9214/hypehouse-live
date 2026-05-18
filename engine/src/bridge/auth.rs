@@ -122,4 +122,56 @@ mod tests {
         assert!(!constant_time_eq(b"a", b"ab"));
         assert!(constant_time_eq(b"abc", b"abc"));
     }
+
+    /// Loose timing-comparison sanity check: per issue #10, a wrong-but-
+    /// same-length token must not short-circuit on the first differing
+    /// byte. We can't make hard real-time guarantees on a noisy CI box, so
+    /// the assertion is just that the mean wall-clock for valid-but-wrong
+    /// and valid-and-right tokens stays within ±50% of each other across
+    /// 10000 iterations. Anything wildly off (e.g. 10x faster on the
+    /// wrong-prefix path) means short-circuit comparison crept back in.
+    #[test]
+    fn constant_time_eq_does_not_short_circuit_on_mismatch() {
+        use std::time::Instant;
+
+        // Identical-length tokens; the "wrong" one differs at the FIRST
+        // byte so a naive `==` would short-circuit on iteration 1.
+        let right: &[u8] = b"correct-horse-battery-staple-token-0123456789";
+        let wrong: &[u8] = b"Xorrect-horse-battery-staple-token-0123456789";
+        assert_eq!(right.len(), wrong.len());
+
+        const ITERS: usize = 10_000;
+
+        let mut wrong_ns: u128 = 0;
+        let mut right_ns: u128 = 0;
+
+        // Interleave the two loops to dampen scheduling skew.
+        for _ in 0..ITERS {
+            let t0 = Instant::now();
+            let r = constant_time_eq(right, wrong);
+            wrong_ns += t0.elapsed().as_nanos();
+            assert!(!r);
+
+            let t1 = Instant::now();
+            let r = constant_time_eq(right, right);
+            right_ns += t1.elapsed().as_nanos();
+            assert!(r);
+        }
+
+        let wrong_mean = wrong_ns as f64 / ITERS as f64;
+        let right_mean = right_ns as f64 / ITERS as f64;
+        let ratio = if wrong_mean > right_mean {
+            wrong_mean / right_mean.max(1.0)
+        } else {
+            right_mean / wrong_mean.max(1.0)
+        };
+
+        // ±50% window: ratio must be < 1.5. CI noise on cold timers can
+        // be high; this is a smoke-test for short-circuit regressions,
+        // not a cryptographic guarantee.
+        assert!(
+            ratio < 1.5,
+            "timing diverged too far: wrong_mean={wrong_mean}ns right_mean={right_mean}ns ratio={ratio:.2}"
+        );
+    }
 }
