@@ -31,6 +31,32 @@ const VALID_CLOCK_SOURCES: ReadonlyArray<ClockSource> = [
   "ableton_link",
 ];
 
+/**
+ * Crossfader response curve — mirrors the engine's `CrossfaderCurve`
+ * enum (engine/src/state.rs). The full `EngineState` snapshot serializes
+ * this field, so it rides on every `engine.state_changed`. Defaulted
+ * to `"Linear"` on an empty mirror to match the engine's `Default`
+ * impl. Used by the preset panel to capture the current scene.
+ */
+export type CrossfaderCurve = "Linear" | "Dipped" | "Sharp" | "Scratch";
+
+const VALID_CROSSFADER_CURVES: ReadonlyArray<CrossfaderCurve> = [
+  "Linear",
+  "Dipped",
+  "Sharp",
+  "Scratch",
+];
+
+const normaliseCrossfaderCurve = (raw: unknown): CrossfaderCurve => {
+  if (
+    typeof raw === "string" &&
+    (VALID_CROSSFADER_CURVES as string[]).includes(raw)
+  ) {
+    return raw as CrossfaderCurve;
+  }
+  return "Linear";
+};
+
 /** Coerce an unknown wire value to a known `ClockSource`. Defends the
  * mirror against a future engine that ships a variant the UI doesn't
  * recognise yet — unknown source = treat as `internal` (badge falls
@@ -82,6 +108,14 @@ export interface Deck {
 export interface EngineState {
   decks: readonly [Deck, Deck];
   crossfader: number;
+  /**
+   * Mirror of `EngineState::crossfader_curve` (engine/src/state.rs).
+   * The engine broadcasts the field as part of every `engine.state_changed`
+   * snapshot. Defaults to `"Linear"` so a pre-this-PR engine that omits
+   * the field still produces a sensible UI mirror. Used by the preset
+   * panel to capture / restore the curve as part of a scene.
+   */
+  crossfader_curve: CrossfaderCurve;
   last_event_id: number;
   /**
    * Master-bus soft-clip limiter — toggle. Mirror of
@@ -151,6 +185,7 @@ const DEFAULT_MASTER_LIMITER_THRESHOLD_DB = -0.5;
 const emptyEngineState = (): EngineState => ({
   decks: [emptyDeck("A"), emptyDeck("B")],
   crossfader: 0.5,
+  crossfader_curve: "Linear",
   last_event_id: 0,
   master_limiter_enabled: true,
   master_limiter_threshold_db: DEFAULT_MASTER_LIMITER_THRESHOLD_DB,
@@ -317,9 +352,18 @@ const mergeState = (
     payload.clock_source === undefined
       ? prev.clock_source
       : normaliseClockSource(payload.clock_source);
+  // `crossfader_curve` rides inside the `state` patch (it's part of the
+  // engine's serialised `EngineState`). Engines that omit the field
+  // (pre-curve-PR snapshots, replays of older event logs) keep the
+  // prior value rather than thrash back to Linear on every push.
+  const curve =
+    patch.crossfader_curve === undefined
+      ? prev.crossfader_curve
+      : normaliseCrossfaderCurve(patch.crossfader_curve);
   return {
     decks,
     crossfader: patch.crossfader ?? prev.crossfader,
+    crossfader_curve: curve,
     last_event_id:
       payload.last_event_id ?? patch.last_event_id ?? prev.last_event_id,
     master_limiter_enabled:

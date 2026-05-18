@@ -202,7 +202,7 @@ def test_schema_migration_adds_stems_columns(tmp_path: Path) -> None:
 
         # Version stamped to current.
         ver = lib._conn.execute("SELECT version FROM schema_version").fetchone()
-        assert ver[0] == TRACK_SCHEMA_VERSION == 5
+        assert ver[0] == TRACK_SCHEMA_VERSION
 
         # Legacy row survived migration with NULL stems columns.
         row = lib._conn.execute(

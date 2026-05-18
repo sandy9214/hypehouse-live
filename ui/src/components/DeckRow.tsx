@@ -16,6 +16,7 @@ import { Deck } from "./Deck";
 import { Crossfader } from "./Crossfader";
 import { Library } from "./Library";
 import { MasterControls } from "./MasterControls";
+import { PresetPanel } from "./PresetPanel";
 import { Sessions } from "./Sessions";
 import { JsonRpcWS } from "../ws/client";
 import { applyNotification, useEngineState } from "../store/engine";
@@ -129,6 +130,11 @@ export const DeckRow = ({ client: external }: DeckRowProps = {}): JSX.Element =>
         thresholdDb={state.master_limiter_threshold_db}
         gainReductionDb={state.master_limiter_gain_reduction_db}
         clockSource={state.clock_source}
+      />
+      <PresetPanel
+        client={client}
+        decks={state.decks}
+        crossfaderCurve={state.crossfader_curve}
       />
       <div
         style={{

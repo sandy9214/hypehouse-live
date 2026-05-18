@@ -42,6 +42,10 @@ import json
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover — type-only import to break cycle.
+    from .presets import PresetStore
 
 # Bumped to v5 in the stem-separation scaffold PR.
 # v2 added beat-grid columns (anchor_ms / period_ms / downbeats_json);
@@ -54,9 +58,14 @@ from pathlib import Path
 # computation status string ("pending" / "ready" / "failed"). NULL on
 # both columns = stems have never been requested for this track. See
 # ``copilot/stems.py`` for the on-disk layout.
+# v6 adds the ``presets`` table for user preset snapshots (per-deck
+# effects + EQ + pitch/tempo + crossfader curve). Storage scheme is a
+# JSON blob in a single ``json`` column — schema-light because the
+# captured field set is still churning. See ``copilot/presets.py`` for
+# the in-memory shape + wire projection.
 # Migrations dispatch on the gap between this constant and the value
 # recorded in the ``schema_version`` table.
-TRACK_SCHEMA_VERSION = 5
+TRACK_SCHEMA_VERSION = 6
 
 # Per-track stem-status enum values. Persisted as plain strings (not a
 # SQL enum) so older readers can still introspect the column. The
@@ -282,6 +291,25 @@ class TrackLibrary:
             self._conn.execute(
                 "ALTER TABLE tracks ADD COLUMN stems_status TEXT"
             )
+        # v6 migration — user preset snapshots. Lives in its own table
+        # rather than as columns on ``tracks`` because presets aren't
+        # per-track. ``name`` is UNIQUE so the UI's "save current" flow
+        # can detect duplicate names and prompt the user to rename
+        # rather than silently overwrite. ``json`` holds the full
+        # preset body so we don't need an ALTER TABLE per new field
+        # (effect set + EQ + pitch/tempo + curve are likely to grow).
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS presets (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT NOT NULL UNIQUE,
+                json       TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS presets_created_at_idx
+                ON presets (created_at DESC);
+            """
+        )
         # Stamp the current schema version. The ``schema_version``
         # table is conceptually single-row but ``version`` is also the
         # primary key — using ``INSERT OR REPLACE`` would leave stale
@@ -297,6 +325,18 @@ class TrackLibrary:
 
     def close(self) -> None:
         self._conn.close()
+
+    def preset_store(self) -> "PresetStore":
+        """Return a :class:`copilot.presets.PresetStore` over the same DB.
+
+        Lazy-imported to keep :mod:`copilot.library` importable without
+        pulling in the preset module — symmetric with the lazy demucs
+        import on stems. The store shares this library's connection, so
+        a preset save and a track read both hit the same SQLite file.
+        """
+        from .presets import PresetStore
+
+        return PresetStore(self._conn)
 
     # --- write path (ingestion / tests) -----------------------------------
 
