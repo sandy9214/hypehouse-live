@@ -44,14 +44,25 @@ const token = (): string => {
   return env?.VITE_BRIDGE_TOKEN ?? "dev-token";
 };
 
-export const DeckRow = (): JSX.Element => {
+export interface DeckRowProps {
+  /** Optional shared JSON-RPC client. When provided, DeckRow uses it
+   * instead of constructing its own — the lifecycle (subscribe +
+   * connect + close) still belongs to DeckRow so existing callers that
+   * pass nothing get the legacy self-managed behaviour. Hoisted by
+   * `App.tsx` so the onboarding wizard and the deck UI share a single
+   * WebSocket. */
+  client?: JsonRpcWS;
+}
+
+export const DeckRow = ({ client: external }: DeckRowProps = {}): JSX.Element => {
   const client = useMemo<JsonRpcWS>(
-    () => new JsonRpcWS({ url: wsUrl(), token: token() }),
-    [],
+    () => external ?? new JsonRpcWS({ url: wsUrl(), token: token() }),
+    [external],
   );
   const state = useEngineState();
   const [tab, setTab] = useState<SecondaryTab>("live");
 
+  const ownsClient = external === undefined;
   useEffect((): (() => void) => {
     const unsubscribeState = client.subscribe(applyNotification);
     const unsubscribeDecodeErrors = client.subscribe(
@@ -61,9 +72,12 @@ export const DeckRow = (): JSX.Element => {
     return (): void => {
       unsubscribeState();
       unsubscribeDecodeErrors();
-      client.close();
+      // Only close the socket if we constructed it ourselves — when a
+      // parent (App.tsx) injected the client the parent owns its
+      // lifecycle.
+      if (ownsClient) client.close();
     };
-  }, [client]);
+  }, [client, ownsClient]);
 
   useEffect((): (() => void) => {
     const handler = (ev: KeyboardEvent): void => {
