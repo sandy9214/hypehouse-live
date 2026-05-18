@@ -9,6 +9,14 @@
 // Subsequent calls use a monotonically-increasing id starting at 2.
 // The class is transport-agnostic enough to be unit-tested against a
 // mock WebSocket constructor (see client.test.ts).
+//
+// Two ways to construct one:
+//   * `new JsonRpcWS({ url, token })` — explicit, used in tests.
+//   * `await createBridgeClient()` — auto-detects Tauri vs browser via
+//     `src/runtime.ts`; calls the Tauri `invoke()` API for URL + token
+//     when running in the desktop shell.
+
+import { getBridgeToken, getBridgeUrl } from "../runtime";
 
 export type JsonRpcId = number;
 
@@ -241,4 +249,19 @@ export class JsonRpcWS {
       this.connect();
     }, delay);
   }
+}
+
+/**
+ * Construct a `JsonRpcWS` from the current runtime environment.
+ *
+ * Resolves URL + token via `runtime.ts` — Tauri invoke commands when
+ * inside the desktop shell, Vite env / dev fallbacks in the browser.
+ * Does NOT call `.connect()`; callers wire subscribers first then
+ * connect explicitly, mirroring the manual constructor usage.
+ */
+export async function createBridgeClient(
+  overrides?: Omit<JsonRpcWSOptions, "url" | "token">,
+): Promise<JsonRpcWS> {
+  const [url, token] = await Promise.all([getBridgeUrl(), getBridgeToken()]);
+  return new JsonRpcWS({ url, token, ...overrides });
 }
