@@ -426,7 +426,18 @@ mod tests {
 
     #[tokio::test]
     async fn submit_event_and_observe_state_changed_notification() {
-        let engine = EngineHandle::new();
+        // Wire an event sink and a fake control loop that re-applies the
+        // event onto the bridge state, so the state_changed fan-out still
+        // exercises end-to-end. This mirrors the production wiring in
+        // `engine/src/main.rs` (bridge → channel → control_loop).
+        let (event_tx, event_rx) = crossbeam::channel::unbounded::<crate::state::Event>();
+        let engine = EngineHandle::with_event_sink(event_tx);
+        let engine_for_loop = engine.clone();
+        std::thread::spawn(move || {
+            while let Ok(ev) = event_rx.recv() {
+                engine_for_loop.submit_event_kind(ev.kind, ev.source);
+            }
+        });
         let server = spawn(
             cfg_with(ephemeral_loopback(), AuthConfig::default()),
             engine.clone(),

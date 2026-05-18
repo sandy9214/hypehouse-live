@@ -21,6 +21,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use crossbeam::channel::{Sender, TrySendError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -165,10 +166,32 @@ struct EngineInner {
     notices: broadcast::Sender<BridgeNotice>,
     metrics: BridgeMetrics,
     boot_instant: Instant,
+    /// Optional control-loop event channel. When `Some`, `submit_event`
+    /// RPCs `try_send` into it (non-blocking — full / disconnected maps
+    /// to `-32000 engine offline`). When `None`, `submit_event` returns
+    /// `-32001 engine sink not wired` so unit tests that use the bare
+    /// `EngineHandle::new()` constructor still get a structured error
+    /// instead of a panic — and snapshot/event_log/health remain usable.
+    event_sink: Option<Sender<Event>>,
 }
 
 impl EngineHandle {
+    /// Zero-arg constructor — leaves the event sink unwired. Used by
+    /// the integration & unit tests that exercise snapshot / event_log /
+    /// health without spinning up the control loop. Live runs should
+    /// call [`EngineHandle::with_event_sink`] instead.
     pub fn new() -> Self {
+        Self::build(None)
+    }
+
+    /// Build a handle wired to the control-loop event channel. The
+    /// bridge will forward every accepted `engine.submit_event` RPC
+    /// payload onto `sink` via `try_send` (non-blocking).
+    pub fn with_event_sink(sink: Sender<Event>) -> Self {
+        Self::build(Some(sink))
+    }
+
+    fn build(event_sink: Option<Sender<Event>>) -> Self {
         let (tx, _) = broadcast::channel::<BridgeNotice>(1024);
         let inner = EngineInner {
             state: std::sync::Mutex::new(EngineState::default()),
@@ -177,9 +200,37 @@ impl EngineHandle {
             notices: tx,
             metrics: BridgeMetrics::default(),
             boot_instant: Instant::now(),
+            event_sink,
         };
         Self {
             inner: Arc::new(inner),
+        }
+    }
+
+    /// Whether this handle has a wired event sink (i.e. live mode vs.
+    /// bare-test mode). Used by dispatch to choose the error response.
+    pub fn has_event_sink(&self) -> bool {
+        self.inner.event_sink.is_some()
+    }
+
+    /// Forward `event` onto the control-loop channel without blocking.
+    /// Returns:
+    /// * `Ok(())` on accept,
+    /// * `Err(RpcError::engine_offline(...))` if the channel is full or
+    ///   the receiver was dropped,
+    /// * `Err(RpcError::engine_sink_unwired(...))` if no sink is wired.
+    pub fn forward_event(&self, event: Event) -> Result<(), RpcError> {
+        match &self.inner.event_sink {
+            None => Err(RpcError::engine_sink_unwired(
+                "EngineHandle constructed without an event sink",
+            )),
+            Some(sink) => match sink.try_send(event) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(_)) => Err(RpcError::engine_offline("event channel full")),
+                Err(TrySendError::Disconnected(_)) => Err(RpcError::engine_offline(
+                    "event channel disconnected (control loop exited)",
+                )),
+            },
         }
     }
 
@@ -341,11 +392,27 @@ pub fn dispatch(engine: &EngineHandle, req: RpcRequest) -> RpcResponse {
                 Ok(SubmitEventParams::Bare(kind)) => (kind, EventSource::Ui),
                 Err(e) => return RpcResponse::err(id, RpcError::invalid_params(e.to_string())),
             };
-            let state_id = engine.submit_event_kind(kind, source);
-            RpcResponse::ok(
-                id,
-                serde_json::json!({ "accepted": true, "state_id": state_id }),
-            )
+            // Stamp id + ts on the bridge side so the control loop sees
+            // monotonic ordering in receive order. The reducer is then
+            // pure on the consumer side.
+            let event_id = engine
+                .inner
+                .next_event_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let ts_micros = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0);
+            let event = Event {
+                id: event_id,
+                ts_micros,
+                source,
+                kind,
+            };
+            match engine.forward_event(event) {
+                Ok(()) => RpcResponse::ok(id, serde_json::json!({ "accepted": true })),
+                Err(e) => RpcResponse::err(id, e),
+            }
         }
         method::SNAPSHOT => {
             let snap = engine.snapshot();
@@ -396,9 +463,15 @@ pub fn audio_alert_notification(kind: &str, details: &str) -> RpcNotification {
 mod tests {
     use super::*;
     use crate::state::{DeckId, EventKind};
+    use crossbeam::channel;
 
     fn engine() -> EngineHandle {
         EngineHandle::new()
+    }
+
+    fn engine_with_sink() -> (EngineHandle, channel::Receiver<Event>) {
+        let (tx, rx) = channel::unbounded::<Event>();
+        (EngineHandle::with_event_sink(tx), rx)
     }
 
     fn submit(method: &str, params: Value, id: i64) -> RpcRequest {
@@ -411,8 +484,8 @@ mod tests {
     }
 
     #[test]
-    fn submit_event_accepts_deck_play_and_advances_state_id() {
-        let e = engine();
+    fn submit_event_accepts_deck_play_when_sink_wired() {
+        let (e, rx) = engine_with_sink();
         let req = submit(
             method::SUBMIT_EVENT,
             serde_json::json!({ "kind": { "DeckPlay": { "deck": "A" } } }),
@@ -422,13 +495,79 @@ mod tests {
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
         let result = resp.result.unwrap();
         assert_eq!(result["accepted"], Value::Bool(true));
-        assert_eq!(result["state_id"].as_u64(), Some(1));
-        assert!(e.snapshot().deck_a.playing);
+        // The event was forwarded onto the channel.
+        let ev = rx.try_recv().expect("event forwarded onto sink");
+        match ev.kind {
+            EventKind::DeckPlay { deck: DeckId::A } => {}
+            other => panic!("unexpected event kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_event_no_sink_returns_engine_sink_unwired() {
+        let e = engine();
+        let req = submit(
+            method::SUBMIT_EVENT,
+            serde_json::json!({ "kind": { "DeckPlay": { "deck": "A" } } }),
+            1,
+        );
+        let resp = dispatch(&e, req);
+        let err = resp.error.expect("expected error when sink is unwired");
+        assert_eq!(err.code, super::super::error::ENGINE_SINK_UNWIRED);
+        assert!(err.message.contains("engine sink not wired"));
+    }
+
+    #[test]
+    fn submit_event_full_channel_returns_engine_offline() {
+        // Bounded channel of capacity 1: fill it, then ensure the second
+        // submit_event RPC trips the `-32000 engine offline` path.
+        let (tx, _rx) = channel::bounded::<Event>(1);
+        let e = EngineHandle::with_event_sink(tx);
+        // First submit fills the channel (we never drain it).
+        let r1 = dispatch(
+            &e,
+            submit(
+                method::SUBMIT_EVENT,
+                serde_json::json!({ "kind": { "DeckPlay": { "deck": "A" } } }),
+                10,
+            ),
+        );
+        assert!(r1.error.is_none(), "first submit should succeed: {r1:?}");
+        // Second submit must error with engine_offline.
+        let r2 = dispatch(
+            &e,
+            submit(
+                method::SUBMIT_EVENT,
+                serde_json::json!({ "kind": { "DeckPlay": { "deck": "B" } } }),
+                11,
+            ),
+        );
+        let err = r2.error.expect("expected -32000 on full channel");
+        assert_eq!(err.code, super::super::error::ENGINE_OFFLINE);
+        assert!(err.message.contains("engine offline"));
+    }
+
+    #[test]
+    fn submit_event_disconnected_channel_returns_engine_offline() {
+        // Drop the receiver; the sender's try_send must surface Disconnected.
+        let (tx, rx) = channel::unbounded::<Event>();
+        drop(rx);
+        let e = EngineHandle::with_event_sink(tx);
+        let resp = dispatch(
+            &e,
+            submit(
+                method::SUBMIT_EVENT,
+                serde_json::json!({ "kind": { "DeckPlay": { "deck": "A" } } }),
+                12,
+            ),
+        );
+        let err = resp.error.expect("expected -32000 on disconnected channel");
+        assert_eq!(err.code, super::super::error::ENGINE_OFFLINE);
     }
 
     #[test]
     fn submit_event_unknown_kind_returns_invalid_params() {
-        let e = engine();
+        let (e, _rx) = engine_with_sink();
         let req = submit(
             method::SUBMIT_EVENT,
             serde_json::json!({ "kind": { "NotAnEvent": {} } }),
@@ -540,8 +679,8 @@ mod tests {
     }
 
     #[test]
-    fn submit_event_accepts_bare_kind_shape() {
-        let e = engine();
+    fn submit_event_accepts_bare_kind_shape_with_sink() {
+        let (e, rx) = engine_with_sink();
         let req = submit(
             method::SUBMIT_EVENT,
             serde_json::json!({ "DeckPlay": { "deck": "A" } }),
@@ -549,6 +688,37 @@ mod tests {
         );
         let resp = dispatch(&e, req);
         assert!(resp.error.is_none(), "{:?}", resp.error);
-        assert!(e.snapshot().deck_a.playing);
+        let ev = rx.try_recv().expect("event forwarded onto sink");
+        match ev.kind {
+            EventKind::DeckPlay { deck: DeckId::A } => {}
+            other => panic!("unexpected event kind: {other:?}"),
+        }
+        // Source defaults to Ui when omitted from the bare shape.
+        assert!(matches!(ev.source, EventSource::Ui));
+    }
+
+    #[test]
+    fn forward_event_returns_engine_offline_on_full_bounded_channel() {
+        // Direct method test for the helper.
+        let (tx, _rx) = channel::bounded::<Event>(1);
+        let e = EngineHandle::with_event_sink(tx);
+        let ev = Event {
+            id: 1,
+            ts_micros: 0,
+            source: EventSource::Ui,
+            kind: EventKind::DeckPlay { deck: DeckId::A },
+        };
+        // Fill the channel.
+        e.forward_event(ev.clone()).expect("first send fits");
+        // Next send must return engine_offline.
+        let err = e.forward_event(ev).expect_err("expected engine_offline");
+        assert_eq!(err.code, super::super::error::ENGINE_OFFLINE);
+    }
+
+    #[test]
+    fn has_event_sink_reflects_constructor_choice() {
+        assert!(!EngineHandle::new().has_event_sink());
+        let (tx, _rx) = channel::unbounded::<Event>();
+        assert!(EngineHandle::with_event_sink(tx).has_event_sink());
     }
 }

@@ -24,9 +24,16 @@
 //!
 //! Error codes
 //! -----------
-//! `-32600` invalid request (also used for malformed JSON per this
-//! engine's framing requirement), `-32601` method not found, `-32602`
-//! invalid params, `-32603` internal. See [`error`].
+//! Standard JSON-RPC: `-32600` invalid request (also used for malformed
+//! JSON per this engine's framing requirement), `-32601` method not
+//! found, `-32602` invalid params, `-32603` internal.
+//!
+//! Engine application codes (`-32000..=-32099`):
+//! * `-32000` `ENGINE_OFFLINE`      — control-loop channel full/disconnected.
+//! * `-32001` `ENGINE_SINK_UNWIRED` — handle has no event sink wired.
+//! * `-32002` `AUTH_REJECTED`       — rare; handshake usually 401s first.
+//!
+//! See [`error`] for full enumeration.
 
 pub mod auth;
 pub mod error;
@@ -35,8 +42,8 @@ pub mod ws_server;
 
 pub use auth::AuthConfig;
 pub use error::{
-    RpcError, AUTH_REJECTED, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
-    PARSE_ERROR,
+    RpcError, AUTH_REJECTED, ENGINE_OFFLINE, ENGINE_SINK_UNWIRED, INTERNAL_ERROR, INVALID_PARAMS,
+    INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
 };
 pub use rpc::{
     audio_alert_notification, dispatch, method, state_changed_notification, BridgeMetrics,

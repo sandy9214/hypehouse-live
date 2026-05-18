@@ -203,11 +203,7 @@ fn chrono_micros() -> i64 {
 
 /// Pure translator: Note-On → `EventKind`. Public-in-crate so tests can call
 /// it without spinning up a real MIDI device.
-pub(crate) fn translate_note(
-    status: u8,
-    data1: u8,
-    mapping: &Mapping,
-) -> Option<EventKind> {
+pub(crate) fn translate_note(status: u8, data1: u8, mapping: &Mapping) -> Option<EventKind> {
     let b: &NoteBinding = mapping.note_binding(status, data1)?;
     let deck = b.deck.map(DeckId::from);
     Some(match b.action {
@@ -242,7 +238,9 @@ pub(crate) fn translate_cc(
 ) -> Option<EventKind> {
     let b: &CcBinding = mapping.cc_binding(status, data1)?;
     let deck = b.deck.map(DeckId::from);
-    let [lo, hi] = b.range_db.unwrap_or([clamp::DEFAULT_EQ_DB_LO, clamp::DEFAULT_EQ_DB_HI]);
+    let [lo, hi] = b
+        .range_db
+        .unwrap_or([clamp::DEFAULT_EQ_DB_LO, clamp::DEFAULT_EQ_DB_HI]);
 
     Some(match b.action {
         CcAction::EqLow => EventKind::EqAdjust {
@@ -273,7 +271,10 @@ pub(crate) fn translate_cc(
                 centered as f32 / 64.0
             };
             let semitones = (normalized * 2.0).clamp(-12.0, 12.0);
-            EventKind::PitchBend { deck: deck?, semitones }
+            EventKind::PitchBend {
+                deck: deck?,
+                semitones,
+            }
         }
     })
 }
@@ -286,8 +287,7 @@ pub(crate) fn translate_pitch_bend(
     mapping: &Mapping,
 ) -> Option<EventKind> {
     let b = mapping.pitch_bend_binding(status)?;
-    let semitones =
-        clamp::pitch_bend_14_to_semitones(data1_lsb, data2_msb, b.range_semitones);
+    let semitones = clamp::pitch_bend_14_to_semitones(data1_lsb, data2_msb, b.range_semitones);
     Some(EventKind::PitchBend {
         deck: DeckId::from(b.deck),
         semitones,
@@ -511,4 +511,3 @@ mod tests {
         }
     }
 }
-
