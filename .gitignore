@@ -1,6 +1,8 @@
 # Rust
 /engine/target/
 /engine/Cargo.lock.bak
+/tauri/target/
+/tauri/gen/
 **/*.rs.bk
 
 # Node / Vite

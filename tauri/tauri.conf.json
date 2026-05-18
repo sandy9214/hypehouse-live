@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "HypeHouse Live",
+  "version": "0.1.0",
+  "identifier": "live.hypehouse.desktop",
+  "build": {
+    "frontendDist": "../ui/dist",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeDevCommand": "npm --prefix ../ui run dev",
+    "beforeBuildCommand": "npm --prefix ../ui run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "HypeHouse Live",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 640,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png"
+    ],
+    "category": "Music",
+    "shortDescription": "Live multi-deck DJ player with AI co-pilot",
+    "longDescription": "HypeHouse Live is a Rust-powered live DJ application featuring sub-5ms audio latency, native MIDI controller support, and an optional AI co-pilot for AI-driven track selection and phrase-aligned transitions."
+  }
+}

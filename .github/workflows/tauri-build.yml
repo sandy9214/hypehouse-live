@@ -1,0 +1,106 @@
+name: tauri-build
+
+# Cross-platform Tauri desktop binary build.
+#
+# Trigger: tag pushes matching `v*` (release artifacts). PRs to main
+# DO NOT trigger this — the matrix is heavy (Rust + Node + Tauri
+# system deps on three OSes) and CI minutes are finite. Use
+# `make build-tauri` locally to smoke-test PR builds.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+  RUST_TOOLCHAIN: "1.88"
+
+jobs:
+  build:
+    name: ${{ matrix.platform.label }}
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - label: macos
+            os: macos-latest
+            artifact-glob: |
+              tauri/target/release/bundle/macos/*.app
+              tauri/target/release/bundle/dmg/*.dmg
+          - label: linux
+            os: ubuntu-latest
+            artifact-glob: |
+              tauri/target/release/bundle/appimage/*.AppImage
+              tauri/target/release/bundle/deb/*.deb
+          - label: windows
+            os: windows-latest
+            artifact-glob: |
+              tauri/target/release/bundle/msi/*.msi
+              tauri/target/release/bundle/nsis/*.exe
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - name: Install Linux Tauri + audio system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libasound2-dev \
+            libudev-dev \
+            pkg-config
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+            tauri/target
+          key: ${{ runner.os }}-cargo-tauri-${{ hashFiles('engine/Cargo.lock', 'tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-tauri-
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli@2 --locked
+
+      - name: Build engine (release)
+        run: cargo build --release --manifest-path engine/Cargo.toml
+
+      - name: Install UI deps
+        run: npm install --prefix ui
+
+      - name: Build Tauri bundle
+        run: cargo tauri build --manifest-path tauri/Cargo.toml
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hypehouse-desktop-${{ matrix.platform.label }}
+          path: ${{ matrix.platform.artifact-glob }}
+          if-no-files-found: warn

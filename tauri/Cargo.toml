@@ -1,0 +1,64 @@
+[package]
+name = "hypehouse-desktop"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Tauri v2 desktop shell for hypehouse-live — wraps the static UI build and spawns the Rust engine binary as a sidecar."
+license = "MIT"
+publish = false
+
+# Library + binary layout. The library exists so integration tests in
+# `tests/` can import `sidecar` and `commands` without copying source.
+[lib]
+name = "hypehouse_desktop"
+path = "src/lib.rs"
+
+# Binary target — single desktop app entrypoint.
+[[bin]]
+name = "hypehouse-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri v2 — latest stable as of 2026-05.
+tauri = { version = "2", features = [] }
+
+# Serialize command return values back to the webview.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging — match the engine's tracing setup so child stdout/stderr can
+# be re-emitted on the same logger.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Cryptographically-strong random bytes for the per-launch session token
+# returned by `get_bridge_token`. ChaCha20-based, no OS-specific deps
+# beyond `getrandom` which Tauri already pulls in.
+rand = "0.9"
+
+# Hex-encoding for the token (we hand it to the UI as a string; the WS
+# bridge accepts the bearer verbatim).
+hex = "0.4"
+
+# anyhow keeps the sidecar plumbing terse — error variants here are
+# operational ("failed to spawn child"), not domain-logic.
+anyhow = "1"
+
+[dev-dependencies]
+# Tempdir for the sidecar integration test — we drop a sleep-forever
+# shim binary in a scratch directory and point ChildGuard at it.
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# `panic = "abort"` is the Tauri-recommended profile for distributables;
+# we keep it consistent with engine/Cargo.toml.
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
