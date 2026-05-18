@@ -19,6 +19,7 @@ use crate::audio::command::{AudioCommand, AudioCommandKind};
 use crate::audio::decode::{DecodeHandle, DecodeService};
 use crate::audio::effects::{FxBank, EFFECT_NONE};
 use crate::audio::pitch_tempo::{PitchTempo, CHUNK_FRAMES as PT_CHUNK_FRAMES};
+use crate::recording::MasterRecorderSink;
 use crate::state::DeckId;
 
 /// Per-callback scratch stride used when pulling stereo samples from
@@ -100,6 +101,16 @@ pub struct AudioMixer {
     /// worst-case stage-2 expansion (input × MAX_TEMPO_RATIO/MIN ≈ 4×).
     pt_scratch_a: [f32; PT_OUT_SCRATCH],
     pt_scratch_b: [f32; PT_OUT_SCRATCH],
+    /// Master-mix recorder sink. `None` when the user has disabled
+    /// recording via `HYPEHOUSE_RECORDING_DISABLED=1` (or when tests
+    /// don't wire one). The tee path inside [`AudioMixer::render`] is
+    /// alloc-free: it materialises a `[L, R]` block into `rec_scratch`
+    /// and pushes the slice into the recorder's lock-free ring.
+    recorder: Option<MasterRecorderSink>,
+    /// Per-chunk interleaved-stereo scratch fed to the recorder.
+    /// Re-used across render calls. Sized to one stereo pull chunk so
+    /// the tee never spills.
+    rec_scratch: [f32; STEREO_PULL_FRAMES * 2],
 }
 
 /// Per-deck pitch/tempo output scratch capacity (interleaved stereo
@@ -131,7 +142,17 @@ impl AudioMixer {
             pitch_tempo_b: PitchTempo::new(DeckId::B),
             pt_scratch_a: [0.0; PT_OUT_SCRATCH],
             pt_scratch_b: [0.0; PT_OUT_SCRATCH],
+            recorder: None,
+            rec_scratch: [0.0; STEREO_PULL_FRAMES * 2],
         }
+    }
+
+    /// Attach a recording sink so [`render`] tees the final master
+    /// mix (as interleaved-stereo L=R duplicates of the current mono
+    /// output) into the recorder. Idempotent: a second call replaces
+    /// the previous sink.
+    pub fn attach_recorder(&mut self, sink: MasterRecorderSink) {
+        self.recorder = Some(sink);
     }
 
     /// Construct a mixer wired to a real decode service. Production
@@ -349,11 +370,21 @@ impl AudioMixer {
 
             // Downmix to mono + crossfade. Reuses the v0.1 contract
             // (the engine output is mono until a separate stereo PR).
+            // Tee the final mix into the recording sink as interleaved
+            // stereo (L = R = mono mix) for master.wav.
+            let tee = self.recorder.is_some();
             for i in 0..chunk {
                 let a = 0.5 * (a_slice[i * 2] + a_slice[i * 2 + 1]);
                 let b = 0.5 * (b_slice[i * 2] + b_slice[i * 2 + 1]);
                 let mix = a * (1.0 - self.crossfader) + b * self.crossfader;
                 out[written + i] = mix;
+                if tee {
+                    self.rec_scratch[i * 2] = mix;
+                    self.rec_scratch[i * 2 + 1] = mix;
+                }
+            }
+            if let Some(rec) = self.recorder.as_mut() {
+                rec.push(&self.rec_scratch[..(chunk * 2)]);
             }
             written += chunk;
         }

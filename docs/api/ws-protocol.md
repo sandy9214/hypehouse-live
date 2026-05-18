@@ -626,6 +626,15 @@ path.
 
 `u32` ms ceiling = ~71 minutes, well beyond any sane DJ track.
 
+## Session recording (master.wav)
+
+The engine writes the per-session master mix to
+`<session_dir>/master.wav` (alongside `events.jsonl` from ADR-003).
+Format is PCM IEEE-float stereo, 32-bit, sample rate = audio device's
+preferred rate. The recorder is **not** a WS protocol surface; it's
+documented in [`docs/recording.md`](../recording.md). Disable with
+`HYPEHOUSE_RECORDING_DISABLED=1`.
+
 ## MIDI clock OUT (ADR-007 v0.1)
 
 The engine can act as a MIDI clock **master**, emitting 24 PPQN MIDI
