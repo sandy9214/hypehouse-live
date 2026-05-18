@@ -59,4 +59,88 @@ describe("Crossfader", () => {
     // Serialised form is the literal string the Rust deserializer expects.
     expect(JSON.stringify(frame)).toBe('{"Crossfader":{"value":0.25}}');
   });
+
+  it("curve dropdown emits externally-tagged { SetCrossfaderCurve: { curve } } frame", (): void => {
+    const client = new FakeRpc();
+    render(
+      <Crossfader
+        client={client as unknown as never}
+        value={0.5}
+        curve="Linear"
+      />,
+    );
+    const dropdown = screen.getByTestId("crossfader-curve-select");
+    fireEvent.change(dropdown, { target: { value: "Dipped" } });
+    expect(client.calls).toHaveLength(1);
+    expect(client.calls[0]!.method).toBe("submit_event");
+    expect(client.calls[0]!.params).toEqual({
+      SetCrossfaderCurve: { curve: "Dipped" },
+    });
+    // Snapshot-pin the wire string so any drift from the engine's
+    // serde external-tag default trips loudly.
+    expect(JSON.stringify(client.calls[0]!.params)).toBe(
+      '{"SetCrossfaderCurve":{"curve":"Dipped"}}',
+    );
+  });
+
+  it("curve dropdown emits each of the four engine curve variants", (): void => {
+    const client = new FakeRpc();
+    render(
+      <Crossfader
+        client={client as unknown as never}
+        value={0.5}
+        curve="Linear"
+      />,
+    );
+    const dropdown = screen.getByTestId("crossfader-curve-select");
+    for (const curve of ["Linear", "Dipped", "Sharp", "Scratch"]) {
+      fireEvent.change(dropdown, { target: { value: curve } });
+    }
+    expect(client.calls).toHaveLength(4);
+    const curves = client.calls.map(
+      (c): string =>
+        (c.params as { SetCrossfaderCurve: { curve: string } }).SetCrossfaderCurve
+          .curve,
+    );
+    expect(curves).toEqual(["Linear", "Dipped", "Sharp", "Scratch"]);
+  });
+
+  it("curve dropdown reflects the active curve prop", (): void => {
+    const client = new FakeRpc();
+    render(
+      <Crossfader
+        client={client as unknown as never}
+        value={0.5}
+        curve="Sharp"
+      />,
+    );
+    const dropdown = screen.getByTestId(
+      "crossfader-curve-select",
+    ) as HTMLSelectElement;
+    expect(dropdown.value).toBe("Sharp");
+    // The matching icon variant is rendered alongside.
+    expect(screen.getByTestId("crossfader-curve-icon-sharp")).toBeTruthy();
+  });
+
+  it("curve dropdown ignores an invalid value (defensive)", (): void => {
+    // A direct DOM mutation injecting a value outside the enum should
+    // not produce a wire frame — the engine's reducer would no-op the
+    // unknown variant, but skipping the call saves a round-trip and
+    // protects against an out-of-tree custom UI variant.
+    const client = new FakeRpc();
+    render(
+      <Crossfader
+        client={client as unknown as never}
+        value={0.5}
+        curve="Linear"
+      />,
+    );
+    const dropdown = screen.getByTestId(
+      "crossfader-curve-select",
+    ) as HTMLSelectElement;
+    // Use Object.defineProperty so the select's controlled value isn't
+    // overwritten by React before the change handler reads it.
+    fireEvent.change(dropdown, { target: { value: "NotARealCurve" } });
+    expect(client.calls).toHaveLength(0);
+  });
 });

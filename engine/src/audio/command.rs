@@ -13,7 +13,7 @@
 //!   lock-free by index.
 
 use crate::audio::decode::DecodeHandle;
-use crate::state::DeckId;
+use crate::state::{CrossfaderCurve, DeckId};
 
 /// Maximum on-wire fixed-buffer length we allow inside an `AudioCommand`.
 /// Currently unused by any variant (no string-bearing variants ship in
@@ -60,6 +60,13 @@ pub enum AudioCommandKind {
     Crossfader {
         target: f32,
         ramp_frames: u32,
+    },
+    /// Switch the crossfader response curve. Pure POD — the audio
+    /// thread updates a single cached enum used by the per-block gain
+    /// lookup. No allocation, no audio glitch (curve evaluated next
+    /// render block).
+    SetCrossfaderCurve {
+        curve: CrossfaderCurve,
     },
     EqLow {
         deck: DeckId,
