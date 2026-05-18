@@ -494,7 +494,7 @@ mod tests {
     }
 
     async fn ws_url(addr: SocketAddr) -> String {
-        format!("ws://{}", addr)
+        format!("ws://{addr}")
     }
 
     #[tokio::test]
