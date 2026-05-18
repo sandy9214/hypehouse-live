@@ -101,11 +101,14 @@ async fn ws_submit_event_deck_load_forwards_to_control_loop_channel() {
             track,
             bpm,
             beat_grid_anchor_ms,
+            downbeats_ms,
         } => {
             assert_eq!(track.id, "trk-1");
             assert_eq!(track.path, "/music/song.mp3");
             assert!((bpm - 128.0).abs() < f32::EPSILON);
             assert_eq!(beat_grid_anchor_ms, 12);
+            // Wire payload omitted `downbeats_ms`; serde default = [].
+            assert!(downbeats_ms.is_empty());
         }
         other => panic!("unexpected event kind on channel: {other:?}"),
     }

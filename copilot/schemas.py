@@ -74,6 +74,12 @@ class Deck(BaseModel):
     beat_grid_anchor_ms: int = 0
     beat_period_ms: float = 0.0
     phase_offset_ms: int = 0
+    # Per-deck downbeat grid (ms positions). Mirrors the engine's
+    # `Deck::downbeats: SmallVec<[u32; 64]>`. Engine serializes with
+    # `skip_serializing_if = SmallVec::is_empty` so notifications for
+    # tracks without a downbeat grid omit the field entirely; pydantic
+    # default = empty list covers that.
+    downbeats: list[int] = Field(default_factory=list)
     effects: list[EffectSlot] = Field(default_factory=lambda: [EffectSlot() for _ in range(3)])
     handoff_until_frame: int = 0
 
@@ -138,6 +144,11 @@ class DeckLoad(_EventKindBase):
     track: TrackRef
     bpm: float
     beat_grid_anchor_ms: int
+    # Downbeat positions in ms. Engine's serde default = [] when the
+    # field is omitted, so this defaults to the empty list to keep
+    # callers that haven't migrated yet wire-compatible. Field name
+    # matches the Rust serde naming (snake_case).
+    downbeats_ms: list[int] = Field(default_factory=list)
 
 
 class DeckPlay(_EventKindBase):

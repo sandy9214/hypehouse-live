@@ -60,6 +60,7 @@ fn bench_event_to_commands(c: &mut Criterion) {
             },
             bpm: 128.0,
             beat_grid_anchor_ms: 0,
+            downbeats_ms: vec![],
         },
     );
     let next_load = prev.apply(&e_load);

@@ -6,6 +6,21 @@
 //! snapshot of `EngineState` and renders.
 
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
+
+/// Inline capacity for the per-deck downbeat grid. A 4/4 track at 120 BPM
+/// in 4-bar phrases generates ~1 downbeat every 8 beats; a 5-minute set
+/// (300s) at 120 BPM has ~37 downbeats. We round up to 64 so most pop /
+/// EDM tracks fit on the stack — heap spill is only paid by edge-case
+/// long tracks (≥10 min at fast tempo). Tracks with more downbeats are
+/// truncated by the reducer; see `EventKind::DeckLoad` handling.
+pub const DOWNBEATS_INLINE_CAPACITY: usize = 64;
+
+/// Per-deck downbeat grid (millisecond positions inside the track). u32
+/// ceiling = ~71 minutes, more than any sane DJ track. Storing u32 keeps
+/// the SmallVec small (256B inline vs 512B for u64) which matters because
+/// `Deck` is cloned by the pure reducer on every event.
+pub type DownbeatGrid = SmallVec<[u32; DOWNBEATS_INLINE_CAPACITY]>;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeckId {
@@ -43,6 +58,18 @@ pub enum EventKind {
         /// beat-matching. ADR-002 council review (Codex).
         bpm: f32,
         beat_grid_anchor_ms: u64,
+        /// Downbeat (bar-start) positions in milliseconds, sourced from
+        /// the copilot's madmom DBNDownBeatTracker pass. Optional so old
+        /// payloads (before beat-grid analysis landed) still deserialize
+        /// — they just leave the deck with an empty downbeat grid and
+        /// phrase-aligned transitions fall back to bar-grid math derived
+        /// from `beat_grid_anchor_ms` + `beat_period_ms × 4`.
+        ///
+        /// Truncated to `DOWNBEATS_INLINE_CAPACITY` (64) entries inside
+        /// the reducer — see :meth:`EngineState::apply`. Most tracks fit
+        /// comfortably; the cap protects the inline `SmallVec` budget.
+        #[serde(default)]
+        downbeats_ms: Vec<u32>,
     },
     /// ADR review Groq: explicit DeckUnload so the engine can free buffers
     /// and clear state cleanly (vs. relying on DeckLoad implicit replace).
@@ -168,6 +195,16 @@ pub struct Deck {
     pub beat_grid_anchor_ms: u64, // ms of beat 0 in the track
     pub beat_period_ms: f32,      // milliseconds per beat (= 60_000 / bpm)
     pub phase_offset_ms: i32,     // user-applied phase nudge (±)
+    /// Downbeat (bar-start) positions in ms, populated from the copilot
+    /// analyzer's madmom pass on `DeckLoad`. Inline capacity =
+    /// `DOWNBEATS_INLINE_CAPACITY` (64) — sufficient for most 3-5 minute
+    /// tracks at common tempos. Tracks with more downbeats are truncated
+    /// to the first 64 in the reducer (see `EngineState::apply`); the
+    /// truncation is intentional and documented on the field rather than
+    /// dropped silently — callers should not see runtime cliffs at the
+    /// boundary.
+    #[serde(default, skip_serializing_if = "SmallVec::is_empty")]
+    pub downbeats: DownbeatGrid,
     /// Effects chain (ADR-006). 3 slots per deck.
     pub effects: [EffectSlot; 3],
     /// Co-pilot takeover handoff window end (ADR-005). 0 = no handoff active.
@@ -218,6 +255,7 @@ impl EngineState {
                 track,
                 bpm,
                 beat_grid_anchor_ms,
+                downbeats_ms,
             } => {
                 let d = next.deck_mut(*id);
                 d.loaded = Some(track.clone());
@@ -232,6 +270,13 @@ impl EngineState {
                 d.beat_grid_anchor_ms = *beat_grid_anchor_ms;
                 d.beat_period_ms = 60_000.0 / safe_bpm;
                 d.phase_offset_ms = 0;
+                // Truncate to inline capacity. SmallVec::from_iter spills to
+                // heap only when input > inline cap, but we cap explicitly so
+                // the audio-thread snapshot is bounded regardless of input
+                // size — a malicious or buggy copilot can't blow up `Deck`
+                // size via a giant downbeats array.
+                let take = downbeats_ms.len().min(DOWNBEATS_INLINE_CAPACITY);
+                d.downbeats = DownbeatGrid::from_slice(&downbeats_ms[..take]);
             }
             EventKind::DeckUnload { deck: id } => {
                 *next.deck_mut(*id) = Deck::default();
@@ -523,11 +568,13 @@ mod tests {
                 },
                 bpm: 128.0,
                 beat_grid_anchor_ms: 220,
+                downbeats_ms: vec![],
             },
         ));
         assert_eq!(s.deck_a.bpm, 128.0);
         assert_eq!(s.deck_a.beat_grid_anchor_ms, 220);
         assert!((s.deck_a.beat_period_ms - (60_000.0 / 128.0)).abs() < 0.001);
+        assert!(s.deck_a.downbeats.is_empty());
     }
 
     #[test]
@@ -543,6 +590,7 @@ mod tests {
                 },
                 bpm: f32::NAN,
                 beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![],
             },
         ));
         assert_eq!(s.deck_a.bpm, 120.0);
@@ -561,6 +609,7 @@ mod tests {
                 },
                 bpm: 120.0,
                 beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![],
             },
         ));
         let s = s.apply(&ev(2, EventKind::DeckPlay { deck: DeckId::A }));
@@ -568,6 +617,96 @@ mod tests {
         let s = s.apply(&ev(3, EventKind::DeckUnload { deck: DeckId::A }));
         assert!(s.deck_a.loaded.is_none());
         assert!(!s.deck_a.playing);
+        assert!(s.deck_a.downbeats.is_empty());
+    }
+
+    #[test]
+    fn deck_load_populates_downbeats() {
+        let s = EngineState::default();
+        // 4-bar grid at 120 BPM: bar = 4 × 500ms = 2000ms.
+        let downbeats: Vec<u32> = (0..10).map(|i| i * 2000).collect();
+        let s = s.apply(&ev(
+            1,
+            EventKind::DeckLoad {
+                deck: DeckId::B,
+                track: TrackRef {
+                    id: "tdb".into(),
+                    path: "/tracks/db.mp3".into(),
+                },
+                bpm: 120.0,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: downbeats.clone(),
+            },
+        ));
+        assert_eq!(s.deck_b.downbeats.len(), downbeats.len());
+        assert_eq!(s.deck_b.downbeats[0], 0);
+        assert_eq!(s.deck_b.downbeats[9], 18_000);
+        // Per-track grid only — deck A must remain untouched.
+        assert!(s.deck_a.downbeats.is_empty());
+    }
+
+    #[test]
+    fn deck_load_truncates_downbeats_at_inline_capacity() {
+        let s = EngineState::default();
+        // Synthesize 200 downbeats — well above the inline cap of 64.
+        let downbeats: Vec<u32> = (0..200u32).map(|i| i * 2000).collect();
+        let s = s.apply(&ev(
+            1,
+            EventKind::DeckLoad {
+                deck: DeckId::A,
+                track: TrackRef {
+                    id: "huge".into(),
+                    path: "/tracks/huge.mp3".into(),
+                },
+                bpm: 120.0,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: downbeats,
+            },
+        ));
+        assert_eq!(s.deck_a.downbeats.len(), DOWNBEATS_INLINE_CAPACITY);
+        // First 64 entries are preserved (FIFO truncation per the docstring).
+        assert_eq!(s.deck_a.downbeats[0], 0);
+        assert_eq!(
+            s.deck_a.downbeats[DOWNBEATS_INLINE_CAPACITY - 1],
+            ((DOWNBEATS_INLINE_CAPACITY - 1) as u32) * 2000,
+        );
+    }
+
+    #[test]
+    fn deck_load_replacing_track_resets_downbeats() {
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::DeckLoad {
+                deck: DeckId::A,
+                track: TrackRef {
+                    id: "t1".into(),
+                    path: "/a.mp3".into(),
+                },
+                bpm: 120.0,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![0, 2000, 4000, 6000],
+            },
+        ));
+        assert_eq!(s.deck_a.downbeats.len(), 4);
+        // Replacing track on same deck must overwrite the grid wholesale, not
+        // append. Otherwise stale downbeats from the previous track could
+        // confuse the proposer's `next_downbeat_after` math.
+        let s = s.apply(&ev(
+            2,
+            EventKind::DeckLoad {
+                deck: DeckId::A,
+                track: TrackRef {
+                    id: "t2".into(),
+                    path: "/b.mp3".into(),
+                },
+                bpm: 128.0,
+                beat_grid_anchor_ms: 100,
+                downbeats_ms: vec![100, 1975, 3850],
+            },
+        ));
+        assert_eq!(s.deck_a.downbeats.len(), 3);
+        assert_eq!(s.deck_a.downbeats[0], 100);
     }
 
     #[test]

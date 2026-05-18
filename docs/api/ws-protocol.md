@@ -149,6 +149,33 @@ The `kind` shape is the serde-tagged enum of `state::EventKind`. The
 server stamps `id` (monotonic) and `ts_micros` (engine clock) so the
 client doesn't have to.
 
+#### `DeckLoad` payload — beat-grid + downbeats
+
+`DeckLoad` carries the pre-analyzed beat-grid for the incoming track.
+The optional `downbeats_ms` array (added in the beat-grid analysis PR)
+populates `Deck::downbeats` on the reducer side and drives
+phrase-aligned transitions in the co-pilot.
+
+```json
+{
+  "DeckLoad": {
+    "deck": "B",
+    "track": { "id": "trk-7", "path": "/music/foo.mp3" },
+    "bpm": 124.0,
+    "beat_grid_anchor_ms": 42,
+    "downbeats_ms": [42, 1977, 3912, 5847, 7782]
+  }
+}
+```
+
+`downbeats_ms` is **optional** — pre-analysis payloads can omit the
+field and the engine's serde default (empty list) leaves the deck with
+no downbeat grid. The reducer truncates the array to the first **64**
+entries before storing it on the `Deck` (see `DOWNBEATS_INLINE_CAPACITY`
+in `engine/src/state.rs`); tracks with more downbeats still load, but
+phrase alignment past the 64th bar falls back to bar-grid math derived
+from `beat_grid_anchor_ms + 4 × beat_period_ms`.
+
 **Result**
 ```json
 { "accepted": true }
@@ -330,6 +357,50 @@ with no cross-talk.
 The accept loop exits, in-flight client tasks drain, the server task
 returns, and `engine`'s `main` exits zero. Clients see their WS close
 frame and can reconnect.
+
+## Beat-grid + downbeats
+
+Phrase-aligned transitions need three pieces of timing data per track:
+
+* **`bpm`** — used to derive the beat period (`60_000 / bpm` ms).
+* **`beat_grid_anchor_ms`** — ms position of beat 0 inside the track.
+  Most tracks have a near-zero anchor; outliers happen when a track
+  starts with a silent / non-rhythmic intro and the analyzer locks the
+  grid to the first detected beat.
+* **`downbeats_ms`** — ms positions of bar-starts (every 4 beats for
+  4/4 material). Sourced from the co-pilot's
+  `copilot.vendor.analyzer.detect_downbeats` (madmom DBNBeatTracker)
+  pass during library ingest; persisted to the SQLite catalog and
+  forwarded on `DeckLoad`.
+
+The co-pilot's `TransitionProposer` consumes `Deck::downbeats` on the
+**outgoing** deck to pick the next bar boundary for the crossfade
+start. The math lives in `copilot.proposer.next_downbeat_after`:
+
+```
+beat_align_at_ms = next_downbeat_after(
+    playing_deck.position_ms, playing_deck.downbeats
+)
+# Fallback when no future downbeat exists (track is in its outro):
+# beat_align_at_ms = playing_deck.position_ms
+```
+
+The result is published on the `Proposal.transition_plan.beat_align_at_ms`
+field; the engine uses it to schedule the `CrossfaderRamp` start so the
+ramp begins on a bar. Tracks without downbeat data (legacy library
+rows, analysis still pending) emit `beat_align_at_ms = position_ms`,
+which still works but loses phrase alignment.
+
+### Engine-side storage
+
+`Deck::downbeats: SmallVec<[u32; 64]>` — inline-allocated for the
+common 3-5 minute track at typical tempos. Tracks with more than 64
+downbeats are truncated to the first 64; the doc comment on the field
+calls out the truncation. The audio thread reads the grid from the
+lock-free snapshot of `EngineState`; no allocation happens on the hot
+path.
+
+`u32` ms ceiling = ~71 minutes, well beyond any sane DJ track.
 
 ## Test coverage
 

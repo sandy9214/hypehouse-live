@@ -285,11 +285,13 @@ def transition_plan(
                 deck=target_deck,
                 track=EngineTrackRef(id=incoming.track_id, path=incoming.path),
                 bpm=incoming.bpm,
-                # Beat-grid anchor: 0 is a "best effort" placeholder — the
-                # engine's analyzer cache (HypeHouse v1 carry-over) is the
-                # canonical source. The engine reducer accepts what we send;
-                # if it has a cached value it'll override on load.
-                beat_grid_anchor_ms=0,
+                # Beat-grid anchor + downbeats from the library row.
+                # Pre-analysis tracks still come through with anchor=0 +
+                # downbeats=[]; the engine reducer (`apply` for
+                # `DeckLoad`) handles either shape — see the
+                # `downbeats_ms` doc comment in `engine/src/state.rs`.
+                beat_grid_anchor_ms=incoming.beat_grid_anchor_ms,
+                downbeats_ms=list(incoming.downbeats_ms),
             ),
         )
     )
