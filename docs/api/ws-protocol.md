@@ -877,25 +877,34 @@ this notification is a side channel, not a reducer event.
 icons / copy without pattern-matching the underlying error message.
 Today's set, with the underlying `DecodeError` variant it maps from:
 
-| `category`              | `DecodeError` variant       | Surfaces                                                        |
-|-------------------------|-----------------------------|-----------------------------------------------------------------|
-| `file_not_found`        | `Io`                        | Open-time IO error (path missing, perms denied, etc.).          |
-| `format_unsupported`    | `Probe`, `NoTrack`          | `symphonia` couldn't probe the container or no decodable track. |
-| `decoder_error`         | `Resampler`                 | Decoder thread init failed mid-stream (rubato config invalid).  |
-| `resource_exhausted`    | `NoFreeSlot`                | All `MAX_DECODE_SLOTS` slots occupied; close a deck and retry.  |
-| `unknown_inline_source` | `UnknownInlineSource`       | Test/in-memory `mem://` key not registered.                     |
-| `decoder_thread_spawn`  | `Spawn`                     | OS refused to spawn the per-track decoder thread.               |
+| `category`                  | Source                                | Surfaces                                                                  |
+|-----------------------------|---------------------------------------|---------------------------------------------------------------------------|
+| `file_not_found`            | `DecodeError::Io`                     | Open-time IO error (path missing, perms denied, etc.).                    |
+| `format_unsupported`        | `DecodeError::Probe`, `NoTrack`       | `symphonia` couldn't probe the container or no decodable track.           |
+| `decoder_error`             | `DecodeError::Resampler`              | Decoder thread init failed at open (rubato config invalid).               |
+| `resource_exhausted`        | `DecodeError::NoFreeSlot`             | All `MAX_DECODE_SLOTS` slots occupied; close a deck and retry.            |
+| `unknown_inline_source`     | `DecodeError::UnknownInlineSource`    | Test/in-memory `mem://` key not registered.                               |
+| `decoder_thread_spawn`      | `DecodeError::Spawn`                  | OS refused to spawn the per-track decoder thread.                         |
+| `mid_stream_decode_failure` | Decoder-thread `MidStreamFailureKind::DecodeFailed` / `ResampleFailed` | After-open failure: symphonia returned a non-recoverable error mid-track, or rubato resample failed on a mid-stream chunk. The decoder thread exits cleanly; the audio thread silence-pads the now-quiet ring. |
+| `decoder_thread_panic`      | Decoder-thread `catch_unwind`         | The per-track decoder thread itself panicked. The unwind is caught, the panic message surfaces in `error`, and the audio thread continues without crashing. |
 
 `error` is the human-readable stringification of the underlying
-`DecodeError` and is meant for display + log capture, not for parsing.
+failure and is meant for display + log capture, not for parsing.
 
-Today, only `DeckLoad` events produce this notification — the audio
-thread has no in-flight failure path that surfaces a decode_error
-(decoder-thread errors mid-stream silence-pad the ring instead). A
-future PR may extend the same notification to mid-stream resync
-failures; clients should treat `category` as a forward-compatible
-union and fall back to a generic "Decode error" label for unknown
-values.
+The first six rows are produced **synchronously** by the control
+thread when `DecodeService::open` returns `Err` on a `DeckLoad` event.
+
+The last two rows (`mid_stream_decode_failure` + `decoder_thread_panic`)
+are produced **asynchronously** by the decoder thread once it has
+already been spawned. The decoder thread pushes a `MidStreamFailure`
+onto a bounded `crossbeam::channel` (capacity 64); a tokio drain
+task on the bridge polls the receiver every 100 ms and broadcasts an
+`engine.decode_error` notification for each one. Backpressure: a full
+channel drops the event with a `warn!` rather than blocking the
+decoder thread (which must never block on a slow consumer).
+
+Clients should treat `category` as a forward-compatible union and
+fall back to a generic "Decode error" label for unknown values.
 
 ## Error codes
 

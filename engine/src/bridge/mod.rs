@@ -36,12 +36,17 @@
 //! See [`error`] for full enumeration.
 
 pub mod auth;
+pub mod decode_drain;
 pub mod error;
 pub mod library_proxy;
 pub mod rpc;
 pub mod ws_server;
 
 pub use auth::AuthConfig;
+pub use decode_drain::{
+    drain_once as drain_decode_failures_once, spawn_decode_drain, spawn_decode_drain_if_some,
+    DRAIN_TICK_MS as DECODE_DRAIN_TICK_MS,
+};
 pub use error::{
     RpcError, AUTH_REJECTED, ENGINE_OFFLINE, ENGINE_SINK_UNWIRED, INTERNAL_ERROR, INVALID_PARAMS,
     INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,

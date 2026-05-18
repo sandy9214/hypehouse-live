@@ -266,6 +266,20 @@ async fn main() -> Result<()> {
             engine_for_control,
         )
     });
+
+    // Mid-stream decode-failure drain (PR #56 follow-up). The
+    // decoder thread pushes onto a bounded sidechannel inside
+    // `SymphoniaDecodeService`; this task polls the receiver and fans
+    // out an `engine.decode_error` notification per event so corrupt
+    // tracks / decoder-thread panics no longer silence the deck
+    // invisibly. See `bridge::decode_drain` for cadence + capacity.
+    let mid_stream_rx = decode_service.take_mid_stream_failure_receiver();
+    if let Some(_drain) = bridge::spawn_decode_drain_if_some(engine.clone(), mid_stream_rx) {
+        info!("decode-failure drain task started");
+    } else {
+        info!("decode-failure drain task skipped (service exposes no sidechannel)");
+    }
+
     let config = bridge::BridgeConfig::from_env();
     let server = bridge::spawn(config, engine).await?;
     info!(addr = %server.local_addr, "ws bridge ready");

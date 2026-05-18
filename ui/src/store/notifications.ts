@@ -33,6 +33,15 @@ export type DecodeErrorCategory =
   | "resource_exhausted"
   | "unknown_inline_source"
   | "decoder_thread_spawn"
+  // Mid-stream failures observed AFTER the decoder thread spawned —
+  // symphonia decode error / rubato resample error mid-track. The
+  // engine continues to silence-pad the ring; this toast tells the
+  // operator why the deck went quiet.
+  | "mid_stream_decode_failure"
+  // Decoder thread itself panicked and the engine's `catch_unwind`
+  // guard caught the unwind. The audio thread keeps running; the
+  // affected track is dead but other decks are unharmed.
+  | "decoder_thread_panic"
   | (string & { readonly __brand?: never });
 
 /**

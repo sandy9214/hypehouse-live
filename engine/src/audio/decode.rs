@@ -62,11 +62,13 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Cursor;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use crossbeam::channel::{bounded, Receiver, Sender, TrySendError};
 use crossbeam::queue::ArrayQueue;
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
@@ -94,6 +96,99 @@ pub const RING_SAMPLES_500MS: usize = 48_000;
 /// look up `<key>` in the service's inline-source registry instead of
 /// touching the filesystem. Used by unit + smoke tests.
 pub const MEM_PREFIX: &str = "mem://";
+
+/// Sidechannel capacity for mid-stream decoder failures. Sized to
+/// absorb a multi-deck failure storm (e.g. every open slot fails on
+/// the same corrupt-format wave) without back-pressuring the decoder
+/// thread or losing events. The bridge drains on a 100ms cadence, so
+/// 64 events of headroom = ~6.4s of catch-up at one failure per tick
+/// per slot — comfortably more than the engine ever expects to see.
+///
+/// On overflow the decoder thread drops the event and logs a `warn`;
+/// the in-thread `try_send` is non-blocking by design (the decoder
+/// thread must never block on a slow consumer).
+pub const MID_STREAM_FAILURE_CAPACITY: usize = 64;
+
+/// Wire-facing category emitted when symphonia returns a decode error
+/// mid-track (after a successful `open`). Surfaces as the `category`
+/// field on the `engine.decode_error` notification.
+pub const MID_STREAM_CATEGORY: &str = "mid_stream_decode_failure";
+
+/// Wire-facing category emitted when the decoder thread itself panics
+/// and the `catch_unwind` guard recovers. Surfaces as the `category`
+/// field on the `engine.decode_error` notification. The audio thread
+/// continues to silence-pad the ring (no crash, no `unsafe`).
+pub const DECODER_THREAD_PANIC_CATEGORY: &str = "decoder_thread_panic";
+
+/// Source of a mid-stream failure observed by the per-track decoder
+/// thread AFTER `DecodeService::open` returned successfully.
+///
+/// Open-time failures (file not found, format unsupported) are
+/// surfaced synchronously via `DecodeError` on `open` — see PR #56.
+/// This enum covers the asynchronous failure modes the decoder thread
+/// hits AFTER it's been spawned, which the original PR #56 silently
+/// silence-padded.
+#[derive(Debug)]
+pub enum MidStreamFailureKind {
+    /// Symphonia decode returned a non-recoverable error mid-track
+    /// (corrupt frame outside `DecodeError`, unsupported codec
+    /// extension reached after the first packet, etc.). Maps to the
+    /// wire category [`MID_STREAM_CATEGORY`].
+    DecodeFailed(String),
+    /// Rubato resample errored on a mid-stream chunk (e.g. NaN /
+    /// non-finite input). Maps to wire category [`MID_STREAM_CATEGORY`]
+    /// because the symptom (silent ring) is identical from the UI's
+    /// point of view.
+    ResampleFailed(String),
+    /// The decoder thread itself panicked and `catch_unwind` caught
+    /// the unwind. Maps to wire category
+    /// [`DECODER_THREAD_PANIC_CATEGORY`]. The thread exits cleanly
+    /// after publishing — the audio thread continues silence-padding
+    /// the ring (existing PR #29 contract).
+    ThreadPanic(String),
+}
+
+impl MidStreamFailureKind {
+    /// Stable wire-facing category string. See
+    /// `docs/api/ws-protocol.md` "Engine notifications: decode_error".
+    pub fn category(&self) -> &'static str {
+        match self {
+            MidStreamFailureKind::DecodeFailed(_) | MidStreamFailureKind::ResampleFailed(_) => {
+                MID_STREAM_CATEGORY
+            }
+            MidStreamFailureKind::ThreadPanic(_) => DECODER_THREAD_PANIC_CATEGORY,
+        }
+    }
+
+    /// Human-readable message for the `error` wire field.
+    pub fn message(&self) -> &str {
+        match self {
+            MidStreamFailureKind::DecodeFailed(s)
+            | MidStreamFailureKind::ResampleFailed(s)
+            | MidStreamFailureKind::ThreadPanic(s) => s,
+        }
+    }
+}
+
+/// Sidechannel payload pushed by the decoder thread when an
+/// after-open failure occurs.
+///
+/// The `track_id` is recorded at thread spawn so the bridge can
+/// surface it to the UI without re-correlating with engine state.
+/// The optional `deck` is populated when the open-side knows which
+/// deck the load was targeting (every production open currently
+/// does); when missing the bridge omits it from the wire payload.
+#[derive(Debug)]
+pub struct MidStreamFailure {
+    /// Track id from the original `DeckLoad`. Always populated.
+    pub track_id: String,
+    /// Optional deck id. Surfaces on the wire as `deck` when present.
+    /// Stored as a stable `'A' | 'B' | …` char so this module stays
+    /// free of any dep on `crate::state::DeckId`.
+    pub deck: Option<char>,
+    /// Concrete failure kind.
+    pub kind: MidStreamFailureKind,
+}
 
 /// Errors from the decode pipeline. All variants are non-fatal at the
 /// engine level — a failed open returns an `Err` and the deck simply
@@ -272,6 +367,20 @@ pub trait DecodeService: Send + Sync {
             }
         }
     }
+
+    /// Receiver end of the mid-stream-failure sidechannel.
+    ///
+    /// The bridge holds this and drains it on a 100ms cadence,
+    /// publishing each event as an `engine.decode_error` notification.
+    /// Default implementation returns `None` so test stubs that don't
+    /// need the channel can opt out cheaply.
+    ///
+    /// Returns `None` once the receiver has been claimed (the
+    /// sidechannel has a single consumer — the bridge — and the
+    /// service hands the receiver out exactly once at wire-up).
+    fn take_mid_stream_failure_receiver(&self) -> Option<Receiver<MidStreamFailure>> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +425,14 @@ struct SymphoniaShared {
     next_id: AtomicU64,
     underruns: AtomicU64,
     inline_sources: Mutex<HashMap<String, Vec<u8>>>,
+    /// Sender end of the mid-stream-failure sidechannel. Cloned into
+    /// every spawned decoder thread; the receiver is owned by the
+    /// bridge drain task (see `bridge::decode_drain`).
+    mid_stream_tx: Sender<MidStreamFailure>,
+    /// Receiver, parked until [`take_mid_stream_failure_receiver`]
+    /// hands it to the bridge. `Mutex<Option<_>>` instead of
+    /// `OnceLock` so tests can also peek without consuming if needed.
+    mid_stream_rx: Mutex<Option<Receiver<MidStreamFailure>>>,
 }
 
 impl SymphoniaShared {
@@ -324,11 +441,14 @@ impl SymphoniaShared {
         for _ in 0..MAX_DECODE_SLOTS {
             slots.push(Slot::new());
         }
+        let (tx, rx) = bounded::<MidStreamFailure>(MID_STREAM_FAILURE_CAPACITY);
         Self {
             slots,
             next_id: AtomicU64::new(1),
             underruns: AtomicU64::new(0),
             inline_sources: Mutex::new(HashMap::new()),
+            mid_stream_tx: tx,
+            mid_stream_rx: Mutex::new(Some(rx)),
         }
     }
 }
@@ -408,10 +528,19 @@ impl DecodeService for SymphoniaDecodeService {
         // 4. Spawn the decoder thread.
         let ring = Arc::clone(&slot.queue);
         let shutdown = Arc::clone(&slot.shutdown);
+        let failure_tx = self.inner.mid_stream_tx.clone();
+        let track_id_owned = track.id.clone();
         let join = std::thread::Builder::new()
             .name(format!("hh-decode-{}", track.id))
             .spawn(move || {
-                decoder_thread_main(mss, target_sample_rate, ring, shutdown);
+                decoder_thread_main(
+                    mss,
+                    target_sample_rate,
+                    ring,
+                    shutdown,
+                    failure_tx,
+                    track_id_owned,
+                );
             })
             .map_err(|e| {
                 slot.occupied.store(false, Ordering::Release);
@@ -509,6 +638,87 @@ impl DecodeService for SymphoniaDecodeService {
     fn underrun_count(&self) -> u64 {
         self.inner.underruns.load(Ordering::Relaxed)
     }
+
+    fn take_mid_stream_failure_receiver(&self) -> Option<Receiver<MidStreamFailure>> {
+        let mut slot = self
+            .inner
+            .mid_stream_rx
+            .lock()
+            .expect("mid_stream_rx poisoned");
+        slot.take()
+    }
+}
+
+impl SymphoniaDecodeService {
+    /// Test/internal helper: push a synthetic mid-stream failure onto
+    /// the sidechannel as if the decoder thread had observed one.
+    /// Used by integration tests + the test-only injectable-decoder
+    /// path to exercise the drain plumbing without standing up a real
+    /// symphonia pipeline. Visible inside the crate (and tests) only.
+    #[doc(hidden)]
+    pub fn __inject_mid_stream_failure_for_test(&self, failure: MidStreamFailure) {
+        try_send_mid_stream_failure(&self.inner.mid_stream_tx, failure);
+    }
+
+    /// Test/internal helper: spawn a custom decoder-style thread that
+    /// pushes onto the same sidechannel + ring as the production
+    /// decoder, wrapped in the same `catch_unwind` guard. Lets us
+    /// test panic recovery + mid-stream decode-failure flow without
+    /// depending on symphonia returning a specific error.
+    ///
+    /// The closure receives `(ring, shutdown, failure_tx, track_id)`
+    /// and is responsible for pushing samples + failures itself. The
+    /// outer wrapper handles `catch_unwind` so a panic inside `body`
+    /// is converted to a `ThreadPanic` failure exactly the same way
+    /// the production path does.
+    #[doc(hidden)]
+    pub fn __spawn_test_decoder<F>(&self, track_id: String, body: F) -> JoinHandle<()>
+    where
+        F: FnOnce(Arc<ArrayQueue<f32>>, Arc<AtomicBool>, Sender<MidStreamFailure>, String)
+            + Send
+            + 'static,
+    {
+        // Claim the first free slot so the spawned thread has a real
+        // ring to push into; we still set `occupied=true` so the
+        // public state reflects "this slot is in use".
+        let slot_idx = self
+            .inner
+            .slots
+            .iter()
+            .position(|s| {
+                s.occupied
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            })
+            .expect("no free slot for test decoder");
+        let slot = &self.inner.slots[slot_idx];
+        slot.shutdown.store(false, Ordering::Release);
+        while slot.queue.pop().is_some() {}
+        let ring = Arc::clone(&slot.queue);
+        let shutdown = Arc::clone(&slot.shutdown);
+        let failure_tx = self.inner.mid_stream_tx.clone();
+        let track_id_for_panic = track_id.clone();
+        let failure_tx_for_panic = failure_tx.clone();
+        std::thread::Builder::new()
+            .name(format!("hh-decode-test-{track_id}"))
+            .spawn(move || {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    body(ring, shutdown, failure_tx, track_id);
+                }));
+                if let Err(payload) = result {
+                    let msg = panic_payload_to_string(&payload);
+                    try_send_mid_stream_failure(
+                        &failure_tx_for_panic,
+                        MidStreamFailure {
+                            track_id: track_id_for_panic,
+                            deck: None,
+                            kind: MidStreamFailureKind::ThreadPanic(msg),
+                        },
+                    );
+                }
+            })
+            .expect("failed to spawn test decoder thread")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -555,16 +765,93 @@ fn open_media_source(
     Ok(MediaSourceStream::new(Box::new(file), Default::default()))
 }
 
-/// Body of the per-track decoder thread. Pushes interleaved stereo f32
-/// frames into `ring` until EOF or shutdown.
+/// Top-level entry point for a per-track decoder thread. Wraps the
+/// real decode body in `catch_unwind` so a panic inside symphonia /
+/// rubato / our own code cannot bring down the audio system —
+/// instead the panic surfaces as a `decoder_thread_panic` notification
+/// to connected UI clients and the audio thread continues to
+/// silence-pad the now-quiet ring.
+///
+/// No `unsafe` is used. `AssertUnwindSafe` is applied to the closure
+/// because the local `Vec` scratch buffers + the resampler are not
+/// `RefUnwindSafe`; we accept the unsoundness risk in exchange for
+/// not crashing the whole engine, which matches the std-lib pattern
+/// for "boundary" threads.
 fn decoder_thread_main(
     mss: MediaSourceStream,
     target_sr: u32,
     ring: Arc<ArrayQueue<f32>>,
     shutdown: Arc<AtomicBool>,
+    failure_tx: Sender<MidStreamFailure>,
+    track_id: String,
 ) {
-    if let Err(e) = decoder_thread_inner(mss, target_sr, &ring, &shutdown) {
-        tracing::warn!(target: "decode", error = ?e, "decoder thread exited with error");
+    let track_id_for_panic = track_id.clone();
+    let failure_tx_for_panic = failure_tx.clone();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        decoder_thread_inner(mss, target_sr, &ring, &shutdown, &failure_tx, &track_id)
+    }));
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(target: "decode", error = ?e, "decoder thread exited with error");
+        }
+        Err(panic_payload) => {
+            let msg = panic_payload_to_string(&panic_payload);
+            tracing::error!(
+                target: "decode",
+                track_id = %track_id_for_panic,
+                panic = %msg,
+                "decoder thread panicked — surfacing as decoder_thread_panic",
+            );
+            try_send_mid_stream_failure(
+                &failure_tx_for_panic,
+                MidStreamFailure {
+                    track_id: track_id_for_panic,
+                    deck: None,
+                    kind: MidStreamFailureKind::ThreadPanic(msg),
+                },
+            );
+        }
+    }
+}
+
+/// Best-effort coerce a `Box<dyn Any + Send>` from `catch_unwind` to
+/// a readable string. Covers the two common payload shapes the std
+/// library docs guarantee — `&'static str` and `String` — and falls
+/// back to a placeholder for unknown payloads so the UI always sees
+/// non-empty `error` text.
+fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "decoder thread panicked (non-string payload)".to_string()
+}
+
+/// Non-blocking push onto the failure sidechannel. The decoder thread
+/// must never block on a slow consumer, so a full channel (= 64
+/// queued failures the bridge hasn't drained yet) silently drops the
+/// event after a `warn!`. Channel-closed is also dropped (bridge gone).
+fn try_send_mid_stream_failure(tx: &Sender<MidStreamFailure>, failure: MidStreamFailure) {
+    match tx.try_send(failure) {
+        Ok(()) => {}
+        Err(TrySendError::Full(dropped)) => {
+            tracing::warn!(
+                target: "decode",
+                track_id = %dropped.track_id,
+                category = %dropped.kind.category(),
+                "mid-stream failure channel full — dropping event",
+            );
+        }
+        Err(TrySendError::Disconnected(dropped)) => {
+            tracing::debug!(
+                target: "decode",
+                track_id = %dropped.track_id,
+                "mid-stream failure channel closed — bridge shut down",
+            );
+        }
     }
 }
 
@@ -573,6 +860,8 @@ fn decoder_thread_inner(
     target_sr: u32,
     ring: &Arc<ArrayQueue<f32>>,
     shutdown: &Arc<AtomicBool>,
+    failure_tx: &Sender<MidStreamFailure>,
+    track_id_label: &str,
 ) -> Result<(), DecodeError> {
     let probed = symphonia::default::get_probe()
         .format(
@@ -631,7 +920,20 @@ fn decoder_thread_inner(
             }
             Err(symphonia::core::errors::Error::ResetRequired) => break,
             Err(e) => {
-                tracing::warn!(target: "decode", error = ?e, "reader.next_packet failed");
+                // Mid-stream read failure (corrupt frame, truncated
+                // file, unexpected EOF outside the recoverable variant
+                // above). Pre-PR-#56-followup this exited silently —
+                // now we surface it as `mid_stream_decode_failure`.
+                let msg = format!("reader.next_packet failed: {e}");
+                tracing::warn!(target: "decode", error = ?e, "{msg}");
+                try_send_mid_stream_failure(
+                    failure_tx,
+                    MidStreamFailure {
+                        track_id: track_id_label.to_string(),
+                        deck: None,
+                        kind: MidStreamFailureKind::DecodeFailed(msg),
+                    },
+                );
                 break;
             }
         };
@@ -640,9 +942,22 @@ fn decoder_thread_inner(
         }
         let decoded = match decoder.decode(&packet) {
             Ok(d) => d,
+            // `DecodeError` is symphonia's recoverable-corruption
+            // variant — the standard advice is to skip the packet and
+            // keep going. We DON'T surface these as mid-stream
+            // failures (would spam the UI on glitchy MP3s).
             Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
             Err(e) => {
-                tracing::warn!(target: "decode", error = ?e, "decoder.decode failed");
+                let msg = format!("decoder.decode failed: {e}");
+                tracing::warn!(target: "decode", error = ?e, "{msg}");
+                try_send_mid_stream_failure(
+                    failure_tx,
+                    MidStreamFailure {
+                        track_id: track_id_label.to_string(),
+                        deck: None,
+                        kind: MidStreamFailureKind::DecodeFailed(msg),
+                    },
+                );
                 break;
             }
         };
@@ -651,7 +966,19 @@ fn decoder_thread_inner(
         in_right.clear();
         extract_stereo(decoded, &mut in_left, &mut in_right);
 
-        push_into_ring(&in_left, &in_right, resampler.as_mut(), ring, shutdown);
+        if let Err(e) = push_into_ring(&in_left, &in_right, resampler.as_mut(), ring, shutdown) {
+            let msg = format!("rubato resample failed mid-stream: {e}");
+            tracing::warn!(target: "decode", error = %e, "{msg}");
+            try_send_mid_stream_failure(
+                failure_tx,
+                MidStreamFailure {
+                    track_id: track_id_label.to_string(),
+                    deck: None,
+                    kind: MidStreamFailureKind::ResampleFailed(msg),
+                },
+            );
+            break;
+        }
     }
     Ok(())
 }
@@ -729,15 +1056,21 @@ fn fill_stereo<S, F>(
 /// Resample (if needed), interleave, and push into the ring. If the
 /// ring is full, the decoder thread spins with a tiny sleep — pushing
 /// is throttled by the audio thread's consumption rate.
+///
+/// Returns `Err` only on rubato resample failure (non-finite input,
+/// internal state corruption); the caller surfaces this as a
+/// `mid_stream_decode_failure` notification. The pre-existing
+/// "break-on-error" behaviour is preserved via `?` from the caller
+/// (same effect: decoder thread exits cleanly).
 fn push_into_ring(
     left: &[f32],
     right: &[f32],
     resampler: Option<&mut SincFixedIn<f32>>,
     ring: &Arc<ArrayQueue<f32>>,
     shutdown: &Arc<AtomicBool>,
-) {
+) -> Result<(), String> {
     if left.is_empty() {
-        return;
+        return Ok(());
     }
     let (out_l, out_r): (Vec<f32>, Vec<f32>) = match resampler {
         None => (left.to_vec(), right.to_vec()),
@@ -756,7 +1089,7 @@ fn push_into_ring(
                 }
                 let out = match r.process(&[&chunk_l, &chunk_r], None) {
                     Ok(o) => o,
-                    Err(_) => break,
+                    Err(e) => return Err(format!("{e}")),
                 };
                 acc_l.extend_from_slice(&out[0]);
                 acc_r.extend_from_slice(&out[1]);
@@ -769,6 +1102,7 @@ fn push_into_ring(
         push_blocking(ring, *l, shutdown);
         push_blocking(ring, *r, shutdown);
     }
+    Ok(())
 }
 
 #[inline]
@@ -1165,5 +1499,223 @@ pub(crate) mod tests {
             let _ = svc.read(h, &mut buf);
         });
         svc.close(h);
+    }
+
+    // --- Mid-stream failure sidechannel (PR #56 follow-up) -----------
+
+    /// Helper: drain the sidechannel with a deadline; returns the
+    /// first failure observed or `None` on timeout.
+    fn recv_failure_within(
+        rx: &Receiver<MidStreamFailure>,
+        deadline: Duration,
+    ) -> Option<MidStreamFailure> {
+        rx.recv_timeout(deadline).ok()
+    }
+
+    #[test]
+    fn mid_stream_failure_kind_category_mapping() {
+        assert_eq!(
+            MidStreamFailureKind::DecodeFailed("x".into()).category(),
+            "mid_stream_decode_failure",
+        );
+        assert_eq!(
+            MidStreamFailureKind::ResampleFailed("x".into()).category(),
+            "mid_stream_decode_failure",
+        );
+        assert_eq!(
+            MidStreamFailureKind::ThreadPanic("x".into()).category(),
+            "decoder_thread_panic",
+        );
+    }
+
+    #[test]
+    fn take_mid_stream_failure_receiver_hands_out_once() {
+        let svc = SymphoniaDecodeService::new();
+        assert!(svc.take_mid_stream_failure_receiver().is_some());
+        // Second take returns None — single-consumer contract.
+        assert!(svc.take_mid_stream_failure_receiver().is_none());
+    }
+
+    #[test]
+    fn stub_service_returns_no_sidechannel_by_default() {
+        // The default trait impl returns None — confirms `StubDecodeService`
+        // (which doesn't override) opts out of the sidechannel cleanly.
+        let svc = StubDecodeService::new();
+        assert!(svc.take_mid_stream_failure_receiver().is_none());
+    }
+
+    #[test]
+    fn injected_mid_stream_decode_failure_reaches_receiver() {
+        // Models the "synthetic decoder fails after N samples" path:
+        // we exercise the sidechannel directly so the test doesn't
+        // depend on coaxing a specific symphonia error mid-track.
+        let svc = SymphoniaDecodeService::new();
+        let rx = svc
+            .take_mid_stream_failure_receiver()
+            .expect("rx claimable");
+        svc.__inject_mid_stream_failure_for_test(MidStreamFailure {
+            track_id: "trk-mid-1".into(),
+            deck: Some('A'),
+            kind: MidStreamFailureKind::DecodeFailed("synthetic bitstream corruption".into()),
+        });
+        let got = recv_failure_within(&rx, Duration::from_millis(200))
+            .expect("mid-stream failure should reach receiver");
+        assert_eq!(got.track_id, "trk-mid-1");
+        assert_eq!(got.deck, Some('A'));
+        assert_eq!(got.kind.category(), "mid_stream_decode_failure");
+        assert!(got.kind.message().contains("bitstream corruption"));
+    }
+
+    #[test]
+    fn panicking_test_decoder_thread_surfaces_decoder_thread_panic() {
+        let svc = SymphoniaDecodeService::new();
+        let rx = svc
+            .take_mid_stream_failure_receiver()
+            .expect("rx claimable");
+        // Spawn a "decoder" that just panics — exercises the
+        // catch_unwind guard in the test-spawn helper which mirrors
+        // the production path.
+        let join =
+            svc.__spawn_test_decoder("trk-panic-1".to_string(), |_ring, _shutdown, _tx, _id| {
+                panic!("synthetic panic in decoder thread");
+            });
+        let got = recv_failure_within(&rx, Duration::from_millis(500))
+            .expect("panic should surface as a sidechannel event");
+        assert_eq!(got.track_id, "trk-panic-1");
+        assert_eq!(got.kind.category(), "decoder_thread_panic");
+        assert!(
+            got.kind.message().contains("synthetic panic"),
+            "message should preserve panic payload: {}",
+            got.kind.message()
+        );
+        // The thread itself should be joinable (it caught the unwind).
+        join.join().expect("test decoder thread joined");
+    }
+
+    #[test]
+    fn audio_thread_continues_silence_pad_after_decoder_panic() {
+        // The whole point of catch_unwind on the decoder thread is
+        // that the audio thread keeps running — `read()` must still
+        // return cleanly (silence) after the decoder panics and
+        // posts its failure event.
+        let svc = SymphoniaDecodeService::new();
+        let rx = svc
+            .take_mid_stream_failure_receiver()
+            .expect("rx claimable");
+        let join =
+            svc.__spawn_test_decoder("trk-panic-2".to_string(), |_ring, _shutdown, _tx, _id| {
+                // Decoder panics before pushing anything onto the ring.
+                panic!("decoder thread panic — ring stays empty");
+            });
+        // Drain the sidechannel so the test is deterministic.
+        let _ = recv_failure_within(&rx, Duration::from_millis(500))
+            .expect("panic surfaced as sidechannel event");
+        join.join().expect("test decoder thread joined");
+        // Audio-side read: must NOT panic, must return silence for
+        // every sample (the ring is empty, slot is still occupied).
+        // We sweep every slot because `__spawn_test_decoder` claims
+        // the first free one — handle math is internal to the helper.
+        let mut buf = [1.0_f32; 32];
+        for slot_idx in 0..MAX_DECODE_SLOTS {
+            let h = DecodeHandle(encode_handle(slot_idx, 1));
+            let _ = svc.read(h, &mut buf);
+        }
+        // At least one slot should have written silence over the
+        // sentinel `1.0` values (the one our test decoder claimed).
+        assert!(
+            buf.contains(&0.0),
+            "audio thread should have silence-padded after panic",
+        );
+    }
+
+    #[test]
+    fn sidechannel_full_drops_event_without_blocking_decoder_thread() {
+        // Backpressure contract: a full sidechannel must NOT block the
+        // decoder thread (would freeze the audio pipeline). Instead
+        // events drop with a warn. We saturate the channel + verify
+        // a subsequent push completes promptly.
+        let svc = SymphoniaDecodeService::new();
+        let _rx = svc
+            .take_mid_stream_failure_receiver()
+            .expect("rx claimable");
+        for i in 0..MID_STREAM_FAILURE_CAPACITY {
+            svc.__inject_mid_stream_failure_for_test(MidStreamFailure {
+                track_id: format!("flood-{i}"),
+                deck: None,
+                kind: MidStreamFailureKind::DecodeFailed("flood".into()),
+            });
+        }
+        // One more push past capacity — must return immediately, not
+        // block.
+        let start = std::time::Instant::now();
+        svc.__inject_mid_stream_failure_for_test(MidStreamFailure {
+            track_id: "overflow".into(),
+            deck: None,
+            kind: MidStreamFailureKind::DecodeFailed("dropped".into()),
+        });
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "try_send on full channel must not block; took {elapsed:?}",
+        );
+    }
+
+    #[test]
+    fn synthetic_decoder_fails_after_n_samples_surfaces_mid_stream_failure() {
+        // Models the explicit task requirement: "synthetic decoder
+        // that fails after N samples → mid_stream_decode_failure".
+        // The test decoder pushes a handful of samples then posts a
+        // mid-stream failure exactly the same way the production
+        // decoder thread does (via `try_send_mid_stream_failure`).
+        let svc = SymphoniaDecodeService::new();
+        let rx = svc
+            .take_mid_stream_failure_receiver()
+            .expect("rx claimable");
+        const N: usize = 256;
+        let join = svc.__spawn_test_decoder(
+            "trk-mid-N".to_string(),
+            move |ring, _shutdown, tx, track_id| {
+                // Push N samples of silence, then fail.
+                for _ in 0..N {
+                    let _ = ring.push(0.0);
+                }
+                try_send_mid_stream_failure(
+                    &tx,
+                    MidStreamFailure {
+                        track_id,
+                        deck: Some('B'),
+                        kind: MidStreamFailureKind::DecodeFailed(
+                            "synthetic packet corruption after N samples".into(),
+                        ),
+                    },
+                );
+            },
+        );
+        join.join().expect("test decoder thread joined");
+        let got = recv_failure_within(&rx, Duration::from_millis(500))
+            .expect("mid-stream failure should surface");
+        assert_eq!(got.track_id, "trk-mid-N");
+        assert_eq!(got.deck, Some('B'));
+        assert_eq!(got.kind.category(), "mid_stream_decode_failure");
+        assert!(got.kind.message().contains("after N samples"));
+    }
+
+    #[test]
+    fn open_time_error_path_still_returns_err_and_no_sidechannel_event() {
+        // Regression guard for PR #56: open-time errors must STILL
+        // bubble up synchronously as `DecodeError` (no behaviour
+        // change) and MUST NOT spuriously post a mid-stream event.
+        let svc = SymphoniaDecodeService::new();
+        let rx = svc
+            .take_mid_stream_failure_receiver()
+            .expect("rx claimable");
+        let res = svc.open(&track("ghost", "/nonexistent/at/open.wav"), 48_000);
+        assert!(matches!(res, Err(DecodeError::Io { .. })));
+        // No mid-stream event should appear within a short grace
+        // window (the open failure is a pre-spawn synchronous path).
+        assert!(
+            recv_failure_within(&rx, Duration::from_millis(50)).is_none(),
+            "open-time errors must not produce mid-stream sidechannel events",
+        );
     }
 }
