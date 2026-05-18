@@ -284,6 +284,20 @@ impl AudioMixer {
                     s.enabled = enabled;
                 }
             }
+            AudioCommandKind::EffectSwap { deck, a, b } => {
+                // Audio-thread swap of two FxBank slots. `[FxBank; 3]`
+                // derefs to a slice so `swap` is a no-alloc in-place
+                // exchange. Defensive bounds: skip if either index is
+                // out of range (translator already clamped, but the
+                // audio side never trusts wire data).
+                let bank = self.effects_mut(deck);
+                let len = bank.len();
+                let ai = a as usize;
+                let bi = b as usize;
+                if ai < len && bi < len && ai != bi {
+                    bank.swap(ai, bi);
+                }
+            }
             AudioCommandKind::SetMasterLimiterEnabled { enabled } => {
                 self.limiter.set_enabled(enabled);
             }
@@ -642,6 +656,71 @@ mod tests {
             until_frame: 96_000,
         }));
         assert_eq!(m.handoff_until(DeckId::A), 96_000);
+    }
+
+    #[test]
+    fn effect_swap_reorders_fxbank_without_alloc() {
+        // ADR-006 slot reorder — `[FxBank; 3]::swap` is an in-place
+        // mem::swap, no allocation. This test pins that contract: any
+        // future refactor that adds Vec/Box/heap state inside FxBank
+        // and breaks alloc-freedom on this command path will trip the
+        // assert_no_alloc gate.
+        let mut m = AudioMixer::new(48_000);
+        // Pre-populate the chain so the swap actually moves data.
+        m.apply(cmd(AudioCommandKind::EffectAssign {
+            deck: DeckId::A,
+            slot: 0,
+            effect_id: crate::audio::effects::EFFECT_FILTER,
+        }));
+        m.apply(cmd(AudioCommandKind::EffectAssign {
+            deck: DeckId::A,
+            slot: 2,
+            effect_id: crate::audio::effects::EFFECT_ECHO,
+        }));
+        assert_no_alloc::assert_no_alloc(|| {
+            m.apply(cmd(AudioCommandKind::EffectSwap {
+                deck: DeckId::A,
+                a: 0,
+                b: 2,
+            }));
+        });
+        // After the swap, slot 0 holds Echo and slot 2 holds Filter.
+        assert_eq!(
+            m.effect_id(DeckId::A, 0),
+            crate::audio::effects::EFFECT_ECHO
+        );
+        assert_eq!(
+            m.effect_id(DeckId::A, 2),
+            crate::audio::effects::EFFECT_FILTER
+        );
+        // Slot 1 untouched (was empty, still empty).
+        assert_eq!(
+            m.effect_id(DeckId::A, 1),
+            crate::audio::effects::EFFECT_NONE
+        );
+    }
+
+    #[test]
+    fn effect_swap_out_of_range_is_silent_noop() {
+        // Defensive: the audio thread never trusts wire data. An
+        // out-of-range index must be a silent no-op (no panic, no
+        // partial mutation).
+        let mut m = AudioMixer::new(48_000);
+        m.apply(cmd(AudioCommandKind::EffectAssign {
+            deck: DeckId::A,
+            slot: 0,
+            effect_id: crate::audio::effects::EFFECT_FILTER,
+        }));
+        m.apply(cmd(AudioCommandKind::EffectSwap {
+            deck: DeckId::A,
+            a: 0,
+            b: 9,
+        }));
+        // Slot 0 untouched.
+        assert_eq!(
+            m.effect_id(DeckId::A, 0),
+            crate::audio::effects::EFFECT_FILTER
+        );
     }
 
     #[test]
