@@ -138,7 +138,7 @@ export const KnobRow = ({
   onTempoPct,
   onEq,
 }: KnobRowProps): JSX.Element => (
-  <div style={knobRowStyle}>
+  <div className="hh-knob-row" style={knobRowStyle}>
     <Knob
       label="PITCH"
       min={-12}
