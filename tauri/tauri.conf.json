@@ -29,11 +29,30 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": false,
     "icon": [
       "icons/icon.png"
     ],
     "category": "Music",
     "shortDescription": "Live multi-deck DJ player with AI co-pilot",
-    "longDescription": "HypeHouse Live is a Rust-powered live DJ application featuring sub-5ms audio latency, native MIDI controller support, and an optional AI co-pilot for AI-driven track selection and phrase-aligned transitions."
+    "longDescription": "HypeHouse Live is a Rust-powered live DJ application featuring sub-5ms audio latency, native MIDI controller support, and an optional AI co-pilot for AI-driven track selection and phrase-aligned transitions.",
+    "macOS": {
+      "minimumSystemVersion": "10.13",
+      "hardenedRuntime": true
+    },
+    "windows": {
+      "digestAlgorithm": "sha256"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "active": false,
+      "dialog": true,
+      "pubkey": "PLACEHOLDER_REPLACE_WITH_OUTPUT_OF_TAURI_SIGNER_GENERATE_PUB",
+      "endpoints": [
+        "https://hypehouse.live/releases/stable/manifest.json?target={{target}}&arch={{arch}}&current={{current_version}}",
+        "https://github.com/sandy9214/hypehouse-live/releases/latest/download/manifest.json"
+      ]
+    }
   }
 }
