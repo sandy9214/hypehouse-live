@@ -31,7 +31,7 @@ use crate::audio::decode_gain_reduction_db;
 use crate::audio::effects::{
     descriptors, EffectId, ParamDescriptor, EFFECT_ECHO, EFFECT_FILTER, EFFECT_GATE, EFFECT_REVERB,
 };
-use crate::state::{EngineState, Event, EventKind, EventSource};
+use crate::state::{DeckId, EngineState, Event, EventKind, EventSource};
 
 use super::auth::AuthConfig;
 use super::error::RpcError;
@@ -151,6 +151,12 @@ pub mod method {
 
     pub const NOTIFY_STATE_CHANGED: &str = "engine.state_changed";
     pub const NOTIFY_AUDIO_ALERT: &str = "engine.audio_alert";
+    /// Out-of-band decode failure. Emitted by the control thread when
+    /// `DecodeService::open` errors on a `DeckLoad`. Surfaces in the UI
+    /// as a transient toast (no state mutation — the deck simply stays
+    /// unloaded). See `docs/api/ws-protocol.md` "Engine notifications:
+    /// decode_error".
+    pub const NOTIFY_DECODE_ERROR: &str = "engine.decode_error";
 }
 
 // ---------------------------------------------------------------------
@@ -214,6 +220,23 @@ pub enum BridgeNotice {
     AudioAlert {
         kind: String,
         details: String,
+    },
+    /// Surface a decode-pipeline failure as an out-of-band UI toast.
+    ///
+    /// Emitted by the control thread when `DecodeService::open` returns
+    /// `Err` during a `DeckLoad` event. The deck does NOT mutate state
+    /// (the existing log-and-suppress contract is preserved); we just
+    /// inform connected clients so the operator sees the failure instead
+    /// of a silent no-op load.
+    ///
+    /// `category` lets the UI badge the toast (file_not_found,
+    /// format_unsupported, decoder_error, …). `error` carries the
+    /// stringified `DecodeError` for debugging context.
+    DecodeError {
+        deck: DeckId,
+        track_id: String,
+        category: String,
+        error: String,
     },
 }
 
@@ -351,6 +374,25 @@ impl EngineHandle {
         let _ = self.inner.notices.send(BridgeNotice::AudioAlert {
             kind: kind.into(),
             details: details.into(),
+        });
+    }
+
+    /// Publish a `decode_error` notification. Called by the control
+    /// thread when the translator's `DecodeService::open` errors on a
+    /// `DeckLoad` event. Non-blocking — drops silently if no clients are
+    /// currently subscribed (e.g. unit tests, paused UI).
+    pub fn publish_decode_error(
+        &self,
+        deck: DeckId,
+        track_id: impl Into<String>,
+        category: impl Into<String>,
+        error: impl Into<String>,
+    ) {
+        let _ = self.inner.notices.send(BridgeNotice::DecodeError {
+            deck,
+            track_id: track_id.into(),
+            category: category.into(),
+            error: error.into(),
         });
     }
 
@@ -831,6 +873,29 @@ pub fn audio_alert_notification(kind: &str, details: &str) -> RpcNotification {
     )
 }
 
+/// Build an `engine.decode_error` notification frame.
+///
+/// `category` is the coarse failure class (`file_not_found`,
+/// `format_unsupported`, `decoder_error`, …) used by the UI for icon /
+/// copy selection. `error` is the human-readable stringification of the
+/// underlying `DecodeError` and is shown in the toast body.
+pub fn decode_error_notification(
+    deck: DeckId,
+    track_id: &str,
+    category: &str,
+    error: &str,
+) -> RpcNotification {
+    RpcNotification::new(
+        method::NOTIFY_DECODE_ERROR,
+        serde_json::json!({
+            "deck": deck,
+            "track_id": track_id,
+            "category": category,
+            "error": error,
+        }),
+    )
+}
+
 #[cfg(test)]
 // The async dispatch tests hold `std::sync::MutexGuard` across `.await`
 // points (the shared env-var lock). Under the default `tokio::test`
@@ -1029,8 +1094,65 @@ mod tests {
                 // No audio thread wired in tests; GR defaults to 0.
                 assert!(master_limiter_gain_reduction_db.abs() < f32::EPSILON);
             }
-            BridgeNotice::AudioAlert { .. } => panic!("expected StateChanged"),
+            BridgeNotice::AudioAlert { .. } | BridgeNotice::DecodeError { .. } => {
+                panic!("expected StateChanged")
+            }
         }
+    }
+
+    #[test]
+    fn publish_decode_error_queues_bridge_notice_with_payload() {
+        // Direct method test: publishing a decode error yields a
+        // BridgeNotice::DecodeError variant readable from a subscriber.
+        let e = engine();
+        let mut rx = e.subscribe();
+        e.publish_decode_error(
+            DeckId::A,
+            "track-42",
+            "file_not_found",
+            "io error opening /nope.mp3",
+        );
+        let n = rx.try_recv().expect("decode error notice queued");
+        match n {
+            BridgeNotice::DecodeError {
+                deck,
+                track_id,
+                category,
+                error,
+            } => {
+                assert_eq!(deck, DeckId::A);
+                assert_eq!(track_id, "track-42");
+                assert_eq!(category, "file_not_found");
+                assert!(error.contains("/nope.mp3"));
+            }
+            other => panic!("expected DecodeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_error_notification_wire_frame_round_trips() {
+        // Wire-frame builder produces the exact JSON the protocol doc
+        // promises: method=engine.decode_error, params={deck,
+        // track_id, category, error}.
+        let frame =
+            decode_error_notification(DeckId::B, "abc-123", "format_unsupported", "bad header");
+        let payload = serde_json::to_value(&frame).unwrap();
+        assert_eq!(payload["jsonrpc"], "2.0");
+        assert_eq!(payload["method"], "engine.decode_error");
+        assert_eq!(payload["params"]["deck"], "B");
+        assert_eq!(payload["params"]["track_id"], "abc-123");
+        assert_eq!(payload["params"]["category"], "format_unsupported");
+        assert_eq!(payload["params"]["error"], "bad header");
+    }
+
+    #[test]
+    fn publish_decode_error_without_subscribers_does_not_panic() {
+        // Broadcast send returns Err when nobody is listening; the
+        // publish helper swallows that so a quiet client list never
+        // takes down the control loop.
+        let e = engine();
+        // No subscribe() call before publish — exercises the drop path.
+        e.publish_decode_error(DeckId::A, "t", "decoder_error", "details");
     }
 
     #[test]
@@ -1055,7 +1177,9 @@ mod tests {
                     "expected -3 dB GR, got {master_limiter_gain_reduction_db}",
                 );
             }
-            BridgeNotice::AudioAlert { .. } => panic!("expected StateChanged"),
+            BridgeNotice::AudioAlert { .. } | BridgeNotice::DecodeError { .. } => {
+                panic!("expected StateChanged")
+            }
         }
         // And the wire-frame builder mirrors the same value.
         let frame = state_changed_notification(&EngineState::default(), 1, -3.0);

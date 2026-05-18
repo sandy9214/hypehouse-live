@@ -17,7 +17,7 @@
 use anyhow::Result;
 use crossbeam::channel::{self, Receiver};
 use hypehouse_engine::audio::{
-    event_to_commands, io::spawn_audio_thread, AudioProducer, AudioRing, DecodeService,
+    event_to_commands_with_errors, io::spawn_audio_thread, AudioProducer, AudioRing, DecodeService,
     EngineClock, SharedClock, SymphoniaDecodeService,
 };
 use hypehouse_engine::bridge::{self, EngineHandle};
@@ -157,11 +157,29 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Bridge handle is wired to the control-loop event channel so every
+    // accepted `engine.submit_event` RPC flows into `event_rx`. Cloning
+    // `event_tx` keeps a sender alive inside the handle for the bridge's
+    // lifetime — the control loop will only see `recv` return Err once
+    // both the bridge handle (and its clones) and the local `event_tx`
+    // are dropped during shutdown.
+    //
+    // The handle is also cloned into the control loop so the translator
+    // can surface decode-pipeline failures (`engine.decode_error`
+    // notifications) to every connected UI client without round-tripping
+    // through the event channel.
+    let engine = EngineHandle::with_event_sink(event_tx.clone());
+    // Wire the audio thread's master-bus limiter gain-reduction readout
+    // into the bridge so every outgoing `engine.state_changed`
+    // notification carries the live GR value for the UI meter.
+    engine.attach_master_limiter_gr(stream.master_limiter_gr.clone());
+
     // Control-thread loop runs on a dedicated OS thread so it doesn't
     // block the async runtime.
     let sample_rate = stream.sample_rate;
     let decode_for_control = Arc::clone(&decode_service);
     let shared_clock_for_control = clock.shared.clone();
+    let engine_for_control = engine.clone();
     std::thread::spawn(move || {
         control_loop(
             event_rx,
@@ -171,20 +189,9 @@ async fn main() -> Result<()> {
             decode_for_control,
             shared_clock_for_control,
             event_log,
+            engine_for_control,
         )
     });
-
-    // Bridge handle is wired to the control-loop event channel so every
-    // accepted `engine.submit_event` RPC flows into `event_rx`. Cloning
-    // `event_tx` keeps a sender alive inside the handle for the bridge's
-    // lifetime — the control loop will only see `recv` return Err once
-    // both the bridge handle (and its clones) and the local `event_tx`
-    // are dropped during shutdown.
-    let engine = EngineHandle::with_event_sink(event_tx.clone());
-    // Wire the audio thread's master-bus limiter gain-reduction readout
-    // into the bridge so every outgoing `engine.state_changed`
-    // notification carries the live GR value for the UI meter.
-    engine.attach_master_limiter_gr(stream.master_limiter_gr.clone());
     let config = bridge::BridgeConfig::from_env();
     let server = bridge::spawn(config, engine).await?;
     info!(addr = %server.local_addr, "ws bridge ready");
@@ -261,6 +268,7 @@ fn resolve_recording_path(session_id: &str) -> std::path::PathBuf {
 /// fine: a panic is a bug, not a state change. Persistence errors are
 /// downgraded to a warn so a transient disk hiccup never kills the
 /// live set.
+#[allow(clippy::too_many_arguments)]
 fn control_loop(
     event_rx: Receiver<Event>,
     mut producer: AudioProducer,
@@ -269,6 +277,7 @@ fn control_loop(
     decode: Arc<dyn DecodeService>,
     shared_clock: SharedClock,
     mut event_log: Option<EventLog>,
+    engine: EngineHandle,
 ) {
     let mut state = EngineState::default();
 
@@ -292,7 +301,14 @@ fn control_loop(
         }
 
         let now_frame = clock.frame();
-        let cmds = event_to_commands(&state, &next, &ev, now_frame, sample_rate, decode.as_ref());
+        let (cmds, decode_errors) = event_to_commands_with_errors(
+            &state,
+            &next,
+            &ev,
+            now_frame,
+            sample_rate,
+            decode.as_ref(),
+        );
         for cmd in cmds.into_iter() {
             if let Err(dropped) = producer.try_push(cmd) {
                 warn!(
@@ -300,6 +316,16 @@ fn control_loop(
                     "audio ring full — dropping command (control plane backpressure)"
                 );
             }
+        }
+        // Forward decode-pipeline failures (today: DeckLoad open errors)
+        // to every connected WS client as an `engine.decode_error`
+        // notification. Stringifying the underlying `DecodeError` keeps
+        // the wire payload self-contained; the `category` field gives
+        // the UI a stable key for toast styling.
+        for failure in decode_errors {
+            let category = failure.category();
+            let error_text = format!("{}", failure.error);
+            engine.publish_decode_error(failure.deck, failure.track_id, category, error_text);
         }
         state = next;
     }

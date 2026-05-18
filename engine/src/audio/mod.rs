@@ -57,4 +57,7 @@ pub use pitch_tempo::{
     MAX_TEMPO_RATIO, MIN_PITCH_SEMITONES, MIN_TEMPO_RATIO,
 };
 pub use ring::{AudioConsumer, AudioProducer, AudioRing, RING_CAPACITY};
-pub use translator::{event_to_commands, AudioCmdBatch, BAR_BEATS, DEFAULT_RAMP_MS};
+pub use translator::{
+    event_to_commands, event_to_commands_with_errors, AudioCmdBatch, DecodeFailure, BAR_BEATS,
+    DEFAULT_RAMP_MS,
+};

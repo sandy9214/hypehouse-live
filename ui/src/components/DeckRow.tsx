@@ -19,6 +19,7 @@ import { MasterControls } from "./MasterControls";
 import { Sessions } from "./Sessions";
 import { JsonRpcWS } from "../ws/client";
 import { applyNotification, useEngineState } from "../store/engine";
+import { applyDecodeErrorNotification } from "../store/notifications";
 
 /** Which secondary surface the user is looking at — live mixing
  * (default) or the read-only past-sessions History panel. Lives at
@@ -52,10 +53,14 @@ export const DeckRow = (): JSX.Element => {
   const [tab, setTab] = useState<SecondaryTab>("live");
 
   useEffect((): (() => void) => {
-    const unsubscribe = client.subscribe(applyNotification);
+    const unsubscribeState = client.subscribe(applyNotification);
+    const unsubscribeDecodeErrors = client.subscribe(
+      applyDecodeErrorNotification,
+    );
     client.connect();
     return (): void => {
-      unsubscribe();
+      unsubscribeState();
+      unsubscribeDecodeErrors();
       client.close();
     };
   }, [client]);

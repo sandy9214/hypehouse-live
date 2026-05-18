@@ -32,14 +32,55 @@ use smallvec::SmallVec;
 
 use crate::audio::{
     command::{AudioCommand, AudioCommandKind},
-    decode::DecodeService,
+    decode::{DecodeError, DecodeService},
 };
-use crate::state::{EngineState, EqBand, Event, EventKind};
+use crate::state::{DeckId, EngineState, EqBand, Event, EventKind};
 
 /// SmallVec inline capacity — the common case is 0..1 commands per
 /// event; we size for 4 so the rare multi-emit cases (`TakeOver`,
 /// `DeckLoad`) don't escape to the heap.
 pub type AudioCmdBatch = SmallVec<[AudioCommand; 4]>;
+
+/// Out-of-band failure surfaced by [`event_to_commands_with_errors`].
+///
+/// The translator's pure-fn contract means it cannot publish to the
+/// bridge's broadcast channel itself; instead it returns a list of
+/// failures the caller (the control loop) drains and forwards to
+/// `EngineHandle::publish_decode_error`. Today only `DeckLoad` populates
+/// this list; the variant carries the deck the load was targeting plus
+/// the underlying [`DecodeError`] for diagnostic context.
+///
+/// The control loop maps `kind` into a coarse `category` string for the
+/// wire (`file_not_found`, `format_unsupported`, `decoder_error`,
+/// `resource_exhausted`, `unknown_inline_source`, `decoder_thread_spawn`)
+/// via [`DecodeFailure::category`].
+#[derive(Debug)]
+pub struct DecodeFailure {
+    /// Deck the failed load was targeting.
+    pub deck: DeckId,
+    /// Track-id from the originating `DeckLoad` event.
+    pub track_id: String,
+    /// Source `DecodeError`. The control loop stringifies this for the
+    /// `error` wire field; tests inspect it directly.
+    pub error: DecodeError,
+}
+
+impl DecodeFailure {
+    /// Coarse failure class for the UI toast. Stable string namespace
+    /// so the frontend can branch on it for icons / copy without
+    /// pattern-matching the underlying error message.
+    pub fn category(&self) -> &'static str {
+        match &self.error {
+            DecodeError::Io { .. } => "file_not_found",
+            DecodeError::Probe(_) => "format_unsupported",
+            DecodeError::NoTrack => "format_unsupported",
+            DecodeError::Resampler(_) => "decoder_error",
+            DecodeError::NoFreeSlot => "resource_exhausted",
+            DecodeError::UnknownInlineSource(_) => "unknown_inline_source",
+            DecodeError::Spawn(_) => "decoder_thread_spawn",
+        }
+    }
+}
 
 /// Beats per bar in 4/4 time. ADR-005's "1-bar handoff envelope" uses
 /// this constant.
@@ -64,6 +105,10 @@ fn ramp_frames(sample_rate: u32) -> u32 {
 ///
 /// `decode` is the (stub for now) decode service the translator asks for
 /// buffers when an event would require new pre-decoded audio.
+///
+/// This is a thin shim over [`event_to_commands_with_errors`] that drops
+/// the decode-error sidecar; preserved for callers (benches, older test
+/// helpers) that don't care about out-of-band failures.
 pub fn event_to_commands(
     prev: &EngineState,
     next: &EngineState,
@@ -72,7 +117,31 @@ pub fn event_to_commands(
     sample_rate: u32,
     decode: &dyn DecodeService,
 ) -> AudioCmdBatch {
+    let (cmds, _errors) =
+        event_to_commands_with_errors(prev, next, ev, now_frame, sample_rate, decode);
+    cmds
+}
+
+/// Same as [`event_to_commands`] but also returns any `DecodeFailure`s
+/// observed during translation (today, only `DeckLoad` populates this
+/// list — the audio thread itself has no path to fail an `open` after
+/// the fact).
+///
+/// The control loop calls this variant and forwards each failure to
+/// `EngineHandle::publish_decode_error` so connected UI clients see a
+/// transient toast. State is **not** mutated for failed loads — the
+/// deck simply stays empty (preserves the v0.1 "silent no-op load"
+/// contract aside from the new notification).
+pub fn event_to_commands_with_errors(
+    prev: &EngineState,
+    next: &EngineState,
+    ev: &Event,
+    now_frame: u64,
+    sample_rate: u32,
+    decode: &dyn DecodeService,
+) -> (AudioCmdBatch, SmallVec<[DecodeFailure; 1]>) {
     let mut out: AudioCmdBatch = SmallVec::new();
+    let mut errors: SmallVec<[DecodeFailure; 1]> = SmallVec::new();
     let ramp = ramp_frames(sample_rate);
 
     match &ev.kind {
@@ -193,10 +262,11 @@ pub fn event_to_commands(
             // Ask the streaming decode service to open the track. The
             // service spawns a decoder thread off the control plane;
             // the returned handle is what the audio thread reads
-            // from in subsequent render calls. `open` errors land
-            // here as `tracing::warn!` + no command emitted — the UI
-            // sees a no-op load (issue #TBD: surface load errors via
-            // an engine event).
+            // from in subsequent render calls. `open` errors are
+            // logged + pushed onto the `errors` sidecar so the
+            // control loop can fan them out as `engine.decode_error`
+            // notifications to connected clients. State stays
+            // un-mutated — the deck simply doesn't load.
             match decode.open(track, sample_rate) {
                 Ok(handle) => {
                     out.push(AudioCommand {
@@ -213,8 +283,13 @@ pub fn event_to_commands(
                         track_id = %track.id,
                         path = %track.path,
                         error = ?e,
-                        "DecodeService::open failed — deck will not load",
+                        "DecodeService::open failed — surfacing to UI as decode_error",
                     );
+                    errors.push(DecodeFailure {
+                        deck: *deck,
+                        track_id: track.id.clone(),
+                        error: e,
+                    });
                 }
             }
         }
@@ -370,7 +445,7 @@ pub fn event_to_commands(
     }
 
     let _ = prev; // keep the diff-style signature even when unused in some arms
-    out
+    (out, errors)
 }
 
 /// Convert track-relative milliseconds to absolute sample frames.
@@ -916,5 +991,187 @@ mod tests {
             }
             other => panic!("expected SetMasterLimiterThreshold, got {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // decode-error surfacing (engine.decode_error notification plumbing)
+    // ---------------------------------------------------------------------
+
+    /// `DecodeService` stub whose `open` always errors with the given
+    /// `DecodeError` variant — lets us exercise every category branch of
+    /// `DecodeFailure::category` without contriving real symphonia
+    /// failures.
+    struct AlwaysFailDecode {
+        builder: fn() -> DecodeError,
+    }
+
+    impl DecodeService for AlwaysFailDecode {
+        fn open(
+            &self,
+            _track: &crate::state::TrackRef,
+            _target_sample_rate: u32,
+        ) -> Result<crate::audio::DecodeHandle, DecodeError> {
+            Err((self.builder)())
+        }
+        fn read(&self, _: crate::audio::DecodeHandle, _: &mut [f32]) -> usize {
+            0
+        }
+        fn close(&self, _: crate::audio::DecodeHandle) {}
+        fn underrun_count(&self) -> u64 {
+            0
+        }
+    }
+
+    fn load_event(deck: DeckId, track_id: &str, path: &str) -> Event {
+        ev(
+            1,
+            EventKind::DeckLoad {
+                deck,
+                track: TrackRef {
+                    id: track_id.into(),
+                    path: path.into(),
+                },
+                bpm: 128.0,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![],
+                hot_cues: [None; 8],
+            },
+        )
+    }
+
+    #[test]
+    fn deck_load_open_failure_surfaces_decode_error_sidecar() {
+        // DeckLoad with an unknown filesystem path → `Io` error;
+        // translator must (a) emit zero audio commands, (b) push a
+        // single `DecodeFailure` onto the errors sidecar that carries
+        // the deck + track id and the `file_not_found` category.
+        let svc = crate::audio::SymphoniaDecodeService::new();
+        let prev = EngineState::default();
+        let e = load_event(DeckId::A, "ghost-id", "/nonexistent/track.wav");
+        let next = prev.apply(&e);
+        let (cmds, errors) = event_to_commands_with_errors(&prev, &next, &e, 0, SR, &svc);
+        assert!(
+            cmds.is_empty(),
+            "failed open should NOT emit a DeckLoad audio command, got {cmds:?}",
+        );
+        assert_eq!(errors.len(), 1, "expected exactly one DecodeFailure");
+        let f = &errors[0];
+        assert_eq!(f.deck, DeckId::A);
+        assert_eq!(f.track_id, "ghost-id");
+        assert_eq!(f.category(), "file_not_found");
+        assert!(matches!(f.error, DecodeError::Io { .. }));
+    }
+
+    #[test]
+    fn deck_load_success_produces_no_decode_failures() {
+        // Happy path: StubDecodeService never errors → errors sidecar
+        // empty, single DeckLoad command emitted.
+        let svc = StubDecodeService::new();
+        let prev = EngineState::default();
+        let e = load_event(DeckId::B, "ok-id", "/anywhere.mp3");
+        let next = prev.apply(&e);
+        let (cmds, errors) = event_to_commands_with_errors(&prev, &next, &e, 0, SR, &svc);
+        assert_eq!(cmds.len(), 1, "happy load should emit one DeckLoad");
+        assert!(matches!(cmds[0].kind, AudioCommandKind::DeckLoad { .. }));
+        assert!(
+            errors.is_empty(),
+            "no decode failures expected on happy load",
+        );
+    }
+
+    #[test]
+    fn non_load_events_never_populate_decode_errors_sidecar() {
+        // Sanity: a stream of non-Load events through a deliberately-
+        // failing decode service never adds anything to the errors
+        // sidecar because translator only calls `open` on DeckLoad.
+        let svc = AlwaysFailDecode {
+            builder: || DecodeError::NoFreeSlot,
+        };
+        let s0 = EngineState::default();
+        let events = [
+            EventKind::DeckPlay { deck: DeckId::A },
+            EventKind::DeckPause { deck: DeckId::A },
+            EventKind::Crossfader { value: 0.25 },
+            EventKind::EqAdjust {
+                deck: DeckId::A,
+                band: EqBand::Mid,
+                value_db: 2.0,
+            },
+        ];
+        let mut s = s0;
+        for (i, kind) in events.iter().enumerate() {
+            let e = ev((i + 1) as u64, kind.clone());
+            let next = s.apply(&e);
+            let (_, errors) = event_to_commands_with_errors(&s, &next, &e, 0, SR, &svc);
+            assert!(
+                errors.is_empty(),
+                "non-load event {kind:?} produced spurious decode error",
+            );
+            s = next;
+        }
+    }
+
+    #[test]
+    fn decode_failure_category_covers_every_decode_error_variant() {
+        // Stable, hand-mapped table from DecodeError → category string.
+        // The UI branches on `category` for icons/copy, so adding a
+        // new variant must add a row here or the toast falls back to
+        // a generic look.
+        type Case = (fn() -> DecodeError, &'static str);
+        let cases: &[Case] = &[
+            (
+                || DecodeError::Io {
+                    path: "/x".into(),
+                    source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+                },
+                "file_not_found",
+            ),
+            (
+                || DecodeError::Probe("bad header".into()),
+                "format_unsupported",
+            ),
+            (|| DecodeError::NoTrack, "format_unsupported"),
+            (
+                || DecodeError::Resampler("rubato init".into()),
+                "decoder_error",
+            ),
+            (|| DecodeError::NoFreeSlot, "resource_exhausted"),
+            (
+                || DecodeError::UnknownInlineSource("missing-key".into()),
+                "unknown_inline_source",
+            ),
+            (
+                || DecodeError::Spawn(std::io::Error::other("spawn fail")),
+                "decoder_thread_spawn",
+            ),
+        ];
+        for (build, want) in cases {
+            let failure = DecodeFailure {
+                deck: DeckId::A,
+                track_id: "t".into(),
+                error: build(),
+            };
+            assert_eq!(
+                failure.category(),
+                *want,
+                "category for {:?}",
+                failure.error,
+            );
+        }
+    }
+
+    #[test]
+    fn event_to_commands_shim_drops_decode_error_sidecar() {
+        // Ensure the 1-tuple `event_to_commands` helper preserved for
+        // benches / older tests still returns the same `AudioCmdBatch`
+        // as the tuple-returning variant (silently dropping the errors
+        // sidecar so the old call sites compile unchanged).
+        let svc = StubDecodeService::new();
+        let prev = EngineState::default();
+        let e = load_event(DeckId::A, "p", "/p.mp3");
+        let next = prev.apply(&e);
+        let cmds_legacy = event_to_commands(&prev, &next, &e, 0, SR, &svc);
+        let (cmds_tuple, _) = event_to_commands_with_errors(&prev, &next, &e, 0, SR, &svc);
+        assert_eq!(cmds_legacy.len(), cmds_tuple.len());
     }
 }
