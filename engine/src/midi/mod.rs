@@ -14,16 +14,21 @@
 //! * `listener`  — `MidiListener::start` opens a port + spawns the callback.
 //! * `clock_out` — MIDI clock OUT v0.1 per ADR-007 (24 PPQN, behind the
 //!   `midi-clock-out` Cargo feature).
+//! * `clock_in`  — MIDI clock IN  v0.3 per ADR-007 (24 PPQN, behind the
+//!   `midi-clock-in` Cargo feature). When active, MIDI clock OUT is
+//!   silently disabled to avoid feedback loops; see ADR-007 §v0.3.
 //!
 //! The default mapping ships at `mappings/ddj200.json` and is bundled into
 //! the binary via `include_str!`. Users can override by setting the
 //! `HYPEHOUSE_MIDI_MAPPING` environment variable to a JSON file path.
 
 pub mod clamp;
+pub mod clock_in;
 pub mod clock_out;
 pub mod listener;
 pub mod mapping;
 
+pub use clock_in::{ClockInError, MidiClockIn, MidiSource};
 pub use clock_out::{ClockOutError, MidiClockOut, MidiSink};
 pub use listener::{ListenerError, MidiListener, MidiListenerHandle};
 pub use mapping::{

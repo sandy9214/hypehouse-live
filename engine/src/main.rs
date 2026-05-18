@@ -132,11 +132,29 @@ async fn main() -> Result<()> {
         "audio thread up — cpal stream playing"
     );
 
+    // MIDI clock IN (ADR-007 §v0.3). Gated by both the `midi-clock-in`
+    // Cargo feature AND the `MIDI_CLOCK_IN_DEVICE` env var. When
+    // active it locks `SharedClock::master_bpm` to an external master
+    // sequencer / DAW. Spawn it BEFORE the OUT so the OUT can detect
+    // the IN is active and silently disable itself (avoids feedback
+    // loop — see clock_in.rs module docs).
+    let _midi_clock_in = spawn_midi_clock_in_if_enabled(clock.shared.clone());
+    let clock_in_active = _midi_clock_in.is_some();
+
     // MIDI clock OUT (ADR-007 §v0.1). Gated by both the `midi-clock-out`
     // Cargo feature AND the `MIDI_CLOCK_OUT_DEVICE` env var (substring
-    // match against output port names; empty/unset = disabled).
+    // match against output port names; empty/unset = disabled). When
+    // MIDI clock IN is active (v0.3) we silently skip OUT so the
+    // engine can't echo its own input back to the master.
     // Owned by `main` so the worker thread joins cleanly on shutdown.
-    let _midi_clock_out = spawn_midi_clock_out_if_enabled(clock.shared.clone());
+    let _midi_clock_out = if clock_in_active {
+        info!(
+            "midi-clock-out: skipped — MIDI clock IN is active (avoids feedback loop, ADR-007 §v0.3)"
+        );
+        None
+    } else {
+        spawn_midi_clock_out_if_enabled(clock.shared.clone())
+    };
 
     // Event channel — fed by WS bridge / MIDI / co-pilot, drained by
     // the control-thread loop.
@@ -395,6 +413,56 @@ fn spawn_midi_clock_out_if_enabled(
         warn!(
             device_filter = %device,
             "midi-clock-out: env var set but feature `midi-clock-out` not enabled at compile time"
+        );
+        None
+    }
+}
+
+/// Spawn the MIDI clock IN listener if the user has configured it.
+///
+/// Selection rules (per ADR-007 §v0.3):
+/// * Env var `MIDI_CLOCK_IN_DEVICE` unset / empty → disabled, returns `None`.
+/// * `midi-clock-in` feature off at compile time → disabled even if env set.
+/// * Substring match (case-insensitive) against the available input port
+///   names. No match → log a warning, return `None`. We never fail the
+///   whole engine on a missing MIDI device — DJ rigs commonly boot
+///   without all the hardware plugged in.
+fn spawn_midi_clock_in_if_enabled(
+    shared_clock: SharedClock,
+) -> Option<hypehouse_engine::midi::MidiClockIn> {
+    let device = std::env::var("MIDI_CLOCK_IN_DEVICE").unwrap_or_default();
+    let _ = shared_clock; // keep signature stable when feature is off
+    if device.trim().is_empty() {
+        info!("midi-clock-in: MIDI_CLOCK_IN_DEVICE unset — disabled");
+        return None;
+    }
+
+    #[cfg(feature = "midi-clock-in")]
+    {
+        match hypehouse_engine::midi::MidiClockIn::start(Some(&device), shared_clock) {
+            Ok(handle) => {
+                info!(
+                    port = %handle.port_name,
+                    device_filter = %device,
+                    "midi-clock-in: started — locking master_bpm to external MIDI clock"
+                );
+                Some(handle)
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    device_filter = %device,
+                    "midi-clock-in: failed to open input port — continuing without"
+                );
+                None
+            }
+        }
+    }
+    #[cfg(not(feature = "midi-clock-in"))]
+    {
+        warn!(
+            device_filter = %device,
+            "midi-clock-in: env var set but feature `midi-clock-in` not enabled at compile time"
         );
         None
     }

@@ -1051,6 +1051,83 @@ head" concept; downstream gear assumes start-from-zero on 0xFA.
 The engine never refuses to boot because of a missing MIDI device — DJ
 rigs frequently start without all hardware plugged in.
 
+## MIDI clock IN (ADR-007 v0.3)
+
+The engine can act as a MIDI clock **slave**, locking its master
+tempo (`SharedClock::master_bpm`) to a hardware sequencer / DAW that
+emits 24 PPQN MIDI clock. **There is no protocol surface** — MIDI
+clock IN does not flow through the WebSocket bridge. Documented here
+because it mutates the same master-tempo abstraction that the event
+log + MIDI clock OUT depend on.
+
+### Enabling
+
+| Knob | Value | Effect |
+|---|---|---|
+| Cargo feature | `midi-clock-in` (default **off**) | Compiles the `midir` input binding. Without it the env var is logged and ignored. |
+| Env var       | `MIDI_CLOCK_IN_DEVICE=<substring>`  | Case-insensitive substring matched against MIDI input port names. Empty / unset = disabled. |
+
+```bash
+# Native build with MIDI clock IN, locking to the first input port
+# whose name contains "IAC" (macOS IAC bus).
+MIDI_CLOCK_IN_DEVICE=iac cargo run --features midi-clock-in
+```
+
+### Mode interaction with MIDI clock OUT
+
+When `MIDI_CLOCK_IN_DEVICE` is set (and the feature is active), the
+engine **silently disables** MIDI clock OUT to avoid a feedback loop
+where the engine echoes the master's own clock back to it.
+
+```bash
+# IN takes precedence over OUT. OUT will not start.
+MIDI_CLOCK_IN_DEVICE=iac \
+  MIDI_CLOCK_OUT_DEVICE=maschine \
+  cargo run --features midi-clock-in,midi-clock-out
+```
+
+A future v0.4 may add a "mirror" mode that re-emits the incoming
+clock byte-for-byte; today the simpler interlock above ships.
+
+### BPM derivation + smoothing
+
+* **24 PPQN**: per the MIDI clock spec, 24 ticks = one quarter note.
+* **Beat anchor**: the first 0xF8 after 0xFA timestamps the anchor.
+  The next `TICKS_PER_BEAT (=24)` 0xF8 bytes complete one beat. We
+  compute `BPM = 60.0 / beat_duration_secs`.
+* **Smoothing window**: 4 most-recent beat-BPMs, mean-averaged before
+  being pushed into `SharedClock::set_master_bpm`. ≈ 2 s of history
+  at 120 BPM — enough to absorb USB-MIDI jitter, fast enough to
+  follow a live tempo nudge within a beat or two.
+* **Deadband**: smoothed BPM within ±0.1 BPM of the current
+  `SharedClock::master_bpm` is dropped (no atomic store). ±0.1 BPM
+  is the JND for a trained ear and well below consumer-grade MIDI
+  USB timing precision.
+* **Plausibility clamp**: inferred BPMs outside [20.0, 999.0] (e.g.
+  a missed tick stretching the interval to 60 s) are rejected rather
+  than poisoning the smoothing buffer.
+
+### Wire format consumed
+
+Single-byte MIDI realtime messages:
+
+| Byte  | Name  | Effect |
+|------:|-------|--------|
+| 0xFA  | Start | Begin counting ticks; reset smoothing state. |
+| 0xF8  | Clock | Inside a Start..Stop window: timestamp + count. Outside: ignored (some DAWs like Ableton Live emit 0xF8 continuously with transport stopped). |
+| 0xFC  | Stop  | Stop counting; clear smoothing state. Subsequent 0xF8 are ignored until the next 0xFA. |
+
+### Failure modes (non-fatal)
+
+* `MIDI_CLOCK_IN_DEVICE` set but the feature is disabled → log warn,
+  continue without MIDI clock IN.
+* No MIDI input ports available → log warn, continue.
+* Substring matched no port → log warn, continue.
+* `midir` connection failed → log warn, continue.
+
+As with clock OUT, the engine never refuses to boot because of a
+missing MIDI input device.
+
 ## Test coverage
 
 Unit + integration tests live under `engine/src/bridge/*` (per-module

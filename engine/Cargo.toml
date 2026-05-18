@@ -12,6 +12,11 @@ default = []
 # Enables the MIDI clock OUT v0.1 module (ADR-007). When off, the
 # module compiles in trait-only form and main.rs skips device probe.
 midi-clock-out = []
+# Enables the MIDI clock IN v0.3 module (ADR-007). When off, the
+# module compiles with the trait + pure helpers (so tests still run)
+# but the midir-backed `MidiClockIn::start` entry point is omitted and
+# main.rs skips device probe.
+midi-clock-in = []
 
 [dependencies]
 # Audio I/O — cpal gives us a lock-free callback into the audio thread.

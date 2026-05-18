@@ -1,6 +1,6 @@
 # ADR-007 — External clock sync (Ableton Link, MIDI clock)
 
-**Status**: Accepted 2026-05-17 — scope: v0.1 = MIDI clock OUT only (**implemented** — see `engine/src/midi/clock_out.rs`); v0.2+ = Ableton Link.
+**Status**: Accepted 2026-05-17 — scope: v0.1 = MIDI clock OUT only (**implemented** — see `engine/src/midi/clock_out.rs`); v0.2+ = Ableton Link; v0.3 = MIDI clock IN (**implemented** — see `engine/src/midi/clock_in.rs`).
 **Decider**: Sandeep Gorai
 **Trigger**: Council review flagged this as a long-term refactor risk if punted (Cohere).
 
@@ -69,6 +69,19 @@ The MIDI clock OUT module landed against `main` with the following shape:
 * **Anchor deck**: not yet wired. `ClockSource::Internal { anchor_deck: None }` is implied. v0.1.x will add an `EventKind::SetClockAnchor { deck: Option<DeckId> }` and the control loop will mirror that deck's BPM on `DeckLoad` / `PitchBend`.
 * **Timing**: ~10 ms `thread::sleep` + spin-yield tail. Measured ~35 µs mean / 400 µs stddev / ~6 ms max jitter on a 2024 M2 MacBook Air running a release build (Cargo also active). MIDI hardware tolerates ±5 ms; pure-spin opt-in is a v0.2 nice-to-have.
 * **Tests**: 12 unit tests against an in-memory `MidiSink` trait — 24 PPQN @ 120 BPM, Start emission, BPM change reactivity, Drop emits Stop, substring port selection, bad-BPM clamp, 1 BPM idle (no busy loop).
+
+### v0.3 implementation notes (PR `engine-midi-clock-in`)
+
+The MIDI clock IN module landed against `main` with the following shape:
+
+* **Module**: [`engine/src/midi/clock_in.rs`](../../engine/src/midi/clock_in.rs) — `MidiClockIn::start(Some("device-substring"), shared_clock)` opens a `midir::MidiInput` port (substring match, case-insensitive) and registers a callback that consumes MIDI **Start** (0xFA), **Clock** (0xF8), and **Stop** (0xFC) bytes.
+* **BPM derivation**: 24 ticks per beat per the MIDI clock spec. The first 0xF8 after 0xFA anchors a `std::time::Instant`; the next `TICKS_PER_BEAT (=24)` ticks span exactly one beat. Beat duration → BPM = `60 / beat_duration_secs`.
+* **Smoothing**: ring buffer of the last `SMOOTHING_WINDOW (=4)` beat-BPMs, mean-averaged before being pushed into `SharedClock`. Absorbs the per-tick jitter of consumer USB-MIDI / virtual ports.
+* **Deadband**: `BPM_DEADBAND = 0.1 BPM`. Smoothed values within ±0.1 BPM of the current `SharedClock::master_bpm` are dropped — avoids spamming the audio thread with micro-jitter writes.
+* **Configuration**: env var `MIDI_CLOCK_IN_DEVICE` selects the port. Empty / unset = disabled. Cargo feature `midi-clock-in` gates compilation of the `midir` input binding — default off.
+* **Mode interaction with OUT**: when `MIDI_CLOCK_IN_DEVICE` is set, `main.rs` silently disables MIDI clock OUT (avoids feedback loop). A future v0.4 may add a 1:1 mirror mode.
+* **Shutdown**: `MidiClockIn` owns the `midir::MidiInputConnection`. `Drop` closes the port — midir guarantees the callback thread joins before `drop` returns. A cancellation `AtomicBool` short-circuits any in-flight callback during teardown.
+* **Tests**: 12 unit tests against an in-memory `MidiSource` trait — 24-tick lock to 120 BPM, 4-beat smoothing, Stop resets state, Start-after-Stop resumes, deadband skips micro-changes, substring port selection, pre-Start 0xF8 ignored, bogus-beat rejection, smoothing window cap, BPM-from-beat clamping, and two end-to-end pipeline tests via the source trait.
 
 ## What v0.2+ unlocks
 
