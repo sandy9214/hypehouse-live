@@ -32,6 +32,7 @@ pub mod mixer;
 pub mod pitch_tempo;
 pub mod ring;
 pub mod translator;
+pub mod wsola;
 
 pub use clock::{EngineClock, SharedClock};
 pub use command::{AudioCommand, AudioCommandKind, RAMP_BUFFER_MAX};
@@ -60,4 +61,9 @@ pub use ring::{AudioConsumer, AudioProducer, AudioRing, RING_CAPACITY};
 pub use translator::{
     event_to_commands, event_to_commands_with_errors, AudioCmdBatch, DecodeFailure, BAR_BEATS,
     DEFAULT_RAMP_MS,
+};
+pub use wsola::{
+    Wsola, DEFAULT_HOP_OUT as WSOLA_DEFAULT_HOP_OUT,
+    DEFAULT_SEARCH_RANGE as WSOLA_DEFAULT_SEARCH_RANGE,
+    DEFAULT_WINDOW_SIZE as WSOLA_DEFAULT_WINDOW_SIZE,
 };

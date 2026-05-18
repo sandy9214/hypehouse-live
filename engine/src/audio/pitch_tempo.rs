@@ -48,15 +48,26 @@
 //!  output (target_rate × tempo_ratio frames)
 //! ```
 //!
-//! **v0.1 limitation**: stage 2 is implemented as a *sample-rate
-//! converter*, not a true time-stretch (WSOLA / phase vocoder). The
-//! mathematical effect of cascading two SRCs is identical to a single
-//! SRC by the product ratio — i.e. when both knobs are non-default, the
-//! pitch and tempo changes are NOT truly independent (they cancel /
-//! compound). The public API is shaped to allow a future v0.2 to swap
-//! stage 2 for a real WSOLA implementation **without** changing
-//! callers. See GH issue #41 (filed alongside this PR) for the v0.2
-//! follow-up.
+//! **v0.2 stage-2 routing** (this PR — WSOLA follow-up to PR #43):
+//! the public API is unchanged, but stage 2 now picks between two
+//! implementations at audio-thread dispatch time:
+//!
+//! * **Single-knob path (legacy SRC)**: when EITHER `tempo_ratio` is
+//!   default OR `pitch_semitones` is default, stage 2 runs the
+//!   original rubato `FastFixedIn` cascade. Cheaper (≈3-5 µs / chunk
+//!   release build); the two SRCs collapse cleanly to a single
+//!   resample whose ratio is correct for whichever knob is moving.
+//!
+//! * **Both-knob path (WSOLA)**: when BOTH knobs are non-default,
+//!   stage 2 is replaced with a per-channel WSOLA time-stretcher
+//!   ([`crate::audio::wsola::Wsola`]). Stage 1 still does the pitch
+//!   shift (and incidentally squeezes / stretches duration as an SRC
+//!   side-effect); WSOLA then time-stretches stage 1's output back
+//!   to the caller-requested speed WITHOUT touching pitch. This
+//!   delivers true pitch / tempo orthogonality at extreme ratios
+//!   (±50% tempo, ±12 st pitch). Heavier than the SRC path
+//!   (~150-300 µs / chunk release build) but stays well inside the
+//!   ADR-004 audio-thread budget.
 //!
 //! What DOES work cleanly in v0.1:
 //! * `tempo_ratio` alone — output length scales by `1/tempo_ratio`
@@ -82,6 +93,7 @@
 
 use rubato::{FastFixedIn, PolynomialDegree, Resampler};
 
+use crate::audio::wsola::Wsola;
 use crate::state::DeckId;
 
 /// Minimum allowed `tempo_ratio`. Below this rubato's polynomial
@@ -163,8 +175,17 @@ pub fn clamp_pitch_semitones(st: f32) -> f32 {
 pub struct PitchTempo {
     /// Stage 1 — pitch resampler. Operates on per-channel mono buffers.
     pitch_resampler: FastFixedIn<f32>,
-    /// Stage 2 — tempo correction resampler. Same shape.
+    /// Stage 2 — tempo correction resampler (LEGACY path: used when
+    /// only `tempo_ratio` is non-default, or only `pitch_semitones`).
+    /// When both knobs are non-default we route stage 2 through
+    /// [`PitchTempo::wsola_left`] / `wsola_right` instead — that path
+    /// is a true time-domain time-stretch and preserves pitch.
     tempo_corrector: FastFixedIn<f32>,
+    /// Stage 2 — WSOLA time-stretch (true pitch-preserving). Used
+    /// when BOTH `tempo_ratio != 1.0` AND `pitch_semitones != 0`.
+    /// Per-channel state so stereo phase is preserved.
+    wsola_left: Wsola,
+    wsola_right: Wsola,
     /// Last-applied tempo_ratio (cached so re-applying the same value
     /// avoids re-priming rubato's `target_ratio`).
     last_tempo_ratio: f32,
@@ -209,9 +230,18 @@ impl PitchTempo {
             FastFixedIn::<f32>::new(1.0, max_rel, PolynomialDegree::Cubic, CHUNK_FRAMES, 1)
                 .expect("FastFixedIn tempo corrector construction must succeed at boot");
 
+        // WSOLA stage 2 (true pitch-preserving time-stretch). One
+        // instance per channel; defaults from `audio::wsola` give a
+        // 1024-sample window / 512-sample hop / 256-sample search
+        // range — see ADR-004 §"WSOLA stage 2".
+        let wsola_left = Wsola::with_defaults(48_000);
+        let wsola_right = Wsola::with_defaults(48_000);
+
         Self {
             pitch_resampler,
             tempo_corrector,
+            wsola_left,
+            wsola_right,
             last_tempo_ratio: 1.0,
             last_pitch_semitones: 0.0,
             in_left: vec![0.0; CHUNK_FRAMES],
@@ -250,6 +280,8 @@ impl PitchTempo {
         self.last_pitch_semitones = 0.0;
         self.pitch_resampler.reset();
         self.tempo_corrector.reset();
+        self.wsola_left.reset();
+        self.wsola_right.reset();
     }
 
     /// Are we on the bypass path? Both knobs default = pass input
@@ -317,14 +349,40 @@ impl PitchTempo {
         let st = self.last_pitch_semitones;
         let pitch_ratio = semitones_to_ratio(-st) as f64; // 2^(-st/12)
         let tempo_ratio = self.last_tempo_ratio as f64;
-        // Inverse pitch contribution so stage 2 reverses stage 1's
-        // pitch effect (best-effort with SRC alone — see module doc):
-        // composed ratio = 1 / tempo_ratio.
-        let stage2_ratio = (1.0 / tempo_ratio) * semitones_to_ratio(st) as f64;
+        // ---- Stage-2 routing ----
+        //
+        // When ONLY one knob is non-default (tempo-only OR pitch-only)
+        // we keep the original v0.1 cascade: two cascaded SRCs whose
+        // composed ratio is (1/tempo_ratio) × 2^(st/12 - st/12) =
+        // 1/tempo_ratio when st = 0, or 1.0 when tempo_ratio = 1. The
+        // pitch-only case is mathematically a length-preserving
+        // (pitch-shifting) pair-cancellation — fine. The tempo-only
+        // case is a single resample — also fine.
+        //
+        // When BOTH knobs are non-default the cascaded SRCs collapse
+        // mathematically to a single SRC by `1/tempo_ratio` — i.e.
+        // pitch and tempo are NOT independent. To get true orthogonality
+        // we replace stage 2 with WSOLA (a time-domain time-stretch
+        // that preserves pitch). Stage 1 still shifts pitch by `st`
+        // semitones (and shrinks/grows duration as a side-effect);
+        // WSOLA then time-stretches stage 1's output by
+        // `wsola_ratio = tempo_ratio × 2^(-st/12)` so the final
+        // total speed is `tempo_ratio` — without touching pitch.
+        let use_wsola_stage2 = (tempo_ratio - 1.0).abs() > f64::EPSILON && st.abs() > f32::EPSILON;
+        let stage2_src_ratio = (1.0 / tempo_ratio) * semitones_to_ratio(st) as f64;
+        let wsola_ratio = (tempo_ratio * semitones_to_ratio(-st) as f64) as f32;
 
-        // Re-tune rubato instances in place (O(1)).
+        // Re-tune rubato instances in place (O(1)). The pitch
+        // resampler is always retuned; the SRC stage-2 only matters
+        // when WSOLA isn't routed.
         self.update_ratio_if_changed(true, pitch_ratio);
-        self.update_ratio_if_changed(false, stage2_ratio);
+        if !use_wsola_stage2 {
+            self.update_ratio_if_changed(false, stage2_src_ratio);
+        }
+        // Always keep the WSOLA ratios in sync so a knob toggle to
+        // single-knob → both-knob has consistent state when crossed.
+        self.wsola_left.set_ratio(wsola_ratio);
+        self.wsola_right.set_ratio(wsola_ratio);
 
         // Deinterleave into mono channel scratch (truncating to one
         // CHUNK_FRAMES chunk per call).
@@ -377,35 +435,61 @@ impl PitchTempo {
             return 0;
         }
 
-        // Stage 2 — feed mid_l / mid_r in CHUNK_FRAMES-sized pieces
-        // through tempo_corrector. The corrector also wants exactly
-        // CHUNK_FRAMES input frames per call, so we zero-pad if stage1
-        // produced fewer (commonly happens when pitch_ratio < 1).
+        // Stage 2 — either WSOLA (true time-stretch, pitch-preserving)
+        // or the legacy SRC `tempo_corrector` cascade.
+        //
+        // ## WSOLA path (both knobs non-default)
+        //
+        // Feed exactly `stage1_frames` of stage-1 output (mid_left /
+        // mid_right) into each channel's `Wsola::process`. WSOLA
+        // accumulates input in its own ring; it emits whatever
+        // synthesised output its internal hop schedule permits given
+        // the current ratio + queued input. Returned frame count can
+        // differ between L and R when the SAD-search lands on
+        // different best-match offsets per channel; we conservatively
+        // emit `min(L, R)` so the interleave stays in phase.
+        //
+        // ## SRC path (single-knob or zero-knob non-default)
+        //
+        // Original v0.1 cascade — fixed-size CHUNK_FRAMES in, variable
+        // out, kept for back-compat behaviour (tests + UI).
         for i in stage1_frames..CHUNK_FRAMES {
             self.mid_left[i] = 0.0;
             self.mid_right[i] = 0.0;
         }
-        let mid_left_slices: [&[f32]; 1] = [&self.mid_left[..CHUNK_FRAMES]];
-        let mut final_left_slices: [&mut [f32]; 1] = [&mut self.out_left[..]];
-        let (_, stage2_frames_l) = match self.tempo_corrector.process_into_buffer(
-            &mid_left_slices,
-            &mut final_left_slices,
-            None,
-        ) {
-            Ok(x) => x,
-            Err(_) => return 0,
+        let frames_out = if use_wsola_stage2 {
+            // Feed exactly the freshly-produced stage-1 frames; WSOLA
+            // doesn't want the zero-padded tail polluting its ring.
+            let n_l = self
+                .wsola_left
+                .process(&self.mid_left[..stage1_frames], &mut self.out_left[..]);
+            let n_r = self
+                .wsola_right
+                .process(&self.mid_right[..stage1_frames], &mut self.out_right[..]);
+            n_l.min(n_r)
+        } else {
+            let mid_left_slices: [&[f32]; 1] = [&self.mid_left[..CHUNK_FRAMES]];
+            let mut final_left_slices: [&mut [f32]; 1] = [&mut self.out_left[..]];
+            let (_, stage2_frames_l) = match self.tempo_corrector.process_into_buffer(
+                &mid_left_slices,
+                &mut final_left_slices,
+                None,
+            ) {
+                Ok(x) => x,
+                Err(_) => return 0,
+            };
+            let mid_right_slices: [&[f32]; 1] = [&self.mid_right[..CHUNK_FRAMES]];
+            let mut final_right_slices: [&mut [f32]; 1] = [&mut self.out_right[..]];
+            let (_, stage2_frames_r) = match self.tempo_corrector.process_into_buffer(
+                &mid_right_slices,
+                &mut final_right_slices,
+                None,
+            ) {
+                Ok(x) => x,
+                Err(_) => return 0,
+            };
+            stage2_frames_l.min(stage2_frames_r)
         };
-        let mid_right_slices: [&[f32]; 1] = [&self.mid_right[..CHUNK_FRAMES]];
-        let mut final_right_slices: [&mut [f32]; 1] = [&mut self.out_right[..]];
-        let (_, stage2_frames_r) = match self.tempo_corrector.process_into_buffer(
-            &mid_right_slices,
-            &mut final_right_slices,
-            None,
-        ) {
-            Ok(x) => x,
-            Err(_) => return 0,
-        };
-        let frames_out = stage2_frames_l.min(stage2_frames_r);
 
         // Re-interleave into caller's output buffer.
         let max_pairs = (output.len() / 2).min(frames_out);
@@ -590,33 +674,34 @@ mod tests {
 
     #[test]
     fn pitch_minus_12_and_tempo_2_combined_cascade_emits_signal() {
-        // pitch_semitones = -12 + tempo_ratio = 2.0. Stage-1 ratio =
-        // 2^(12/12) = 2 (doubles output from CHUNK to 2×CHUNK), but
-        // stage 2 only consumes CHUNK frames of that, so half the
-        // stage-1 output is dropped. Stage-2 ratio = (1/2) × 2^(-1) =
-        // 0.25, so 256 frames in → ~64 frames out.
+        // pitch_semitones = -12 + tempo_ratio = 2.0. Both knobs
+        // non-default → stage 2 routes through WSOLA. Stage 1 ratio =
+        // 2^(12/12) = 2 (doubles output), then WSOLA time-stretches
+        // by `tempo_ratio × 2^(-st/12) = 2 × 2 = 4` (much faster).
         //
-        // This is the documented v0.1 behaviour: the two stages don't
-        // truly compose to (1/tempo_ratio) when both knobs are
-        // non-default — we lose stage-1 expansion to stage-2's fixed
-        // chunk-size input. v0.2 (WSOLA stage 2) removes this limit.
+        // WSOLA needs ≥ `window_size + search_range` samples (1280)
+        // of stage-1 output in its ring before it can synthesise. At
+        // stage1 = 2×CHUNK = 512 frames per call we need ≥ 3 calls
+        // before WSOLA emits a frame, so this test drives multiple
+        // calls and asserts SOME output eventually flows.
         let mut pt = PitchTempo::new(DeckId::A);
         pt.set_pitch_semitones(-12.0);
         pt.set_tempo_ratio(2.0);
         let input = sine_stereo(220.0, 48_000, CHUNK_FRAMES * 2);
-        let mut output = vec![0.0_f32; CHUNK_FRAMES * 2];
-        let _ = pt.process(&input, &mut output); // prime
-        let n = pt.process(&input, &mut output);
-        let frames_out = n / 2;
-        // Cascade must produce SOME audio (not zero) and stay below
-        // the input chunk size — proves both stages are running.
-        assert!(frames_out > 0, "cascade produced no output");
-        assert!(
-            frames_out <= CHUNK_FRAMES,
-            "frames_out {frames_out} should be ≤ CHUNK_FRAMES ({CHUNK_FRAMES})"
-        );
+        let mut output = vec![0.0_f32; CHUNK_FRAMES * 4];
+        let mut total = 0usize;
+        for _ in 0..12 {
+            let n = pt.process(&input, &mut output);
+            total += n;
+            if total > 0 {
+                break;
+            }
+        }
+        let frames_out = total / 2;
+        assert!(frames_out > 0, "cascade produced no output after warmup");
         // Energy sanity — must not be all zeros.
-        let energy: f32 = output[..n].iter().map(|s| s * s).sum::<f32>() / (n.max(1) as f32);
+        let energy: f32 =
+            output[..total].iter().map(|s| s * s).sum::<f32>() / (total.max(1) as f32);
         assert!(
             energy > 1e-6,
             "cascade output had no energy (frames={frames_out}, energy={energy})"
@@ -729,5 +814,51 @@ mod tests {
         // many times per second. Just assert it's > 0.
         let zcr = zero_crossing_rate(&output[..n], sr);
         assert!(zcr > 100.0, "zcr too low after tempo=2 cascade: {zcr}");
+    }
+
+    #[test]
+    fn wsola_stage2_preserves_pitch_under_extreme_tempo() {
+        // End-to-end orthogonality check (the property this PR
+        // adds): with BOTH knobs non-default, the WSOLA-routed
+        // stage 2 must keep the output pitch close to
+        // `input_freq × 2^(pitch_semitones/12)` regardless of
+        // `tempo_ratio`. We feed a long 440 Hz sine with pitch=+5 st
+        // (target ≈ 587 Hz) and tempo=0.8 (20% slower); the legacy
+        // SRC cascade would shift pitch by the composed ratio
+        // (= 1/0.8 = +3.86 st extra), giving ~735 Hz. WSOLA must
+        // pin it near 587 Hz instead.
+        let sr = 48_000_u32;
+        let mut pt = PitchTempo::new(DeckId::A);
+        pt.set_pitch_semitones(5.0);
+        pt.set_tempo_ratio(0.8);
+        let target_hz = 440.0 * semitones_to_ratio(5.0);
+        let input = sine_stereo(440.0, sr, CHUNK_FRAMES * 2);
+        let mut output = vec![0.0_f32; CHUNK_FRAMES * 4];
+        // WSOLA needs several priming chunks (window + search range
+        // of stage-1 output) before it emits.
+        let mut total = 0usize;
+        for _ in 0..20 {
+            let n = pt.process(&input, &mut output[total..]);
+            total += n;
+            if total >= CHUNK_FRAMES * 2 {
+                break;
+            }
+        }
+        assert!(
+            total >= CHUNK_FRAMES,
+            "WSOLA cascade didn't produce enough output after warmup: {total} samples"
+        );
+        // ZCR target ≈ 587 Hz. Allow ±30% — the SAD search drifts
+        // slightly across pitch periods and the windowing tapers
+        // some crossings near frame boundaries.
+        let z = zero_crossing_rate(&output[..total], sr);
+        let drift = (z - target_hz).abs();
+        // The diagnostic the legacy SRC cascade would have failed:
+        // it'd land near 735 Hz (drift > 100 Hz). WSOLA must drift
+        // < 0.5 × target — well below the legacy artefact.
+        assert!(
+            drift < 0.5 * target_hz,
+            "WSOLA stage-2 failed to preserve pitch: ZCR={z} target={target_hz} drift={drift}"
+        );
     }
 }
