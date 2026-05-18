@@ -1,0 +1,39 @@
+{
+  "id": "keyboard",
+  "bindings": [
+    { "key": "q", "action": "play_pause", "deck": "A" },
+    { "key": "p", "action": "play_pause", "deck": "B" },
+
+    { "key": "1", "action": "hot_cue", "deck": "A", "slot": 0 },
+    { "key": "2", "action": "hot_cue", "deck": "A", "slot": 1 },
+    { "key": "3", "action": "hot_cue", "deck": "A", "slot": 2 },
+    { "key": "4", "action": "hot_cue", "deck": "A", "slot": 3 },
+    { "key": "5", "action": "hot_cue", "deck": "A", "slot": 4 },
+    { "key": "6", "action": "hot_cue", "deck": "A", "slot": 5 },
+    { "key": "7", "action": "hot_cue", "deck": "A", "slot": 6 },
+    { "key": "8", "action": "hot_cue", "deck": "A", "slot": 7 },
+
+    { "key": "9",         "action": "hot_cue", "deck": "B", "slot": 0 },
+    { "key": "0",         "action": "hot_cue", "deck": "B", "slot": 1 },
+    { "key": "-",         "action": "hot_cue", "deck": "B", "slot": 2 },
+    { "key": "=",         "action": "hot_cue", "deck": "B", "slot": 3 },
+    { "key": "[",         "action": "hot_cue", "deck": "B", "slot": 4 },
+    { "key": "]",         "action": "hot_cue", "deck": "B", "slot": 5 },
+    { "key": "\\",        "action": "hot_cue", "deck": "B", "slot": 6 },
+    { "key": "Backspace", "action": "hot_cue", "deck": "B", "slot": 7 },
+
+    { "key": "z", "action": "pitch_delta", "deck": "A", "delta": -0.5,
+      "outputRange": { "min": -12, "max": 12 } },
+    { "key": "x", "action": "pitch_delta", "deck": "A", "delta":  0.5,
+      "outputRange": { "min": -12, "max": 12 } },
+    { "key": "n", "action": "pitch_delta", "deck": "B", "delta": -0.5,
+      "outputRange": { "min": -12, "max": 12 } },
+    { "key": "m", "action": "pitch_delta", "deck": "B", "delta":  0.5,
+      "outputRange": { "min": -12, "max": 12 } },
+
+    { "key": ",", "action": "crossfader_delta", "delta": -0.05,
+      "outputRange": { "min": 0, "max": 1 } },
+    { "key": ".", "action": "crossfader_delta", "delta":  0.05,
+      "outputRange": { "min": 0, "max": 1 } }
+  ]
+}
