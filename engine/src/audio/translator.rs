@@ -239,15 +239,88 @@ pub fn event_to_commands(
                 },
             });
         }
+        // ADR-006 — effects: emit POD `AudioCommandKind::Effect*` per
+        // event so the audio thread can mutate its `FxBank` state.
+        // String params are resolved to numeric `param_id` here on
+        // the control thread; the audio side never sees a `String`.
+        EventKind::EffectAssign {
+            deck,
+            slot,
+            effect_id,
+        } => {
+            out.push(AudioCommand {
+                at_frame: now_frame,
+                kind: AudioCommandKind::EffectAssign {
+                    deck: *deck,
+                    slot: *slot,
+                    effect_id: *effect_id,
+                },
+            });
+        }
+        EventKind::EffectClear { deck, slot } => {
+            out.push(AudioCommand {
+                at_frame: now_frame,
+                kind: AudioCommandKind::EffectClear {
+                    deck: *deck,
+                    slot: *slot,
+                },
+            });
+        }
+        EventKind::EffectParam {
+            deck,
+            slot,
+            param,
+            value,
+        } => {
+            // Resolve param name → numeric id by asking the registry
+            // for the slot's current effect. Drop the command silently
+            // if the slot is empty or the name is unknown.
+            let effect_id = next
+                .deck_ref(*deck)
+                .effects
+                .get(*slot as usize)
+                .map(|s| s.effect_id)
+                .unwrap_or(0);
+            if let Some(param_id) = crate::audio::effects::resolve_param(effect_id, param) {
+                out.push(AudioCommand {
+                    at_frame: now_frame,
+                    kind: AudioCommandKind::EffectParam {
+                        deck: *deck,
+                        slot: *slot,
+                        param_id,
+                        value: *value,
+                    },
+                });
+            }
+        }
+        EventKind::EffectWetDry { deck, slot, value } => {
+            out.push(AudioCommand {
+                at_frame: now_frame,
+                kind: AudioCommandKind::EffectWetDry {
+                    deck: *deck,
+                    slot: *slot,
+                    value: *value,
+                },
+            });
+        }
+        EventKind::EffectEnable {
+            deck,
+            slot,
+            enabled,
+        } => {
+            out.push(AudioCommand {
+                at_frame: now_frame,
+                kind: AudioCommandKind::EffectEnable {
+                    deck: *deck,
+                    slot: *slot,
+                    enabled: *enabled,
+                },
+            });
+        }
         // Non-audio-relevant events — pure state, no audio command needed.
         EventKind::HotCueSet { .. }
         | EventKind::LoopIn { .. }
         | EventKind::PhaseNudge { .. }
-        | EventKind::EffectAssign { .. }
-        | EventKind::EffectClear { .. }
-        | EventKind::EffectParam { .. }
-        | EventKind::EffectWetDry { .. }
-        | EventKind::EffectEnable { .. }
         | EventKind::CopilotEngage { .. }
         | EventKind::CopilotDisengage { .. }
         | EventKind::SessionStart
@@ -495,6 +568,164 @@ mod tests {
         assert_eq!(ms_to_frames(1000, 48_000), 48_000);
         assert_eq!(ms_to_frames(0, 48_000), 0);
         assert_eq!(ms_to_frames(500, 96_000), 48_000);
+    }
+
+    #[test]
+    fn effect_assign_emits_audio_command() {
+        // ADR-006 — EffectAssign event must translate into an
+        // EffectAssign audio command so the mixer's FxBank picks it
+        // up.
+        let prev = EngineState::default();
+        let e = ev(
+            1,
+            EventKind::EffectAssign {
+                deck: DeckId::A,
+                slot: 0,
+                effect_id: 2, // Echo
+            },
+        );
+        let next = prev.apply(&e);
+        let cmds = translate(&prev, &next, &e, 0);
+        assert_eq!(cmds.len(), 1);
+        match cmds[0].kind {
+            AudioCommandKind::EffectAssign {
+                deck,
+                slot,
+                effect_id,
+            } => {
+                assert_eq!(deck, DeckId::A);
+                assert_eq!(slot, 0);
+                assert_eq!(effect_id, 2);
+            }
+            other => panic!("expected EffectAssign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effect_param_resolves_param_name_to_numeric_id() {
+        // After assigning Filter to slot 0, an EffectParam event with
+        // `param="cutoff_hz"` should resolve to param_id=0 (the
+        // descriptor index of cutoff_hz).
+        let s0 = EngineState::default();
+        let assign = ev(
+            1,
+            EventKind::EffectAssign {
+                deck: DeckId::A,
+                slot: 0,
+                effect_id: 1, // Filter
+            },
+        );
+        let s1 = s0.apply(&assign);
+        let set = ev(
+            2,
+            EventKind::EffectParam {
+                deck: DeckId::A,
+                slot: 0,
+                param: "cutoff_hz".to_string(),
+                value: 800.0,
+            },
+        );
+        let s2 = s1.apply(&set);
+        let cmds = translate(&s1, &s2, &set, 0);
+        assert_eq!(cmds.len(), 1);
+        match cmds[0].kind {
+            AudioCommandKind::EffectParam {
+                deck,
+                slot,
+                param_id,
+                value,
+            } => {
+                assert_eq!(deck, DeckId::A);
+                assert_eq!(slot, 0);
+                assert_eq!(param_id, 0);
+                assert!((value - 800.0).abs() < 1e-6);
+            }
+            other => panic!("expected EffectParam, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effect_param_unknown_name_is_dropped() {
+        // Unknown param name → no command emitted (silent drop; the
+        // reducer still records the state change for audit, but the
+        // audio side has no slot to receive it).
+        let s0 = EngineState::default();
+        let assign = ev(
+            1,
+            EventKind::EffectAssign {
+                deck: DeckId::A,
+                slot: 0,
+                effect_id: 1,
+            },
+        );
+        let s1 = s0.apply(&assign);
+        let bad = ev(
+            2,
+            EventKind::EffectParam {
+                deck: DeckId::A,
+                slot: 0,
+                param: "not_a_param".to_string(),
+                value: 1.0,
+            },
+        );
+        let s2 = s1.apply(&bad);
+        let cmds = translate(&s1, &s2, &bad, 0);
+        assert!(
+            cmds.is_empty(),
+            "unknown effect param should drop without emitting a command"
+        );
+    }
+
+    #[test]
+    fn effect_wet_dry_and_enable_translate() {
+        let s0 = EngineState::default();
+        let assign = ev(
+            1,
+            EventKind::EffectAssign {
+                deck: DeckId::B,
+                slot: 1,
+                effect_id: 3,
+            },
+        );
+        let s1 = s0.apply(&assign);
+        let wd = ev(
+            2,
+            EventKind::EffectWetDry {
+                deck: DeckId::B,
+                slot: 1,
+                value: 0.8,
+            },
+        );
+        let s2 = s1.apply(&wd);
+        let cmds = translate(&s1, &s2, &wd, 0);
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(
+            cmds[0].kind,
+            AudioCommandKind::EffectWetDry { .. }
+        ));
+        let en = ev(
+            3,
+            EventKind::EffectEnable {
+                deck: DeckId::B,
+                slot: 1,
+                enabled: false,
+            },
+        );
+        let s3 = s2.apply(&en);
+        let cmds = translate(&s2, &s3, &en, 0);
+        assert_eq!(cmds.len(), 1);
+        match cmds[0].kind {
+            AudioCommandKind::EffectEnable {
+                deck,
+                slot,
+                enabled,
+            } => {
+                assert_eq!(deck, DeckId::B);
+                assert_eq!(slot, 1);
+                assert!(!enabled);
+            }
+            other => panic!("expected EffectEnable, got {other:?}"),
+        }
     }
 
     #[test]

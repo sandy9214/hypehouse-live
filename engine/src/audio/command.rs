@@ -113,6 +113,42 @@ pub enum AudioCommandKind {
         deck: DeckId,
         after_frames: u32,
     },
+    /// ADR-006 — assign effect to a deck's slot. `effect_id` 0 = clear.
+    /// `slot` is 0..3 (per-deck chain).
+    EffectAssign {
+        deck: DeckId,
+        slot: u8,
+        effect_id: u32,
+    },
+    /// ADR-006 — clear an effect slot (return it to passthrough). The
+    /// translator emits this for `EffectClear` events; `EffectAssign`
+    /// with id=0 also clears.
+    EffectClear {
+        deck: DeckId,
+        slot: u8,
+    },
+    /// ADR-006 — set one effect param by **numeric** index. The
+    /// translator resolves the event's textual param name into an
+    /// index via the registry's `resolve_param`, so no String reaches
+    /// the audio thread.
+    EffectParam {
+        deck: DeckId,
+        slot: u8,
+        param_id: u8,
+        value: f32,
+    },
+    /// ADR-006 — set the wet/dry blend for a slot (0..1).
+    EffectWetDry {
+        deck: DeckId,
+        slot: u8,
+        value: f32,
+    },
+    /// ADR-006 — enable/disable a slot in place (without losing state).
+    EffectEnable {
+        deck: DeckId,
+        slot: u8,
+        enabled: bool,
+    },
 }
 
 #[cfg(test)]

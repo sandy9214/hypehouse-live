@@ -1,87 +1,105 @@
 # ADR-006 — Effects chain extensibility
 
-**Status**: Accepted 2026-05-17
-**Decider**: Sandeep Gorai
-**Trigger**: Council review flagged effects chain absence as a gap (Cohere).
+## Status
+
+Accepted. v0.1 effects (Filter, Echo, Reverb, Gate) implemented under
+`engine/src/audio/effects/`.
 
 ## Context
 
-Pro DJ apps ship effects: filter (low-pass / high-pass), echo / delay, reverb, flanger, bit-crusher, gate. Currently the Deck struct has 3-band EQ only. Adding effects later without a designed extension point would force a refactor.
+Live DJ players need per-deck creative effects — filters, delays,
+reverbs, beat-synced gating. The chain has to be:
+
+1. **Audio-thread safe** — `process()` must not allocate, must not lock,
+   must not block. (ADR-004 hard rule.)
+2. **Per-deck**, 3 slots, applied in slot order.
+3. **Hot-swappable** — assigning a different effect to a slot must not
+   stall the audio thread.
+4. **UI-discoverable** — the frontend needs a manifest of available
+   effects + their parameters.
 
 ## Decision
 
-Each deck has an **effects chain**: an ordered list of effect slots (default 3 slots per deck). Each slot can be empty, or hold one effect with parameters. Effects are registered by name + a stable schema at engine boot; UI discovers available effects via JSON manifest.
+### Topology
+
+Each deck owns `[EffectSlot; 3]` (already in `state.rs`). The audio
+thread holds a mirrored `[FxBank; 3]` per deck. A `FxBank`
+**pre-allocates every built-in effect** so that hot-swapping a slot
+just re-points an `effect_id` and `reset()`s the target — no
+construction on the audio thread.
+
+Slots run serially (slot 0 → slot 1 → slot 2). The output of slot N
+feeds slot N+1; the final post-slot-2 buffer is the deck's signal
+into the crossfader.
+
+### Built-ins (v0.1)
+
+| id | name    | params (descriptor order)                                         |
+|----|---------|-------------------------------------------------------------------|
+| 1  | filter  | `cutoff_hz` `resonance` `mode` (RBJ biquad LP/HP/BP)              |
+| 2  | echo    | `time_ms` `feedback` `tone` (delay line + cross-fb + tone tilt)   |
+| 3  | reverb  | `room_size` `damping` `width` (Schroeder 4-comb + 2-allpass)      |
+| 4  | gate    | `period_div` `duty` (beat-synced from master clock + master BPM)  |
+
+Id `0` is reserved for the empty slot.
+
+### Param plumbing
+
+The `EngineState` event log keeps the user-friendly form
+(`EffectParam { param: String, value: f32 }`) so the audit trail
+remains human-readable. The translator resolves the string into a
+numeric index by asking `effects::resolve_param(effect_id, name)`
+**on the control thread**, then emits a pure-POD
+`AudioCommandKind::EffectParam { param_id: u8, value: f32 }`. The
+audio thread never sees a `String`.
+
+### Trait
 
 ```rust
-pub struct EffectSlot {
-    pub effect: Option<EffectId>,
-    pub params: BTreeMap<String, f32>,   // per-effect parameter values
-    pub wet_dry: f32,                    // 0.0 = dry, 1.0 = full wet
-    pub enabled: bool,
-}
-
-pub struct Deck {
-    // ... existing fields ...
-    pub effects: [EffectSlot; 3],
-}
-
-pub type EffectId = u32;  // index into engine effect registry
-```
-
-Effect registry built into the audio engine:
-
-```rust
-pub struct EffectRegistry {
-    by_id: HashMap<EffectId, Effect>,
-}
-
 pub trait Effect: Send + Sync {
     fn id(&self) -> EffectId;
     fn name(&self) -> &'static str;
-    fn params(&self) -> &[ParamDescriptor];
-    /// Process in-place; must not allocate.
-    fn process(&self, buf: &mut [f32], params: &EffectParams, wet_dry: f32);
-    /// Optional smooth ramp on param change (sample-accurate).
-    fn ramp_param(&self, _name: &str, _from: f32, _to: f32, _frames: u32) {}
+    fn params(&self) -> &'static [ParamDescriptor];
+    fn process(&mut self, buf: &mut [f32], params: &EffectParams,
+               wet_dry: f32, sample_rate: u32);  // NO alloc
+    fn reset(&mut self);
 }
 ```
 
-## v0.1 effects
+`EffectParams = [f32; 6]` — fixed-size key table. Each effect maps
+descriptor index → param value. 6 is the per-effect cap.
 
-Ship 4 built-in effects to validate the abstraction; everything else lands later:
+### Buffer ownership
 
-| ID | Name | Params |
-|---|---|---|
-| 1 | `filter` | `cutoff_hz` (20–20000), `resonance` (0.0–1.0), `mode` (lowpass/highpass/bandpass) |
-| 2 | `echo` | `time_ms` (10–2000), `feedback` (0.0–0.95), `tone` (-1.0 dark .. +1.0 bright) |
-| 3 | `reverb` | `room_size` (0.0–1.0), `damping` (0.0–1.0), `width` (0.0–1.0) |
-| 4 | `gate` | `period_div` (1/2 / 1/4 / 1/8 / 1/16 beat), `duty` (0.0–1.0) |
+`process()` takes an `&mut [f32]` containing **interleaved stereo** (L,
+R, L, R, …). Effects render in place. The mixer's stereo scratch
+buffer flows: oscillator/decoder → per-deck stereo scratch → effects
+chain → downmix to mono → crossfade → output. (Output is mono until a
+separate stereo PR; the effects already run on stereo so that PR is
+purely the master path.)
 
-All four implementable in pure Rust with no FFI.
+### Manifest endpoint
 
-## Why not VST3 host?
+`engine.list_effects` JSON-RPC method returns `[ {id, name, params:
+[descriptor…]}, … ]`. Stubbed to `[]` for v0.1; the static descriptor
+data already lives in `effects::descriptors()` and will be marshalled
+in a follow-up.
 
-VST3 SDK is C++ and would force us to load arbitrary native code with arbitrary realtime characteristics. Some VSTs DO allocate on the audio thread. Future ADR could revisit; for now, in-house effects keep the audio-thread purity guarantee.
+## Consequences
 
-## Why slot-based, not graph-based?
-
-Slot chain is sufficient for DJ effects (effects are typically serial: filter → echo → reverb). Modular graphs are overkill and add UI complexity. Slot chain matches the mental model of Pioneer's beat-FX section + every DJ controller's FX bank.
-
-## Events
-
-Add to `EventKind`:
-
-```
-EffectAssign { deck, slot, effect_id }
-EffectClear { deck, slot }
-EffectParam { deck, slot, param_name, value }
-EffectWetDry { deck, slot, value }
-EffectEnable { deck, slot, enabled }
-```
-
-All clamping happens in the reducer per the effect's `ParamDescriptor` range.
+* No `unsafe`; pre-allocation strategy avoids the alloc-on-swap pitfall.
+* Each `FxBank` holds all 4 effect structs whether assigned or not —
+  the bulk of that is Echo's 2s × 96 kHz × stereo delay line (~1.5 MB).
+  6 banks total (3 slots × 2 decks) → ~9 MB resident. Acceptable for
+  a desktop DJ player; revisit if we add many more delay-line effects.
+* Adding a new effect = implement `Effect` + add to `FxBank` +
+  `descriptors()` + the `match` in `process()`. No registry indirection
+  on the audio path.
 
 ## Open questions
 
-- Sidechain routing (e.g., kick triggers gate): defer to ADR-008.
-- Master-bus effects (effects applied to the post-mixer signal): defer; v0.1 is per-deck only.
+* `engine.list_effects` returns `[]` until the static-descriptor
+  marshaller lands.
+* Master BPM update flow → Gate currently uses the BPM passed at
+  `FxBank::new()`. Live BPM change requires a small audio command
+  (covered separately by ADR-007 clock-sync).

@@ -276,6 +276,68 @@ Liveness + telemetry probe. Returns counters scoped to the bridge.
 }
 ```
 
+### `engine.list_effects` (ADR-006)
+
+**STATUS: stubbed.** Returns an empty array. The full handler is
+tracked in a follow-up issue; this method exists so UI code can
+probe without 404'ing the route.
+
+Returns the effect manifest — the catalogue of built-in effects the
+audio engine ships with. Used by the UI to render the per-deck
+effects-chain controls. Static for a given engine build.
+
+**Params**: none.
+**Result** (target shape; current stub returns `[]`)
+```json
+[
+  {
+    "id": 1,
+    "name": "filter",
+    "params": [
+      { "name": "cutoff_hz", "min": 20, "max": 20000, "default": 500 },
+      { "name": "resonance", "min": 0, "max": 1, "default": 0.3 },
+      { "name": "mode", "min": 0, "max": 2, "default": 0 }
+    ]
+  },
+  {
+    "id": 2,
+    "name": "echo",
+    "params": [
+      { "name": "time_ms", "min": 10, "max": 2000, "default": 250 },
+      { "name": "feedback", "min": 0, "max": 0.95, "default": 0.45 },
+      { "name": "tone", "min": -1, "max": 1, "default": 0 }
+    ]
+  },
+  {
+    "id": 3,
+    "name": "reverb",
+    "params": [
+      { "name": "room_size", "min": 0, "max": 1, "default": 0.5 },
+      { "name": "damping", "min": 0, "max": 1, "default": 0.4 },
+      { "name": "width", "min": 0, "max": 1, "default": 0.7 }
+    ]
+  },
+  {
+    "id": 4,
+    "name": "gate",
+    "params": [
+      { "name": "period_div", "min": 0, "max": 3, "default": 1 },
+      { "name": "duty", "min": 0, "max": 1, "default": 0.5 }
+    ]
+  }
+]
+```
+
+Reserved `id` values:
+
+| id | effect  | notes |
+|----|---------|-------|
+| 0  | (none)  | empty slot — `EffectAssign { effect_id: 0 }` clears |
+| 1  | filter  | RBJ biquad LP / HP / BP |
+| 2  | echo    | delay line + cross-feedback + tone tilt |
+| 3  | reverb  | Schroeder 4-comb + 2-allpass |
+| 4  | gate    | beat-synced gate (master BPM x period_div) |
+
 ## Server-pushed notifications
 
 Notifications have no `id` and expect no response.
