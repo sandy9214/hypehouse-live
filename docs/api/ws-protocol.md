@@ -1086,3 +1086,18 @@ In-band auth (`engine/tests/ws_auth_hello.rs`):
   `1008` (`Policy`).
 * Invalid `auth.hello` → `-32002`; retry with valid token still works.
 * Header-authed native client skips `auth.hello` entirely (back-compat).
+
+
+## Telemetry
+
+The bridge does **not** receive or forward telemetry events. Telemetry
+(opt-in Sentry crash + perf monitoring) is a per-process concern: the
+engine, copilot, and UI each carry their own SDK and emit events
+directly to the configured DSN.
+
+See [`docs/telemetry.md`](../telemetry.md) for the privacy contract,
+the opt-in flags (`HYPEHOUSE_TELEMETRY_ENABLED`,
+`VITE_TELEMETRY_ENABLED`, `window.__HYPEHOUSE_TELEMETRY_ENABLED__`),
+and what gets scrubbed before send. **Default is OFF.** No DSN is
+contacted and no events leave the machine unless the operator has
+explicitly enabled telemetry.

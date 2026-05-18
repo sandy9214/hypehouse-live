@@ -24,6 +24,7 @@ use hypehouse_engine::bridge::{self, EngineHandle};
 use hypehouse_engine::persistence::{new_session_id, EventLog};
 use hypehouse_engine::recording::MasterRecorder;
 use hypehouse_engine::state::{EngineState, Event, EventKind};
+use hypehouse_engine::telemetry;
 use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -36,6 +37,14 @@ async fn main() -> Result<()> {
         )
         .json()
         .init();
+
+    // Opt-in Sentry telemetry. Returns `None` (and contacts no
+    // upstream) unless the operator has explicitly enabled it via env
+    // var or config file. The guard MUST live for the whole of `main`
+    // so its `Drop` impl flushes any in-flight events on shutdown —
+    // hoisting it here means a panic anywhere below this line is
+    // still captured.
+    let _sentry_guard = telemetry::init_telemetry();
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
