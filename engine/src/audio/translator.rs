@@ -16,12 +16,13 @@
 //!
 //! Special cases:
 //!
-//! * **DeckLoad** — the event itself signals "start decoding". This PR's
-//!   stub decode service synchronously allocates a sine buffer and
-//!   returns its [`BufferId`]; the translator emits a
-//!   `DeckLoadBuffer` once the buffer is ready. Real (symphonia) decode
-//!   lands in a later PR but the contract is identical: the translator
-//!   doesn't issue `DeckLoadBuffer` until a buffer-id is in hand.
+//! * **DeckLoad** — the event itself signals "start decoding". The
+//!   translator calls `DecodeService::open()`, which spawns a
+//!   per-track decoder thread off the control plane and returns a
+//!   `DecodeHandle`. The translator emits an
+//!   `AudioCommandKind::DeckLoad { deck, handle }` for the audio
+//!   thread to start pulling streaming frames via
+//!   `DecodeService::read`. See `decode.rs` for the streaming pipeline.
 //! * **TakeOver** — emits two commands (no immediate audio side effect
 //!   on the deck's current envelope): `ArmHandoff` (so the audio thread
 //!   knows the 1-bar window) + `CancelAfter` (so queued AI commands
@@ -69,7 +70,7 @@ pub fn event_to_commands(
     ev: &Event,
     now_frame: u64,
     sample_rate: u32,
-    decode: &mut dyn DecodeService,
+    decode: &dyn DecodeService,
 ) -> AudioCmdBatch {
     let mut out: AudioCmdBatch = SmallVec::new();
     let ramp = ramp_frames(sample_rate);
@@ -170,19 +171,33 @@ pub fn event_to_commands(
             });
         }
         EventKind::DeckLoad { deck, track, .. } => {
-            // Ask the (stub) decode service for a buffer id. For v0.1
-            // this synchronously allocates a sine-wave buffer; later
-            // PRs will move real decode off the control thread too.
-            // The id we get back is opaque — the audio thread looks it
-            // up by index.
-            let buffer_id = decode.decode_track(&track.id, &track.path, sample_rate);
-            out.push(AudioCommand {
-                at_frame: now_frame,
-                kind: AudioCommandKind::DeckLoadBuffer {
-                    deck: *deck,
-                    buffer_id,
-                },
-            });
+            // Ask the streaming decode service to open the track. The
+            // service spawns a decoder thread off the control plane;
+            // the returned handle is what the audio thread reads
+            // from in subsequent render calls. `open` errors land
+            // here as `tracing::warn!` + no command emitted — the UI
+            // sees a no-op load (issue #TBD: surface load errors via
+            // an engine event).
+            match decode.open(track, sample_rate) {
+                Ok(handle) => {
+                    out.push(AudioCommand {
+                        at_frame: now_frame,
+                        kind: AudioCommandKind::DeckLoad {
+                            deck: *deck,
+                            handle,
+                        },
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "decode",
+                        track_id = %track.id,
+                        path = %track.path,
+                        error = ?e,
+                        "DecodeService::open failed — deck will not load",
+                    );
+                }
+            }
         }
         EventKind::DeckUnload { deck } => {
             out.push(AudioCommand {
@@ -283,8 +298,8 @@ mod tests {
     }
 
     fn translate(prev: &EngineState, next: &EngineState, e: &Event, now: u64) -> AudioCmdBatch {
-        let mut decode = StubDecodeService::new();
-        event_to_commands(prev, next, e, now, SR, &mut decode)
+        let decode = StubDecodeService::new();
+        event_to_commands(prev, next, e, now, SR, &decode)
     }
 
     #[test]
@@ -451,14 +466,14 @@ mod tests {
         let cmds = translate(&prev, &next, &e, 0);
         assert_eq!(cmds.len(), 1);
         match cmds[0].kind {
-            AudioCommandKind::DeckLoadBuffer { deck, buffer_id } => {
+            AudioCommandKind::DeckLoad { deck, handle } => {
                 assert_eq!(deck, DeckId::B);
                 assert!(
-                    buffer_id.0 > 0,
-                    "stub decode service should hand out non-zero ids"
+                    handle.is_some(),
+                    "stub decode service should hand out valid handles"
                 );
             }
-            other => panic!("expected DeckLoadBuffer, got {other:?}"),
+            other => panic!("expected DeckLoad, got {other:?}"),
         }
     }
 
@@ -482,8 +497,13 @@ mod tests {
     }
 
     #[test]
-    fn buffer_id_emitted_is_stable() {
-        // Same path → same id (stub registry is content-addressed by id).
+    fn deck_load_emits_valid_handle_each_call() {
+        // Streaming decode model: every `open` spawns a fresh
+        // decoder thread + returns a fresh handle. This is a
+        // deliberate change from the v0.1 pre-decoded-buffer cache
+        // (which content-addressed by track id) — re-loading the
+        // same track yields a new handle so seek state, etc., is
+        // fresh.
         let prev = EngineState::default();
         let make = |id: u64| {
             ev(
@@ -503,17 +523,18 @@ mod tests {
         let e2 = make(2);
         let next1 = prev.apply(&e1);
         let next2 = next1.apply(&e2);
-        let mut decode = StubDecodeService::new();
-        let cmds1 = event_to_commands(&prev, &next1, &e1, 0, SR, &mut decode);
-        let cmds2 = event_to_commands(&next1, &next2, &e2, 0, SR, &mut decode);
+        let decode = StubDecodeService::new();
+        let cmds1 = event_to_commands(&prev, &next1, &e1, 0, SR, &decode);
+        let cmds2 = event_to_commands(&next1, &next2, &e2, 0, SR, &decode);
         let id1 = match cmds1[0].kind {
-            AudioCommandKind::DeckLoadBuffer { buffer_id, .. } => buffer_id,
+            AudioCommandKind::DeckLoad { handle, .. } => handle,
             _ => unreachable!(),
         };
         let id2 = match cmds2[0].kind {
-            AudioCommandKind::DeckLoadBuffer { buffer_id, .. } => buffer_id,
+            AudioCommandKind::DeckLoad { handle, .. } => handle,
             _ => unreachable!(),
         };
-        assert_eq!(id1, id2, "stub decode should cache by track id");
+        assert!(id1.is_some());
+        assert!(id2.is_some());
     }
 }

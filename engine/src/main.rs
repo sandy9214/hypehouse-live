@@ -17,11 +17,12 @@
 use anyhow::Result;
 use crossbeam::channel::{self, Receiver};
 use hypehouse_engine::audio::{
-    event_to_commands, io::spawn_audio_thread, AudioProducer, AudioRing, EngineClock,
-    StubDecodeService,
+    event_to_commands, io::spawn_audio_thread, AudioProducer, AudioRing, DecodeService,
+    EngineClock, SymphoniaDecodeService,
 };
 use hypehouse_engine::bridge::{self, EngineHandle};
 use hypehouse_engine::state::{EngineState, Event};
+use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -46,9 +47,17 @@ async fn main() -> Result<()> {
     // control thread for command scheduling.
     let clock = EngineClock::new(48_000, 120.0);
 
+    // Streaming decode service. One service, two clones:
+    //   - audio thread (via the mixer) calls `read` to pull frames.
+    //   - control thread (via the translator) calls `open`/`close`.
+    // Both are alloc-free where it matters; see `decode.rs` module
+    // docs.
+    let decode_service: Arc<dyn DecodeService> = Arc::new(SymphoniaDecodeService::new());
+
     // Spawn the audio thread (cpal stream). Holds the stream alive
-    // for the duration of `main`.
-    let stream = spawn_audio_thread(consumer, clock.shared.clone())?;
+    // for the duration of `main`. The mixer carries an Arc clone of
+    // the decode service so cpal's callback can pull stereo frames.
+    let stream = spawn_audio_thread(consumer, clock.shared.clone(), Arc::clone(&decode_service))?;
     info!(
         sample_rate = stream.sample_rate,
         channels = stream.channels,
@@ -62,7 +71,10 @@ async fn main() -> Result<()> {
     // Control-thread loop runs on a dedicated OS thread so it doesn't
     // block the async runtime.
     let sample_rate = stream.sample_rate;
-    std::thread::spawn(move || control_loop(event_rx, producer, clock, sample_rate));
+    let decode_for_control = Arc::clone(&decode_service);
+    std::thread::spawn(move || {
+        control_loop(event_rx, producer, clock, sample_rate, decode_for_control)
+    });
 
     // Bridge handle is wired to the control-loop event channel so every
     // accepted `engine.submit_event` RPC flows into `event_rx`. Cloning
@@ -97,14 +109,14 @@ fn control_loop(
     mut producer: AudioProducer,
     clock: EngineClock,
     sample_rate: u32,
+    decode: Arc<dyn DecodeService>,
 ) {
     let mut state = EngineState::default();
-    let mut decode = StubDecodeService::new();
 
     while let Ok(ev) = event_rx.recv() {
         let next = state.apply(&ev);
         let now_frame = clock.frame();
-        let cmds = event_to_commands(&state, &next, &ev, now_frame, sample_rate, &mut decode);
+        let cmds = event_to_commands(&state, &next, &ev, now_frame, sample_rate, decode.as_ref());
         for cmd in cmds.into_iter() {
             if let Err(dropped) = producer.try_push(cmd) {
                 warn!(

@@ -16,11 +16,13 @@
 //! * No blocking — no I/O, no `println!`, no panic-on-error logging
 //!   (errors are silently coalesced).
 
+use std::sync::Arc;
+
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SampleFormat, Stream, StreamConfig};
 
-use crate::audio::{AudioConsumer, AudioMixer, SharedClock};
+use crate::audio::{AudioConsumer, AudioMixer, DecodeService, SharedClock};
 
 /// Owns the cpal `Stream` (which keeps the audio callback alive). When
 /// the handle is dropped the stream is torn down + the OS thread joins.
@@ -35,6 +37,7 @@ pub struct AudioStreamHandle {
 pub fn spawn_audio_thread(
     consumer: AudioConsumer,
     clock: SharedClock,
+    decode: Arc<dyn DecodeService>,
 ) -> Result<AudioStreamHandle> {
     let host = cpal::default_host();
     let device = host
@@ -50,7 +53,7 @@ pub fn spawn_audio_thread(
     let sample_format = supported.sample_format();
     let config: StreamConfig = supported.into();
 
-    let mixer = AudioMixer::new(sample_rate);
+    let mixer = AudioMixer::with_decode(sample_rate, decode);
 
     // Hand the consumer + mixer + clock to the callback. cpal callbacks
     // must be `Send + 'static`; we move owned values in.

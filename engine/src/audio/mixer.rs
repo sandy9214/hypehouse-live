@@ -12,8 +12,22 @@
 //! Real per-track sample playback lands in a later PR; this PR proves
 //! the wire is end-to-end functional.
 
-use crate::audio::command::{AudioCommand, AudioCommandKind, BufferId};
+use std::sync::Arc;
+
+use crate::audio::command::{AudioCommand, AudioCommandKind};
+use crate::audio::decode::{DecodeHandle, DecodeService};
 use crate::state::DeckId;
+
+/// Per-callback scratch stride used when pulling stereo samples from
+/// the decode service. 256 stereo frames = 512 interleaved f32 = ~5 ms
+/// @ 48 kHz. Fits in `MAX_STEREO_SCRATCH` below.
+const STEREO_PULL_FRAMES: usize = 256;
+
+/// Hard cap on the per-render stereo scratch buffer. Single render
+/// call cannot pull more than this from the decoder in one go;
+/// `AudioMixer::render` slices the output into chunks of at most
+/// `MAX_STEREO_SCRATCH / 2` mono frames.
+const MAX_STEREO_SCRATCH: usize = 8192;
 
 /// Per-deck audio-thread hot state.
 #[derive(Clone, Copy, Debug)]
@@ -27,10 +41,11 @@ struct DeckHot {
     gain: f32,
     /// 1-bar handoff envelope end (ADR-005); 0 = no handoff active.
     handoff_until_frame: u64,
-    /// Currently loaded buffer id (informational — not yet used to
-    /// render in v0.1 since the oscillator is the sound source). Real
-    /// playback lands in a later PR.
-    loaded_buffer: Option<BufferId>,
+    /// Decode handle bound to this deck (`DecodeHandle::NONE` if no
+    /// track loaded). When `Some + playing`, the mixer pulls stereo
+    /// frames from the decode service instead of running the
+    /// fallback oscillator.
+    loaded: DecodeHandle,
 }
 
 impl DeckHot {
@@ -41,18 +56,30 @@ impl DeckHot {
             freq_hz,
             gain: 1.0,
             handoff_until_frame: 0,
-            loaded_buffer: None,
+            loaded: DecodeHandle::NONE,
         }
     }
 }
 
 /// Audio-thread mixing state. Lives behind the cpal callback. Never
 /// allocates after construction.
+///
+/// Holds an `Arc<dyn DecodeService>` so the cpal callback can pull
+/// streaming samples for any currently-loaded deck. The decode
+/// service's `read` is contractually alloc-free + lock-free
+/// (`SymphoniaDecodeService` uses an `ArrayQueue` SPSC under the
+/// hood); see `decode.rs` module docs.
 pub struct AudioMixer {
     sample_rate: u32,
     crossfader: f32,
     deck_a: DeckHot,
     deck_b: DeckHot,
+    /// Streaming decode service. None → fallback oscillator path
+    /// (used by tests that don't wire a real service).
+    decode: Option<Arc<dyn DecodeService>>,
+    /// Per-render scratch buffer for stereo pulls. Allocated once at
+    /// construction; the render loop only writes into a prefix of it.
+    stereo_scratch: [f32; MAX_STEREO_SCRATCH],
 }
 
 impl AudioMixer {
@@ -62,7 +89,18 @@ impl AudioMixer {
             crossfader: 0.5,
             deck_a: DeckHot::new(440.0),
             deck_b: DeckHot::new(220.0),
+            decode: None,
+            stereo_scratch: [0.0; MAX_STEREO_SCRATCH],
         }
+    }
+
+    /// Construct a mixer wired to a real decode service. Production
+    /// path (`main.rs`); tests use `AudioMixer::new` to keep behaviour
+    /// identical to v0.1 (oscillator-only).
+    pub fn with_decode(sample_rate: u32, decode: Arc<dyn DecodeService>) -> Self {
+        let mut m = Self::new(sample_rate);
+        m.decode = Some(decode);
+        m
     }
 
     /// Apply a single audio command. **Audio-thread side.** Must NOT
@@ -104,12 +142,12 @@ impl AudioMixer {
             AudioCommandKind::LoopArm { .. } | AudioCommandKind::LoopDisarm { .. } => {
                 // v0.1: loops require buffer playback; no-op.
             }
-            AudioCommandKind::DeckLoadBuffer { deck, buffer_id } => {
-                self.deck_mut(deck).loaded_buffer = Some(buffer_id);
+            AudioCommandKind::DeckLoad { deck, handle } => {
+                self.deck_mut(deck).loaded = handle;
             }
             AudioCommandKind::DeckUnload { deck } => {
                 let d = self.deck_mut(deck);
-                d.loaded_buffer = None;
+                d.loaded = DecodeHandle::NONE;
                 d.playing = false;
             }
             AudioCommandKind::ArmHandoff { deck, until_frame } => {
@@ -124,17 +162,49 @@ impl AudioMixer {
         }
     }
 
-    /// Render `frames` mono samples into `out`. **Audio-thread side.**
-    /// Alloc-free.
+    /// Render `out.len()` mono samples into `out`. **Audio-thread
+    /// side.** Alloc-free.
+    ///
+    /// For each deck:
+    /// * If the deck is playing AND has a `DecodeHandle` loaded AND
+    ///   the mixer has a decode service wired, pull stereo from the
+    ///   decoder and downmix to mono (L+R / 2). Apply per-deck gain.
+    /// * Otherwise, fall back to the v0.1 oscillator path. This keeps
+    ///   the existing translator + mixer tests (which exercise
+    ///   `DeckPlay` without a `DeckLoad`) passing.
     #[inline]
     pub fn render(&mut self, out: &mut [f32]) {
         let sr = self.sample_rate as f32;
-        for sample in out.iter_mut() {
-            let a = render_deck(&mut self.deck_a, sr);
-            let b = render_deck(&mut self.deck_b, sr);
-            // Crossfader: 0 = full A, 1 = full B (matches `EngineState`).
-            let mix = a * (1.0 - self.crossfader) + b * self.crossfader;
-            *sample = mix;
+        let mut written = 0usize;
+        while written < out.len() {
+            let chunk = (out.len() - written).min(STEREO_PULL_FRAMES);
+            // Pull each deck into its dedicated half of the stereo
+            // scratch buffer. Layout:
+            //   [0..chunk*2)        = deck A interleaved stereo
+            //   [chunk*2..chunk*4)  = deck B interleaved stereo
+            let a_end = chunk * 2;
+            let b_end = chunk * 4;
+            // Borrow-checker dance: do A then B via split_at_mut so
+            // each call has its own &mut slice.
+            let (a_slice, b_slice) = self.stereo_scratch[..b_end].split_at_mut(a_end);
+            let a_pulled = pull_deck(&self.decode, &self.deck_a, a_slice);
+            let b_pulled = pull_deck(&self.decode, &self.deck_b, b_slice);
+
+            for i in 0..chunk {
+                let a = if a_pulled {
+                    0.5 * (a_slice[i * 2] + a_slice[i * 2 + 1]) * self.deck_a.gain
+                } else {
+                    render_deck(&mut self.deck_a, sr)
+                };
+                let b = if b_pulled {
+                    0.5 * (b_slice[i * 2] + b_slice[i * 2 + 1]) * self.deck_b.gain
+                } else {
+                    render_deck(&mut self.deck_b, sr)
+                };
+                let mix = a * (1.0 - self.crossfader) + b * self.crossfader;
+                out[written + i] = mix;
+            }
+            written += chunk;
         }
     }
 
@@ -163,6 +233,26 @@ impl AudioMixer {
             DeckId::B => self.deck_b.handoff_until_frame,
         }
     }
+}
+
+/// Try to pull `dest.len()` (interleaved stereo) samples into `dest`
+/// for the given deck. Returns `true` if the decode pipeline supplied
+/// the data (i.e., deck is playing + has a loaded handle + a service
+/// is wired); `false` if the caller should fall back to the
+/// oscillator path.
+///
+/// `dest` is overwritten regardless — on `false` it's left in
+/// whatever state the caller can ignore.
+#[inline]
+fn pull_deck(decode: &Option<Arc<dyn DecodeService>>, deck: &DeckHot, dest: &mut [f32]) -> bool {
+    if !deck.playing || !deck.loaded.is_some() {
+        return false;
+    }
+    let Some(svc) = decode.as_ref() else {
+        return false;
+    };
+    let _ = svc.read(deck.loaded, dest);
+    true
 }
 
 #[inline]
