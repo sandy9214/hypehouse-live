@@ -7,7 +7,11 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   __resetEngineState,
+  __resetNowForTest,
+  __setNowForTest,
   applyNotification,
+  extrapolatedPosition,
+  setDeckDuration,
   useEngineState,
 } from "./engine";
 import { renderHook } from "@testing-library/react";
@@ -81,5 +85,144 @@ describe("engine store — master limiter", () => {
     });
     const { result } = renderHook(() => useEngineState());
     expect(result.current.master_limiter_gain_reduction_db).toBe(0);
+  });
+});
+
+describe("engine store — extrapolated position", () => {
+  let mockNow = 1_000_000;
+  const tick = (deltaMs: number): void => {
+    mockNow += deltaMs;
+  };
+
+  afterEach((): void => {
+    __resetEngineState();
+    __resetNowForTest();
+  });
+
+  const emitDeckA = (
+    position_ms: number,
+    playing: boolean,
+    tempo_ratio = 1.0,
+  ): void => {
+    applyNotification({
+      jsonrpc: "2.0",
+      method: "engine.state_changed",
+      params: {
+        state: {
+          decks: [
+            {
+              id: "A",
+              track_title: "demo",
+              bpm: 120,
+              position_ms,
+              playing,
+              eq_low: 0,
+              eq_mid: 0,
+              eq_high: 0,
+              pitch_semitones: 0,
+              tempo_ratio,
+              hot_cues: [null, null, null, null, null, null, null, null],
+              loop_in_ms: null,
+              loop_out_ms: null,
+              copilot_enabled: false,
+              effects: [
+                { effect_id: 0, params: {}, wet_dry: 0.5, enabled: false },
+                { effect_id: 0, params: {}, wet_dry: 0.5, enabled: false },
+                { effect_id: 0, params: {}, wet_dry: 0.5, enabled: false },
+              ],
+            },
+            {
+              id: "B",
+              track_title: null,
+              bpm: null,
+              position_ms: 0,
+              playing: false,
+              eq_low: 0,
+              eq_mid: 0,
+              eq_high: 0,
+              pitch_semitones: 0,
+              tempo_ratio: 1.0,
+              hot_cues: [null, null, null, null, null, null, null, null],
+              loop_in_ms: null,
+              loop_out_ms: null,
+              copilot_enabled: false,
+              effects: [
+                { effect_id: 0, params: {}, wet_dry: 0.5, enabled: false },
+                { effect_id: 0, params: {}, wet_dry: 0.5, enabled: false },
+                { effect_id: 0, params: {}, wet_dry: 0.5, enabled: false },
+              ],
+            },
+          ],
+        },
+        last_event_id: 1,
+      },
+    });
+  };
+
+  it("returns 0 when the deck has never received a state push", (): void => {
+    mockNow = 1_000_000;
+    __setNowForTest((): number => mockNow);
+    expect(extrapolatedPosition("A")).toBe(0);
+  });
+
+  it("returns last-reported position when the deck is paused", (): void => {
+    mockNow = 1_000_000;
+    __setNowForTest((): number => mockNow);
+    emitDeckA(12_345, false);
+    tick(5_000); // wall clock advances 5s
+    expect(extrapolatedPosition("A", 60_000)).toBe(12_345);
+  });
+
+  it("advances position between state_changed pushes when playing", (): void => {
+    mockNow = 1_000_000;
+    __setNowForTest((): number => mockNow);
+    emitDeckA(10_000, true); // 10s in, playing at 1x
+    tick(200); // simulate 200ms gap before next server push
+    const pos = extrapolatedPosition("A", 60_000);
+    expect(pos).toBe(10_200);
+  });
+
+  it("scales advancement by tempo_ratio (1.05 = +5%)", (): void => {
+    mockNow = 1_000_000;
+    __setNowForTest((): number => mockNow);
+    emitDeckA(10_000, true, 1.05);
+    tick(1_000); // 1s wall
+    // 1000 × 1.05 = 1050 ms of musical time advanced.
+    expect(extrapolatedPosition("A", 60_000)).toBe(11_050);
+  });
+
+  it("clamps extrapolated position to track duration", (): void => {
+    mockNow = 1_000_000;
+    __setNowForTest((): number => mockNow);
+    emitDeckA(59_800, true);
+    tick(5_000); // would advance to 64_800
+    expect(extrapolatedPosition("A", 60_000)).toBe(60_000);
+  });
+
+  it("re-anchors on each state_changed so drift never accumulates", (): void => {
+    mockNow = 1_000_000;
+    __setNowForTest((): number => mockNow);
+    emitDeckA(10_000, true);
+    tick(300);
+    expect(extrapolatedPosition("A", 60_000)).toBe(10_300);
+    emitDeckA(11_000, true); // server says "actually at 11s"
+    tick(100);
+    expect(extrapolatedPosition("A", 60_000)).toBe(11_100);
+  });
+
+  it("setDeckDuration primes the anchor before any state push", (): void => {
+    mockNow = 1_000_000;
+    __setNowForTest((): number => mockNow);
+    setDeckDuration("A", 60_000);
+    // No state push yet → deck position is 0 (default), pause-snapshot.
+    expect(extrapolatedPosition("A")).toBe(0);
+  });
+
+  it("never returns a negative position", (): void => {
+    mockNow = 1_000_000;
+    __setNowForTest((): number => mockNow);
+    emitDeckA(50, false);
+    // Even with a stale anchor and zero duration, never go negative.
+    expect(extrapolatedPosition("A", 0)).toBeGreaterThanOrEqual(0);
   });
 });

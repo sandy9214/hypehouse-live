@@ -6,10 +6,11 @@
 // Sub-rows (transport buttons, knob row, hot-cue grid) live in
 // DeckControls.tsx; this file owns the layout + RPC-emit wiring.
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties, DragEvent as ReactDragEvent, JSX } from "react";
 import type { JsonRpcWS } from "../ws/client";
 import type { Deck as DeckState } from "../store/engine";
+import { extrapolatedPosition, setDeckDuration } from "../store/engine";
 import type { LibraryTrack } from "../store/library";
 import { Waveform } from "./Waveform";
 import {
@@ -111,6 +112,33 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
   useEffect((): void => {
     if (!loaded) setDurationMs(0);
   }, [loaded]);
+  // Beat-grid metadata captured at DeckLoad — engine state mirror doesn't
+  // carry these (they're library-side analyzer output forwarded into the
+  // DeckLoad event payload). Kept in component state so the scrolling
+  // Waveform can overlay beat + downbeat markers.
+  const [beatAnchorMs, setBeatAnchorMs] = useState<number>(0);
+  const [beatPeriodMs, setBeatPeriodMs] = useState<number>(0);
+  const [downbeatsMs, setDownbeatsMs] = useState<ReadonlyArray<number>>([]);
+  useEffect((): void => {
+    if (!loaded) {
+      setBeatAnchorMs(0);
+      setBeatPeriodMs(0);
+      setDownbeatsMs([]);
+    }
+  }, [loaded]);
+  // Register duration with the engine store so `extrapolatedPosition`
+  // clamps correctly. Re-fires on duration change (track swap).
+  useEffect((): void => {
+    setDeckDuration(deck.id, durationMs);
+  }, [deck.id, durationMs]);
+
+  // rAF position provider: read freshly from the store every frame so
+  // the playhead stays smooth between sparse `state_changed` pushes.
+  // Memoised — the Waveform latches it into a ref internally.
+  const positionProvider = useMemo(
+    (): (() => number) => (): number => extrapolatedPosition(deck.id, durationMs),
+    [deck.id, durationMs],
+  );
 
   const onPlayPause = (): void => {
     if (!loaded) return;
@@ -210,6 +238,12 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
     // itself. Engine state mirror doesn't carry duration — it isn't
     // needed by the audio thread, only by the visualiser.
     setDurationMs(Math.round((track.duration_s ?? 0) * 1000));
+    // Snapshot beat-grid metadata for the scrolling waveform overlay.
+    // These are library-side analyzer outputs not echoed in the engine
+    // state mirror; the visualiser is the only consumer.
+    setBeatAnchorMs(track.beat_grid_anchor_ms);
+    setBeatPeriodMs(track.beat_period_ms);
+    setDownbeatsMs(track.downbeats_ms);
   };
 
   return (
@@ -237,6 +271,11 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
         peaks={peaks}
         positionMs={deck.position_ms}
         durationMs={durationMs}
+        mode="scroll"
+        beatGridAnchorMs={beatAnchorMs}
+        beatPeriodMs={beatPeriodMs}
+        downbeatsMs={downbeatsMs}
+        positionProvider={positionProvider}
       />
 
       <TransportRow

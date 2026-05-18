@@ -1,204 +1,250 @@
-// Waveform.tsx — real min/max peak-pair waveform renderer.
+// Waveform.tsx — full-track + scrolling renderer with playhead.
 //
-// ADR-001 keeps the audio path inside the Rust engine; the UI only
-// visualises. Peaks are computed copilot-side at ingest time (see
-// `copilot/waveform.py`) and fetched via `library.get_waveform` —
-// this component never touches PCM directly.
+// "full"   — whole track painted across canvas, playhead slides.
+// "scroll" — pro-DJ: playhead pinned at canvas centre, peaks scroll under
+//            it. Beat-grid + downbeats overlaid. rAF loop reads
+//            `positionProvider` (extrapolated position from
+//            store/engine.ts) so playhead stays smooth between
+//            state_changed pushes (~5 Hz) at ~60 fps.
 //
-// Render contract:
-//   * Accept `peaks: Int8Array | null`. Each pair (i*2, i*2+1) is the
-//     (min, max) of one time bucket, value range [-128, 127].
-//   * Drawing model: per x-pixel, pick a bucket index proportional to
-//     x/width, draw a vertical line from `min_y` to `max_y`. Centre
-//     horizontal line at y=height/2 (the audio zero).
-//   * Playhead: vertical white line at `position_ms / duration_ms * width`.
-//   * No peaks (null): show a flat midline — same v0.1 fallback.
-//   * Colour theme: blue gradient (light at top, dark at bottom).
-//
-// Why no off-screen canvas / dirty rect tracking: a 480-px-wide canvas
-// at 2000 buckets is ~480 draw calls per frame, ~30 µs on modern
-// hardware. The position-cursor re-draw on every state_changed tick
-// is the dominant cost and we already redraw the full canvas anyway.
-// Skip the complexity until profiling says otherwise.
+// Perf: peaks useMemo'd by identity; props latched into a ref so the rAF
+// closure isn't re-armed on every prop change.
 
 import { useEffect, useMemo, useRef } from "react";
 import type { CSSProperties, JSX } from "react";
 
+export type WaveformMode = "full" | "scroll";
+
 export interface WaveformProps {
-  /** Packed min/max peak pairs (2*N i8 bytes). `null` ⇒ render flat. */
   peaks: Int8Array | null;
-  /** Current playhead position in milliseconds. */
   positionMs?: number;
-  /** Track duration in milliseconds — used to position the playhead. */
   durationMs?: number;
   height?: number;
   width?: number;
+  mode?: WaveformMode;
+  beatGridAnchorMs?: number;
+  beatPeriodMs?: number;
+  downbeatsMs?: ReadonlyArray<number>;
+  /** Per-frame position provider (rAF reads this). Falls back to `positionMs`. */
+  positionProvider?: () => number;
 }
 
-// Blue gradient — light at top, dark at bottom. Pulled out so tests
-// can assert the stops are present without hard-coding hex bytes
-// inside the draw call.
 export const WAVEFORM_GRADIENT_TOP = "#6ab0ff";
 export const WAVEFORM_GRADIENT_BOTTOM = "#0a2540";
 export const WAVEFORM_CENTER_LINE = "#3a5070";
 export const WAVEFORM_PLAYHEAD = "#ffffff";
 export const WAVEFORM_BG = "#101820";
+export const WAVEFORM_BG_SCROLL = "#050b18";
+export const WAVEFORM_PEAK_SCROLL = "#3aa0ff";
+export const WAVEFORM_BEAT = "#5a6b80";
+export const WAVEFORM_DOWNBEAT = "#ffffff";
+export const SCROLL_HALF_WINDOW_MS = 5_000;
+type Ctx = CanvasRenderingContext2D;
 
-const canvasStyle: CSSProperties = {
-  display: "block",
-  background: WAVEFORM_BG,
-};
+const canvasStyle: CSSProperties = { display: "block", background: WAVEFORM_BG };
 
-/**
- * Convert an i8 peak value (-128..=127) to a y-coordinate in canvas
- * space (0..=height). Pulled out so the test suite can verify the
- * mapping without rendering a real canvas.
- */
-export const peakToY = (peak: number, height: number): number => {
-  // Map [-128, 127] → [0, height]. Audio min (-128) draws at the
-  // bottom (y = height); audio max (127) draws at the top (y = 0).
-  // Visually: louder negative excursions extend downward.
-  const norm = (peak + 128) / 255; // [0, 1]
-  return Math.round((1 - norm) * height);
-};
+export const peakToY = (peak: number, h: number): number =>
+  Math.round((1 - (peak + 128) / 255) * h);
 
-/**
- * Compute the x-pixel of the playhead given a position + duration.
- * Returns `null` when the math is undefined (duration ≤ 0) so the
- * caller can skip drawing rather than render at x=0.
- */
 export const playheadX = (
-  positionMs: number,
-  durationMs: number,
-  width: number,
+  positionMs: number, durationMs: number, width: number,
 ): number | null => {
   if (durationMs <= 0) return null;
-  const clamped = Math.max(0, Math.min(positionMs, durationMs));
-  return Math.round((clamped / durationMs) * width);
+  const c = Math.max(0, Math.min(positionMs, durationMs));
+  return Math.round((c / durationMs) * width);
 };
 
-const drawFlat = (
-  ctx: CanvasRenderingContext2D,
-  width: number,
-  height: number,
-): void => {
-  ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = WAVEFORM_BG;
-  ctx.fillRect(0, 0, width, height);
+/** ms -> canvas x in scroll mode. NaN if out of visible window. */
+export const scrollXForMs = (
+  ms: number, centerMs: number, width: number,
+  halfWindowMs: number = SCROLL_HALF_WINDOW_MS,
+): number => {
+  const dx = ms - centerMs;
+  if (dx < -halfWindowMs || dx > halfWindowMs) return Number.NaN;
+  return width / 2 + (dx / halfWindowMs) * (width / 2);
+};
+
+/** ms -> "bar.beat" (1-indexed). */
+export const barBeatLabel = (
+  positionMs: number, anchorMs: number, periodMs: number,
+): string => {
+  if (periodMs <= 0) return "";
+  const beats = Math.floor((positionMs - anchorMs) / periodMs);
+  if (!Number.isFinite(beats)) return "";
+  const bar = Math.floor(beats / 4) + 1;
+  const beat = (((beats % 4) + 4) % 4) + 1;
+  return `${bar}.${beat}`;
+};
+
+const paintBg = (ctx: Ctx, w: number, h: number, bg: string): void => {
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, w, h);
   ctx.strokeStyle = WAVEFORM_CENTER_LINE;
   ctx.lineWidth = 1;
   ctx.beginPath();
-  ctx.moveTo(0, height / 2);
-  ctx.lineTo(width, height / 2);
+  ctx.moveTo(0, h / 2);
+  ctx.lineTo(w, h / 2);
   ctx.stroke();
 };
 
-const drawPeaks = (
-  ctx: CanvasRenderingContext2D,
-  peaks: Int8Array,
-  width: number,
-  height: number,
-): void => {
-  ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = WAVEFORM_BG;
-  ctx.fillRect(0, 0, width, height);
+const drawFlat = (ctx: Ctx, w: number, h: number, bg: string): void =>
+  paintBg(ctx, w, h, bg);
 
+const paintColumn = (ctx: Ctx, peaks: Int8Array, idx: number, x: number, h: number): void => {
+  const yMax = peakToY(peaks[idx * 2 + 1] ?? 0, h);
+  const yMin = peakToY(peaks[idx * 2] ?? 0, h);
+  if (yMax === yMin) return;
+  ctx.moveTo(x + 0.5, yMax);
+  ctx.lineTo(x + 0.5, yMin);
+};
+
+const drawPeaksFull = (ctx: Ctx, peaks: Int8Array, w: number, h: number): void => {
   const pairCount = Math.floor(peaks.length / 2);
-  if (pairCount === 0) {
-    drawFlat(ctx, width, height);
-    return;
-  }
-
-  // Centre line first so it sits behind the bars visually.
-  ctx.strokeStyle = WAVEFORM_CENTER_LINE;
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(0, height / 2);
-  ctx.lineTo(width, height / 2);
-  ctx.stroke();
-
-  // Blue gradient — top is bright, bottom is dark. Painted into a
-  // strokeStyle by building a vertical gradient. createLinearGradient
-  // coordinates are canvas-space (x0, y0, x1, y1).
-  const grad = ctx.createLinearGradient(0, 0, 0, height);
+  if (pairCount === 0) return drawFlat(ctx, w, h, WAVEFORM_BG);
+  paintBg(ctx, w, h, WAVEFORM_BG);
+  const grad = ctx.createLinearGradient(0, 0, 0, h);
   grad.addColorStop(0, WAVEFORM_GRADIENT_TOP);
   grad.addColorStop(1, WAVEFORM_GRADIENT_BOTTOM);
   ctx.strokeStyle = grad;
   ctx.beginPath();
-  for (let x = 0; x < width; x++) {
-    // Pick the bucket index proportional to x/width. Float floor
-    // gives a stable mapping for any (width, pairCount) ratio.
-    const idx = Math.min(
-      pairCount - 1,
-      Math.floor((x / width) * pairCount),
-    );
-    const minPeak = peaks[idx * 2] ?? 0;
-    const maxPeak = peaks[idx * 2 + 1] ?? 0;
-    const yMax = peakToY(maxPeak, height); // top of bar (audio max)
-    const yMin = peakToY(minPeak, height); // bottom of bar (audio min)
-    // Skip degenerate buckets (silent region) — they'd paint a 1px dot
-    // on the centre line which the centre-line draw already covered.
-    if (yMax === yMin) continue;
-    ctx.moveTo(x + 0.5, yMax);
-    ctx.lineTo(x + 0.5, yMin);
+  for (let x = 0; x < w; x++) {
+    const idx = Math.min(pairCount - 1, Math.floor((x / w) * pairCount));
+    paintColumn(ctx, peaks, idx, x, h);
   }
   ctx.stroke();
 };
 
-const drawPlayhead = (
-  ctx: CanvasRenderingContext2D,
-  x: number,
-  height: number,
+const drawPeaksScroll = (
+  ctx: Ctx, peaks: Int8Array, w: number, h: number,
+  centerMs: number, durationMs: number,
 ): void => {
-  ctx.strokeStyle = WAVEFORM_PLAYHEAD;
-  ctx.lineWidth = 1;
+  const pairCount = Math.floor(peaks.length / 2);
+  if (pairCount === 0 || durationMs <= 0)
+    return drawFlat(ctx, w, h, WAVEFORM_BG_SCROLL);
+  paintBg(ctx, w, h, WAVEFORM_BG_SCROLL);
+  ctx.strokeStyle = WAVEFORM_PEAK_SCROLL;
   ctx.beginPath();
-  ctx.moveTo(x + 0.5, 0);
-  ctx.lineTo(x + 0.5, height);
+  const msPerPx = (2 * SCROLL_HALF_WINDOW_MS) / w;
+  for (let x = 0; x < w; x++) {
+    const ms = centerMs + (x - w / 2) * msPerPx;
+    if (ms < 0 || ms > durationMs) continue;
+    const idx = Math.min(pairCount - 1, Math.floor((ms / durationMs) * pairCount));
+    paintColumn(ctx, peaks, idx, x, h);
+  }
   ctx.stroke();
 };
 
+const vline = (ctx: Ctx, x: number, h: number): void => {
+  const xp = Math.round(x) + 0.5;
+  ctx.moveTo(xp, 0);
+  ctx.lineTo(xp, h);
+};
+
+const drawBeatGrid = (
+  ctx: Ctx, w: number, h: number,
+  centerMs: number, anchorMs: number, periodMs: number,
+  downbeats: ReadonlyArray<number>,
+): void => {
+  if (periodMs <= 0) return;
+  const startMs = centerMs - SCROLL_HALF_WINDOW_MS;
+  const endMs = centerMs + SCROLL_HALF_WINDOW_MS;
+  ctx.strokeStyle = WAVEFORM_BEAT;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  const firstN = Math.ceil((startMs - anchorMs) / periodMs);
+  const lastN = Math.floor((endMs - anchorMs) / periodMs);
+  for (let n = firstN; n <= lastN; n++) {
+    const x = scrollXForMs(anchorMs + n * periodMs, centerMs, w);
+    if (Number.isFinite(x)) vline(ctx, x, h);
+  }
+  ctx.stroke();
+  if (downbeats.length === 0) return;
+  ctx.strokeStyle = WAVEFORM_DOWNBEAT;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (const ms of downbeats) {
+    if (ms < startMs || ms > endMs) continue;
+    const x = scrollXForMs(ms, centerMs, w);
+    if (Number.isFinite(x)) vline(ctx, x, h);
+  }
+  ctx.stroke();
+  ctx.lineWidth = 1;
+};
+
+const drawPlayhead = (ctx: Ctx, x: number, h: number): void => {
+  ctx.strokeStyle = WAVEFORM_PLAYHEAD;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  vline(ctx, x, h);
+  ctx.stroke();
+};
+
+const labelStyle: CSSProperties = {
+  position: "absolute", left: "50%", top: 2, transform: "translateX(-50%)",
+  color: WAVEFORM_PLAYHEAD, fontFamily: "monospace", fontSize: 10,
+  pointerEvents: "none", background: "rgba(0,0,0,0.5)",
+  padding: "1px 4px", borderRadius: 2,
+};
+
 export const Waveform = ({
-  peaks,
-  positionMs = 0,
-  durationMs = 0,
-  height = 96,
-  width = 480,
+  peaks, positionMs = 0, durationMs = 0, height = 96, width = 480,
+  mode = "scroll", beatGridAnchorMs = 0, beatPeriodMs = 0,
+  downbeatsMs, positionProvider,
 }: WaveformProps): JSX.Element => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-
-  // Memoize the peaks reference so an upstream re-render that hands us
-  // the same Int8Array doesn't trigger a redraw cascade. Identity is
-  // enough — the array contents are immutable per ``waveform.ts``
-  // cache semantics.
+  const labelRef = useRef<HTMLSpanElement | null>(null);
   const stablePeaks = useMemo((): Int8Array | null => peaks, [peaks]);
+  const stableDownbeats = useMemo(
+    (): ReadonlyArray<number> => downbeatsMs ?? [], [downbeatsMs],
+  );
+  const propsRef = useRef({ positionMs, durationMs, beatGridAnchorMs, beatPeriodMs, positionProvider });
+  propsRef.current = { positionMs, durationMs, beatGridAnchorMs, beatPeriodMs, positionProvider };
 
-  useEffect((): void => {
+  useEffect((): (() => void) | void => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-
-    if (!stablePeaks || stablePeaks.length === 0) {
-      drawFlat(ctx, width, height);
-    } else {
-      drawPeaks(ctx, stablePeaks, width, height);
+    if (mode === "full") {
+      if (!stablePeaks || stablePeaks.length === 0)
+        drawFlat(ctx, width, height, WAVEFORM_BG);
+      else drawPeaksFull(ctx, stablePeaks, width, height);
+      const px = playheadX(propsRef.current.positionMs, propsRef.current.durationMs, width);
+      if (px !== null) drawPlayhead(ctx, px, height);
+      return;
     }
-
-    const px = playheadX(positionMs, durationMs, width);
-    if (px !== null) drawPlayhead(ctx, px, height);
-  }, [stablePeaks, positionMs, durationMs, width, height]);
+    let raf = 0;
+    const tick = (): void => {
+      const p = propsRef.current;
+      const center = p.positionProvider ? p.positionProvider() : p.positionMs;
+      if (!stablePeaks || stablePeaks.length === 0)
+        drawFlat(ctx, width, height, WAVEFORM_BG_SCROLL);
+      else drawPeaksScroll(ctx, stablePeaks, width, height, center, p.durationMs);
+      drawBeatGrid(ctx, width, height, center, p.beatGridAnchorMs, p.beatPeriodMs, stableDownbeats);
+      drawPlayhead(ctx, Math.round(width / 2), height);
+      if (labelRef.current)
+        labelRef.current.textContent = barBeatLabel(center, p.beatGridAnchorMs, p.beatPeriodMs);
+      raf = requestAnimationFrame(tick);
+    };
+    tick();
+    return (): void => cancelAnimationFrame(raf);
+  }, [stablePeaks, stableDownbeats, mode, width, height]);
 
   return (
-    <canvas
-      ref={canvasRef}
-      width={width}
-      height={height}
-      data-testid="waveform-canvas"
-      data-has-peaks={
-        stablePeaks !== null && stablePeaks.length > 0 ? "true" : "false"
-      }
-      style={canvasStyle}
-    />
+    <div style={{ position: "relative", width, height, display: "inline-block" }}>
+      <canvas
+        ref={canvasRef}
+        width={width}
+        height={height}
+        data-testid="waveform-canvas"
+        data-mode={mode}
+        data-has-peaks={stablePeaks !== null && stablePeaks.length > 0 ? "true" : "false"}
+        style={canvasStyle}
+      />
+      {mode === "scroll" ? (
+        <span ref={labelRef} data-testid="waveform-barbeat" style={labelStyle} />
+      ) : null}
+    </div>
   );
 };
