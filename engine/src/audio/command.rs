@@ -213,6 +213,22 @@ pub enum AudioCommandKind {
         a: u8,
         b: u8,
     },
+    /// ADR-006 — attach (or replace) a per-slot LFO. `LfoConfig` is
+    /// `Copy + Send + Sync + 'static` so the variant respects the
+    /// `AudioCommand` POD contract. The audio thread copies the
+    /// config into the slot's `FxBank.lfo` field — no allocation, no
+    /// lock.
+    EffectLfoSet {
+        deck: DeckId,
+        slot: u8,
+        config: crate::audio::effects::LfoConfig,
+    },
+    /// ADR-006 — detach the slot's LFO. Slot reverts to static params
+    /// on the next render block.
+    EffectLfoClear {
+        deck: DeckId,
+        slot: u8,
+    },
     /// Master-bus soft-clip limiter — toggle bypass. `enabled = false`
     /// short-circuits the limiter's process loop to a no-op, zero CPU.
     /// See [`crate::audio::limiter`].

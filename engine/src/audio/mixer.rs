@@ -443,6 +443,16 @@ impl AudioMixer {
                     bank.swap(ai, bi);
                 }
             }
+            AudioCommandKind::EffectLfoSet { deck, slot, config } => {
+                if let Some(s) = self.effects_mut(deck).get_mut(slot as usize) {
+                    s.set_lfo(config);
+                }
+            }
+            AudioCommandKind::EffectLfoClear { deck, slot } => {
+                if let Some(s) = self.effects_mut(deck).get_mut(slot as usize) {
+                    s.clear_lfo();
+                }
+            }
             AudioCommandKind::SetMasterLimiterEnabled { enabled } => {
                 self.limiter.set_enabled(enabled);
             }
