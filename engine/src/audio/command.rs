@@ -164,6 +164,17 @@ pub enum AudioCommandKind {
         slot: u8,
         enabled: bool,
     },
+    /// ADR-006 — swap two FxBank slot states (a ↔ b) on a deck's
+    /// effects chain. Pure POD; the audio thread runs `slice.swap(a,
+    /// b)` on the bank array, which is an in-place byte swap with no
+    /// allocation (FxBank slots are size-equivalent containers). Both
+    /// indices are control-thread-clamped; the audio side defensively
+    /// bounds-checks again before swapping.
+    EffectSwap {
+        deck: DeckId,
+        a: u8,
+        b: u8,
+    },
     /// Master-bus soft-clip limiter — toggle bypass. `enabled = false`
     /// short-circuits the limiter's process loop to a no-op, zero CPU.
     /// See [`crate::audio::limiter`].

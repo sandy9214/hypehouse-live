@@ -411,6 +411,25 @@ pub fn event_to_commands_with_errors(
                 },
             });
         }
+        EventKind::EffectSwapSlots {
+            deck,
+            slot_a,
+            slot_b,
+        } => {
+            // Mirror the reducer's clamping so the audio thread sees
+            // the same (a, b) tuple it'd derive from inspecting the
+            // resulting state. Same-slot swap → drop the command (no
+            // audio side effect; saves a ring slot).
+            let last = (next.deck_ref(*deck).effects.len() - 1) as u8;
+            let a = (*slot_a).min(last);
+            let b = (*slot_b).min(last);
+            if a != b {
+                out.push(AudioCommand {
+                    at_frame: now_frame,
+                    kind: AudioCommandKind::EffectSwap { deck: *deck, a, b },
+                });
+            }
+        }
         EventKind::SetMasterLimiterEnabled { .. } => {
             // Read the reducer-finalized value so the audio thread +
             // state log always agree.
@@ -843,6 +862,82 @@ mod tests {
                 assert!(!enabled);
             }
             other => panic!("expected EffectEnable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effect_swap_slots_emits_effect_swap_command() {
+        // ADR-006 reorder — EffectSwapSlots(0,2) on deck A must
+        // translate to one POD EffectSwap audio command with the same
+        // indices.
+        let prev = EngineState::default();
+        let e = ev(
+            1,
+            EventKind::EffectSwapSlots {
+                deck: DeckId::A,
+                slot_a: 0,
+                slot_b: 2,
+            },
+        );
+        let next = prev.apply(&e);
+        let cmds = translate(&prev, &next, &e, 0);
+        assert_eq!(cmds.len(), 1);
+        match cmds[0].kind {
+            AudioCommandKind::EffectSwap { deck, a, b } => {
+                assert_eq!(deck, DeckId::A);
+                assert_eq!(a, 0);
+                assert_eq!(b, 2);
+            }
+            other => panic!("expected EffectSwap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effect_swap_slots_same_slot_emits_no_command() {
+        // a == b → drop the command so we don't waste a ring slot on
+        // a no-op (the reducer also no-ops, so audio + control stay
+        // consistent).
+        let prev = EngineState::default();
+        let e = ev(
+            1,
+            EventKind::EffectSwapSlots {
+                deck: DeckId::A,
+                slot_a: 1,
+                slot_b: 1,
+            },
+        );
+        let next = prev.apply(&e);
+        let cmds = translate(&prev, &next, &e, 0);
+        assert!(
+            cmds.is_empty(),
+            "same-slot EffectSwapSlots must not emit an audio command"
+        );
+    }
+
+    #[test]
+    fn effect_swap_slots_out_of_range_clamps_in_translator() {
+        // Mirror the reducer's clamping. slot_a=99 → 2, slot_b=0 stays.
+        // Resulting command must carry the post-clamp indices so the
+        // audio thread + reducer agree on what happened.
+        let prev = EngineState::default();
+        let e = ev(
+            1,
+            EventKind::EffectSwapSlots {
+                deck: DeckId::B,
+                slot_a: 99,
+                slot_b: 0,
+            },
+        );
+        let next = prev.apply(&e);
+        let cmds = translate(&prev, &next, &e, 0);
+        assert_eq!(cmds.len(), 1);
+        match cmds[0].kind {
+            AudioCommandKind::EffectSwap { deck, a, b } => {
+                assert_eq!(deck, DeckId::B);
+                assert_eq!(a, 2);
+                assert_eq!(b, 0);
+            }
+            other => panic!("expected EffectSwap, got {other:?}"),
         }
     }
 

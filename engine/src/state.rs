@@ -186,6 +186,16 @@ pub enum EventKind {
         slot: u8,
         enabled: bool,
     },
+    /// ADR-006 — swap two slot positions in a deck's effects chain.
+    /// Reorders the slot contents (effect_id + params + wet_dry +
+    /// enabled) in place. Both indices are clamped to the valid
+    /// `0..3` range; same-slot swap is a no-op. Used by the UI's
+    /// drag-drop reordering + keyboard shift-up / shift-down.
+    EffectSwapSlots {
+        deck: DeckId,
+        slot_a: u8,
+        slot_b: u8,
+    },
     CopilotEngage {
         deck: DeckId,
     },
@@ -478,6 +488,23 @@ impl EngineState {
             } => {
                 if let Some(s) = next.deck_mut(*id).effects.get_mut(*slot as usize) {
                     s.enabled = *enabled;
+                }
+            }
+            EventKind::EffectSwapSlots {
+                deck: id,
+                slot_a,
+                slot_b,
+            } => {
+                // Clamp both indices into 0..3. The slice's natural
+                // upper bound (`effects.len() - 1`) is the safe ceiling
+                // so out-of-range values land on the last valid slot
+                // (matches the reducer's defensive style elsewhere —
+                // see `HotCueSet` guarding).
+                let last = (next.deck_mut(*id).effects.len() - 1) as u8;
+                let a = (*slot_a).min(last) as usize;
+                let b = (*slot_b).min(last) as usize;
+                if a != b {
+                    next.deck_mut(*id).effects.swap(a, b);
                 }
             }
             EventKind::DeckPlay { deck: id } => {
@@ -1075,6 +1102,211 @@ mod tests {
         assert_eq!(s.deck_a.effects[0].effect_id, 1);
         assert_eq!(s.deck_a.effects[0].params.get("cutoff_hz"), Some(&500.0));
         assert_eq!(s.deck_a.effects[0].wet_dry, 1.0); // clamped
+    }
+
+    // ADR-006 — slot reordering. Helper that assigns three different
+    // effects to slots 0/1/2 + tweaks each so the swap can be verified
+    // against full slot contents (effect_id + params + wet_dry +
+    // enabled), not just effect_id.
+    fn populate_three_distinct_slots() -> EngineState {
+        let s = EngineState::default();
+        // Slot 0: filter, cutoff_hz=500, wet=0.3, enabled (default after assign).
+        let s = s.apply(&ev(
+            1,
+            EventKind::EffectAssign {
+                deck: DeckId::A,
+                slot: 0,
+                effect_id: 1,
+            },
+        ));
+        let s = s.apply(&ev(
+            2,
+            EventKind::EffectParam {
+                deck: DeckId::A,
+                slot: 0,
+                param: "cutoff_hz".into(),
+                value: 500.0,
+            },
+        ));
+        let s = s.apply(&ev(
+            3,
+            EventKind::EffectWetDry {
+                deck: DeckId::A,
+                slot: 0,
+                value: 0.3,
+            },
+        ));
+        // Slot 1: echo, wet=0.6.
+        let s = s.apply(&ev(
+            4,
+            EventKind::EffectAssign {
+                deck: DeckId::A,
+                slot: 1,
+                effect_id: 2,
+            },
+        ));
+        let s = s.apply(&ev(
+            5,
+            EventKind::EffectWetDry {
+                deck: DeckId::A,
+                slot: 1,
+                value: 0.6,
+            },
+        ));
+        // Slot 2: reverb, disabled (override the assign-default `true`).
+        let s = s.apply(&ev(
+            6,
+            EventKind::EffectAssign {
+                deck: DeckId::A,
+                slot: 2,
+                effect_id: 3,
+            },
+        ));
+        s.apply(&ev(
+            7,
+            EventKind::EffectEnable {
+                deck: DeckId::A,
+                slot: 2,
+                enabled: false,
+            },
+        ))
+    }
+
+    #[test]
+    fn effect_swap_slots_swaps_full_contents() {
+        // ADR-006 — slot reorder must move effect_id + params +
+        // wet_dry + enabled together, not just effect_id. Without that
+        // the slot's user-tuned state would drop on every drag.
+        let s = populate_three_distinct_slots();
+        let before_0 = s.deck_a.effects[0].clone();
+        let before_2 = s.deck_a.effects[2].clone();
+        let s = s.apply(&ev(
+            10,
+            EventKind::EffectSwapSlots {
+                deck: DeckId::A,
+                slot_a: 0,
+                slot_b: 2,
+            },
+        ));
+        // Slot 0 now holds what was in slot 2 (reverb, disabled),
+        // slot 2 holds the old slot 0 (filter + cutoff + wet=0.3).
+        assert_eq!(s.deck_a.effects[0].effect_id, before_2.effect_id);
+        assert_eq!(s.deck_a.effects[0].enabled, before_2.enabled);
+        assert_eq!(s.deck_a.effects[0].wet_dry, before_2.wet_dry);
+        assert_eq!(s.deck_a.effects[2].effect_id, before_0.effect_id);
+        assert_eq!(s.deck_a.effects[2].enabled, before_0.enabled);
+        assert_eq!(s.deck_a.effects[2].wet_dry, before_0.wet_dry);
+        assert_eq!(
+            s.deck_a.effects[2].params.get("cutoff_hz"),
+            Some(&500.0),
+            "params must travel with the slot during a swap"
+        );
+        // Untouched slot 1 (echo) stays put.
+        assert_eq!(s.deck_a.effects[1].effect_id, 2);
+        assert!((s.deck_a.effects[1].wet_dry - 0.6).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn effect_swap_slots_out_of_range_clamps_to_last_slot() {
+        // slot_a=99 → clamps to last valid (2). slot_b=1 unchanged.
+        // Net effect: slot 2 ↔ slot 1.
+        let s = populate_three_distinct_slots();
+        let before_1 = s.deck_a.effects[1].clone();
+        let before_2 = s.deck_a.effects[2].clone();
+        let s = s.apply(&ev(
+            10,
+            EventKind::EffectSwapSlots {
+                deck: DeckId::A,
+                slot_a: 99,
+                slot_b: 1,
+            },
+        ));
+        assert_eq!(s.deck_a.effects[1].effect_id, before_2.effect_id);
+        assert_eq!(s.deck_a.effects[2].effect_id, before_1.effect_id);
+        // Slot 0 unaffected.
+        assert_eq!(s.deck_a.effects[0].effect_id, 1);
+    }
+
+    #[test]
+    fn effect_swap_slots_same_index_is_noop() {
+        // a == b → state is bit-for-bit identical. Catches a regression
+        // where the swap path destructively replaces the slot.
+        let s = populate_three_distinct_slots();
+        let before = s.clone();
+        let s = s.apply(&ev(
+            10,
+            EventKind::EffectSwapSlots {
+                deck: DeckId::A,
+                slot_a: 1,
+                slot_b: 1,
+            },
+        ));
+        for i in 0..3 {
+            assert_eq!(
+                s.deck_a.effects[i].effect_id,
+                before.deck_a.effects[i].effect_id
+            );
+            assert_eq!(
+                s.deck_a.effects[i].enabled,
+                before.deck_a.effects[i].enabled
+            );
+            assert_eq!(
+                s.deck_a.effects[i].wet_dry,
+                before.deck_a.effects[i].wet_dry
+            );
+            assert_eq!(s.deck_a.effects[i].params, before.deck_a.effects[i].params);
+        }
+    }
+
+    #[test]
+    fn effect_swap_slots_both_out_of_range_clamps_to_last_each_noop() {
+        // Both indices clamp to the same last slot → same-slot noop.
+        let s = populate_three_distinct_slots();
+        let before = s.clone();
+        let s = s.apply(&ev(
+            10,
+            EventKind::EffectSwapSlots {
+                deck: DeckId::A,
+                slot_a: 200,
+                slot_b: 50,
+            },
+        ));
+        for i in 0..3 {
+            assert_eq!(
+                s.deck_a.effects[i].effect_id,
+                before.deck_a.effects[i].effect_id
+            );
+        }
+    }
+
+    #[test]
+    fn effect_swap_slots_targets_correct_deck() {
+        // Swapping on deck A must not touch deck B's chain.
+        let s = populate_three_distinct_slots();
+        // Mirror something onto deck B so we can verify it's untouched.
+        let s = s.apply(&ev(
+            10,
+            EventKind::EffectAssign {
+                deck: DeckId::B,
+                slot: 0,
+                effect_id: 4, // gate
+            },
+        ));
+        let s = s.apply(&ev(
+            11,
+            EventKind::EffectSwapSlots {
+                deck: DeckId::A,
+                slot_a: 0,
+                slot_b: 1,
+            },
+        ));
+        // Deck A: slot 0 was filter (1), slot 1 was echo (2) → swapped.
+        assert_eq!(s.deck_a.effects[0].effect_id, 2);
+        assert_eq!(s.deck_a.effects[1].effect_id, 1);
+        // Deck B untouched.
+        assert_eq!(s.deck_b.effects[0].effect_id, 4);
+        assert_eq!(s.deck_b.effects[1].effect_id, 0);
+        assert_eq!(s.deck_b.effects[2].effect_id, 0);
     }
 
     #[test]
