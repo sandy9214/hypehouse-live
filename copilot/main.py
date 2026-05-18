@@ -20,6 +20,7 @@ from pathlib import Path
 
 from .library import TrackLibrary
 from .service import CoPilotService
+from .telemetry import init_telemetry
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -93,6 +94,10 @@ async def _run(args: argparse.Namespace) -> int:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     log = logging.getLogger("copilot.main")
+    # Opt-in telemetry. Always called; the module returns False (and
+    # logs the reason) when the operator has not enabled it. Never
+    # raises — a missing sentry-sdk install is treated as "stay off".
+    init_telemetry()
     log.info("opening library at %s", args.library_db)
     library = TrackLibrary(args.library_db)
     service = CoPilotService(

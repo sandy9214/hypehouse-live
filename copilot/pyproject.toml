@@ -35,6 +35,12 @@ test = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
+# Opt-in crash + perf telemetry. The `copilot.telemetry` module imports
+# `sentry_sdk` lazily and gracefully no-ops when this extra is not
+# installed. See `docs/telemetry.md` for the privacy contract.
+telemetry = [
+    "sentry-sdk>=2.0,<3",
+]
 # Stems / mashup rendering — only needed if/when the co-pilot ever runs
 # v1's smart_mashup locally instead of delegating render to the engine.
 # Today's service stays import-clean without these.

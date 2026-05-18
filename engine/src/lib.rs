@@ -15,5 +15,6 @@ pub mod midi;
 pub mod persistence;
 pub mod recording;
 pub mod state;
+pub mod telemetry;
 
 pub use state::{Deck, DeckId, EngineState, Event, EventKind, EventSource};

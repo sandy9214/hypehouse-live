@@ -57,6 +57,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
 thiserror = "2"
 
+# Opt-in crash + perf telemetry (off by default at runtime — see
+# `engine/src/telemetry.rs` and `docs/telemetry.md`). `rustls` keeps us
+# off OpenSSL; `panic` wires the panic hook so unwinds in the audio
+# thread bubble up as Sentry events. No `unsafe` is added.
+sentry = { version = "0.32", default-features = false, features = ["backtrace", "contexts", "panic", "rustls", "reqwest"] }
+
 [dev-dependencies]
 criterion = "0.7"
 proptest = "1"
