@@ -617,8 +617,12 @@ mod tests {
                 worst = dt;
             }
         }
+        // CI runners (macOS in particular) jitter well past 50µs under
+        // contention — observed 53.6µs on PR #60. Widen tolerance for
+        // debug builds so the test doesn't flake. Production budget
+        // stays tight in release (5µs).
         let budget = if cfg!(debug_assertions) {
-            Duration::from_micros(50)
+            Duration::from_micros(200)
         } else {
             Duration::from_micros(5)
         };
