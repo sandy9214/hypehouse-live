@@ -72,7 +72,9 @@ fn main() {
         .manage(guard)
         .invoke_handler(tauri::generate_handler![
             commands::get_bridge_url,
-            commands::get_bridge_token
+            commands::get_bridge_token,
+            commands::check_for_updates,
+            commands::install_pending_update
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {

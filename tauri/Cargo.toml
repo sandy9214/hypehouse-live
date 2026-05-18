@@ -47,6 +47,10 @@ hex = "0.4"
 # operational ("failed to spawn child"), not domain-logic.
 anyhow = "1"
 
+# thiserror — narrow, derive-only error enums for the updater module
+# (ADR-008). Adds ~zero compile-time cost vs hand-rolling `Display`.
+thiserror = "2"
+
 [dev-dependencies]
 # Tempdir for the sidecar integration test — we drop a sleep-forever
 # shim binary in a scratch directory and point ChildGuard at it.
