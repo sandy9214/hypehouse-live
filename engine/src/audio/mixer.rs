@@ -18,6 +18,7 @@ use crate::audio::clock::SharedClock;
 use crate::audio::command::{AudioCommand, AudioCommandKind};
 use crate::audio::decode::{DecodeHandle, DecodeService};
 use crate::audio::effects::{FxBank, EFFECT_NONE};
+use crate::audio::limiter::MasterLimiter;
 use crate::audio::pitch_tempo::{PitchTempo, CHUNK_FRAMES as PT_CHUNK_FRAMES};
 use crate::recording::MasterRecorderSink;
 use crate::state::DeckId;
@@ -111,6 +112,12 @@ pub struct AudioMixer {
     /// Re-used across render calls. Sized to one stereo pull chunk so
     /// the tee never spills.
     rec_scratch: [f32; STEREO_PULL_FRAMES * 2],
+    /// Master-bus soft-clip limiter (ADR-004 §"master-bus protection").
+    /// Sits between the per-deck crossfade and the recorder tee + cpal
+    /// output, so both the live mix and the recorded `master.wav` are
+    /// protected against clipping when both decks are loud + effects
+    /// are active. See [`crate::audio::limiter`] for the algorithm.
+    limiter: MasterLimiter,
 }
 
 /// Per-deck pitch/tempo output scratch capacity (interleaved stereo
@@ -144,6 +151,7 @@ impl AudioMixer {
             pt_scratch_b: [0.0; PT_OUT_SCRATCH],
             recorder: None,
             rec_scratch: [0.0; STEREO_PULL_FRAMES * 2],
+            limiter: MasterLimiter::new(sample_rate),
         }
     }
 
@@ -276,6 +284,12 @@ impl AudioMixer {
                     s.enabled = enabled;
                 }
             }
+            AudioCommandKind::SetMasterLimiterEnabled { enabled } => {
+                self.limiter.set_enabled(enabled);
+            }
+            AudioCommandKind::SetMasterLimiterThreshold { threshold_db } => {
+                self.limiter.set_threshold_db(threshold_db);
+            }
         }
     }
 
@@ -370,15 +384,25 @@ impl AudioMixer {
 
             // Downmix to mono + crossfade. Reuses the v0.1 contract
             // (the engine output is mono until a separate stereo PR).
-            // Tee the final mix into the recording sink as interleaved
-            // stereo (L = R = mono mix) for master.wav.
-            let tee = self.recorder.is_some();
             for i in 0..chunk {
                 let a = 0.5 * (a_slice[i * 2] + a_slice[i * 2 + 1]);
                 let b = 0.5 * (b_slice[i * 2] + b_slice[i * 2 + 1]);
                 let mix = a * (1.0 - self.crossfader) + b * self.crossfader;
                 out[written + i] = mix;
-                if tee {
+            }
+
+            // Master-bus soft-clip limiter. Run **before** both the
+            // recorder tee and the cpal output so the live mix +
+            // saved `master.wav` are both protected. When the limiter
+            // is bypassed the call is a no-op (zero CPU).
+            self.limiter
+                .process(&mut out[written..written + chunk], self.sample_rate);
+
+            // Tee the limited mix into the recording sink as
+            // interleaved stereo (L = R = mono mix) for master.wav.
+            if self.recorder.is_some() {
+                for i in 0..chunk {
+                    let mix = out[written + i];
                     self.rec_scratch[i * 2] = mix;
                     self.rec_scratch[i * 2 + 1] = mix;
                 }
@@ -388,6 +412,18 @@ impl AudioMixer {
             }
             written += chunk;
         }
+    }
+
+    /// Read accessor for tests — is the master-bus limiter currently
+    /// engaged (not bypassed)?
+    pub fn master_limiter_enabled(&self) -> bool {
+        self.limiter.enabled()
+    }
+
+    /// Read accessor for tests — the current linear ceiling the limiter
+    /// is targeting (= `10^(threshold_db/20)`).
+    pub fn master_limiter_threshold_linear(&self) -> f32 {
+        self.limiter.threshold_linear()
     }
 
     /// Return a mutable borrow of the per-deck pitch/tempo processor.
@@ -747,5 +783,34 @@ mod tests {
         assert_no_alloc::assert_no_alloc(|| {
             m.render(&mut buf);
         });
+    }
+
+    #[test]
+    fn master_limiter_enabled_by_default_on_new_mixer() {
+        // Safety-first: limiter ON the moment the mixer is constructed.
+        // Catches a regression of `MasterLimiter::new` defaulting to
+        // disabled (would silently un-protect the master bus).
+        let m = AudioMixer::new(48_000);
+        assert!(m.master_limiter_enabled());
+        // Default threshold ≈ 0.944 linear (-0.5 dB).
+        let thr = m.master_limiter_threshold_linear();
+        assert!((thr - 10_f32.powf(-0.5 / 20.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn set_master_limiter_command_updates_mixer_state() {
+        let mut m = AudioMixer::new(48_000);
+        m.apply(cmd(AudioCommandKind::SetMasterLimiterEnabled {
+            enabled: false,
+        }));
+        assert!(!m.master_limiter_enabled());
+        m.apply(cmd(AudioCommandKind::SetMasterLimiterThreshold {
+            threshold_db: -12.0,
+        }));
+        let thr = m.master_limiter_threshold_linear();
+        assert!(
+            (thr - 10_f32.powf(-12.0 / 20.0)).abs() < 1e-4,
+            "threshold_linear should reflect SetMasterLimiterThreshold event, got {thr}",
+        );
     }
 }

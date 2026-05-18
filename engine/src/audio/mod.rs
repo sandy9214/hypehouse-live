@@ -27,6 +27,7 @@ pub mod command;
 pub mod decode;
 pub mod effects;
 pub mod io;
+pub mod limiter;
 pub mod mixer;
 pub mod pitch_tempo;
 pub mod ring;
@@ -42,6 +43,12 @@ pub use effects::{
     descriptors as effect_descriptors, resolve_param as resolve_effect_param, Effect, EffectId,
     EffectParams, FxBank, ParamDescriptor, EFFECT_ECHO, EFFECT_FILTER, EFFECT_GATE, EFFECT_NONE,
     EFFECT_REVERB, MAX_PARAMS as EFFECT_MAX_PARAMS,
+};
+pub use limiter::{
+    clamp_threshold_db as clamp_master_limiter_threshold_db, MasterLimiter,
+    DEFAULT_THRESHOLD_DB as MASTER_LIMITER_DEFAULT_THRESHOLD_DB,
+    MAX_THRESHOLD_DB as MASTER_LIMITER_MAX_THRESHOLD_DB,
+    MIN_THRESHOLD_DB as MASTER_LIMITER_MIN_THRESHOLD_DB,
 };
 pub use mixer::AudioMixer;
 pub use pitch_tempo::{

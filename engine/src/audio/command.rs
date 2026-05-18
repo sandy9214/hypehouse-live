@@ -164,6 +164,19 @@ pub enum AudioCommandKind {
         slot: u8,
         enabled: bool,
     },
+    /// Master-bus soft-clip limiter — toggle bypass. `enabled = false`
+    /// short-circuits the limiter's process loop to a no-op, zero CPU.
+    /// See [`crate::audio::limiter`].
+    SetMasterLimiterEnabled {
+        enabled: bool,
+    },
+    /// Master-bus soft-clip limiter — set the threshold in dB. The
+    /// control side already clamps to
+    /// `[MASTER_LIMITER_MIN_THRESHOLD_DB, MASTER_LIMITER_MAX_THRESHOLD_DB]`;
+    /// the audio thread defensive-clamps a second time.
+    SetMasterLimiterThreshold {
+        threshold_db: f32,
+    },
 }
 
 #[cfg(test)]

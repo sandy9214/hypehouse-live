@@ -336,6 +336,26 @@ pub fn event_to_commands(
                 },
             });
         }
+        EventKind::SetMasterLimiterEnabled { .. } => {
+            // Read the reducer-finalized value so the audio thread +
+            // state log always agree.
+            out.push(AudioCommand {
+                at_frame: now_frame,
+                kind: AudioCommandKind::SetMasterLimiterEnabled {
+                    enabled: next.master_limiter_enabled,
+                },
+            });
+        }
+        EventKind::SetMasterLimiterThreshold { .. } => {
+            // The reducer's already clamped to `[-24, 0]`; forward the
+            // post-reducer value so the audio thread + state log agree.
+            out.push(AudioCommand {
+                at_frame: now_frame,
+                kind: AudioCommandKind::SetMasterLimiterThreshold {
+                    threshold_db: next.master_limiter_threshold_db,
+                },
+            });
+        }
         // Non-audio-relevant events — pure state, no audio command needed.
         // (`SetMasterBpm` updates the SharedClock side-channel separately;
         // see ADR-007 §v0.1 — the audio thread doesn't consume it.)
@@ -860,5 +880,41 @@ mod tests {
         };
         assert!(id1.is_some());
         assert!(id2.is_some());
+    }
+
+    #[test]
+    fn set_master_limiter_enabled_translates_to_audio_command() {
+        let prev = EngineState::default();
+        let e = ev(1, EventKind::SetMasterLimiterEnabled { enabled: false });
+        let next = prev.apply(&e);
+        let cmds = translate(&prev, &next, &e, 0);
+        assert_eq!(cmds.len(), 1);
+        match cmds[0].kind {
+            AudioCommandKind::SetMasterLimiterEnabled { enabled } => assert!(!enabled),
+            other => panic!("expected SetMasterLimiterEnabled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_master_limiter_threshold_forwards_reducer_clamped_value() {
+        // Reducer clamps over-max to MAX (= 0.0 dB); translator must
+        // forward the *post-reducer* value, not the raw input.
+        let prev = EngineState::default();
+        let e = ev(
+            1,
+            EventKind::SetMasterLimiterThreshold { threshold_db: 12.0 },
+        );
+        let next = prev.apply(&e);
+        let cmds = translate(&prev, &next, &e, 0);
+        assert_eq!(cmds.len(), 1);
+        match cmds[0].kind {
+            AudioCommandKind::SetMasterLimiterThreshold { threshold_db } => {
+                assert!(
+                    (threshold_db - crate::audio::MASTER_LIMITER_MAX_THRESHOLD_DB).abs() < 1e-6,
+                    "translator should forward reducer-clamped value, got {threshold_db}",
+                );
+            }
+            other => panic!("expected SetMasterLimiterThreshold, got {other:?}"),
+        }
     }
 }

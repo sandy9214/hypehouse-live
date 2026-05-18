@@ -202,6 +202,20 @@ pub enum EventKind {
         deck: DeckId,
         handoff_until_frame: u64,
     },
+    /// Toggle the master-bus soft-clip limiter (default `true` for
+    /// safety — both the live mix and the recorded `master.wav` are
+    /// kept inside ±1.0 when both decks are hot + effects are active).
+    /// See [`crate::audio::limiter`] for the algorithm.
+    SetMasterLimiterEnabled {
+        enabled: bool,
+    },
+    /// Set the master-bus limiter's threshold in dB. Reducer clamps to
+    /// `[audio::MASTER_LIMITER_MIN_THRESHOLD_DB, audio::MASTER_LIMITER_MAX_THRESHOLD_DB]`
+    /// (= `[-24.0, 0.0]`). Non-finite inputs fall back to the default
+    /// (-0.5 dB) per `audio::clamp_master_limiter_threshold_db`.
+    SetMasterLimiterThreshold {
+        threshold_db: f32,
+    },
     SessionStart,
     SessionEnd,
 }
@@ -313,10 +327,29 @@ pub struct EngineState {
     /// Default 120.0, updated by `EventKind::SetMasterBpm`.
     #[serde(default = "default_master_bpm")]
     pub master_bpm: f32,
+    /// Master-bus soft-clip limiter — toggle. Default `true` so the
+    /// live mix + recorded `master.wav` are protected against clipping
+    /// from the moment the engine starts. See [`crate::audio::limiter`].
+    #[serde(default = "default_master_limiter_enabled")]
+    pub master_limiter_enabled: bool,
+    /// Master-bus soft-clip limiter — threshold in dB. Default `-0.5`
+    /// (linear ≈ 0.944). Reducer clamps incoming values to the
+    /// `[-24.0, 0.0]` window via
+    /// `audio::clamp_master_limiter_threshold_db`.
+    #[serde(default = "default_master_limiter_threshold_db")]
+    pub master_limiter_threshold_db: f32,
 }
 
 fn default_master_bpm() -> f32 {
     120.0
+}
+
+fn default_master_limiter_enabled() -> bool {
+    true
+}
+
+fn default_master_limiter_threshold_db() -> f32 {
+    crate::audio::MASTER_LIMITER_DEFAULT_THRESHOLD_DB
 }
 
 /// Serde default for `Deck::tempo_ratio` — 1.0 = original playback
@@ -344,6 +377,8 @@ impl Default for EngineState {
             master_volume_db: 0.0,
             session_active: false,
             master_bpm: default_master_bpm(),
+            master_limiter_enabled: default_master_limiter_enabled(),
+            master_limiter_threshold_db: default_master_limiter_threshold_db(),
         }
     }
 }
@@ -550,6 +585,13 @@ impl EngineState {
                 let d = next.deck_mut(*id);
                 d.copilot_engaged = false;
                 d.handoff_until_frame = *handoff_until_frame;
+            }
+            EventKind::SetMasterLimiterEnabled { enabled } => {
+                next.master_limiter_enabled = *enabled;
+            }
+            EventKind::SetMasterLimiterThreshold { threshold_db } => {
+                next.master_limiter_threshold_db =
+                    crate::audio::clamp_master_limiter_threshold_db(*threshold_db);
             }
         }
         next
@@ -1136,6 +1178,114 @@ mod tests {
         assert!(
             (s.deck_a.tempo_ratio - 0.8).abs() < 1e-6,
             "PitchBend must not touch tempo_ratio"
+        );
+    }
+
+    #[test]
+    fn master_limiter_enabled_by_default() {
+        // Safety-first default — limiter ON the moment the engine starts
+        // so a hot session can't clip the master bus or the recording.
+        let s = EngineState::default();
+        assert!(s.master_limiter_enabled);
+        assert!(
+            (s.master_limiter_threshold_db - crate::audio::MASTER_LIMITER_DEFAULT_THRESHOLD_DB)
+                .abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn set_master_limiter_enabled_toggles() {
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::SetMasterLimiterEnabled { enabled: false },
+        ));
+        assert!(!s.master_limiter_enabled);
+        let s = s.apply(&ev(2, EventKind::SetMasterLimiterEnabled { enabled: true }));
+        assert!(s.master_limiter_enabled);
+    }
+
+    #[test]
+    fn set_master_limiter_threshold_clamps_to_window() {
+        let s = EngineState::default();
+        // Over-max → clamp to 0 dB.
+        let s = s.apply(&ev(
+            1,
+            EventKind::SetMasterLimiterThreshold { threshold_db: 12.0 },
+        ));
+        assert!(
+            (s.master_limiter_threshold_db - crate::audio::MASTER_LIMITER_MAX_THRESHOLD_DB).abs()
+                < 1e-6
+        );
+        // Under-min → clamp to -24 dB.
+        let s = s.apply(&ev(
+            2,
+            EventKind::SetMasterLimiterThreshold {
+                threshold_db: -100.0,
+            },
+        ));
+        assert!(
+            (s.master_limiter_threshold_db - crate::audio::MASTER_LIMITER_MIN_THRESHOLD_DB).abs()
+                < 1e-6
+        );
+        // NaN → default.
+        let s = s.apply(&ev(
+            3,
+            EventKind::SetMasterLimiterThreshold {
+                threshold_db: f32::NAN,
+            },
+        ));
+        assert!(
+            (s.master_limiter_threshold_db - crate::audio::MASTER_LIMITER_DEFAULT_THRESHOLD_DB)
+                .abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn engine_state_serde_roundtrip_preserves_limiter_fields() {
+        // Wire-compat: an older snapshot (pre-limiter) deserializes
+        // back to defaults via the `#[serde(default)]` attributes —
+        // catches accidental removal of those serde defaults.
+        let json = r#"{
+            "deck_a": {
+                "loaded": null, "playing": false, "position_ms": 0,
+                "pitch_semitones": 0.0, "tempo_ratio": 1.0,
+                "eq_low_db": 0.0, "eq_mid_db": 0.0, "eq_high_db": 0.0,
+                "loop_in_ms": null, "loop_out_ms": null, "loop_active": false,
+                "hot_cues": [null,null,null,null,null,null,null,null],
+                "copilot_engaged": false, "bpm": 0.0, "beat_grid_anchor_ms": 0,
+                "beat_period_ms": 0.0, "phase_offset_ms": 0,
+                "effects": [{"effect_id":0,"params":{},"wet_dry":0.0,"enabled":false},
+                            {"effect_id":0,"params":{},"wet_dry":0.0,"enabled":false},
+                            {"effect_id":0,"params":{},"wet_dry":0.0,"enabled":false}],
+                "handoff_until_frame": 0
+            },
+            "deck_b": {
+                "loaded": null, "playing": false, "position_ms": 0,
+                "pitch_semitones": 0.0, "tempo_ratio": 1.0,
+                "eq_low_db": 0.0, "eq_mid_db": 0.0, "eq_high_db": 0.0,
+                "loop_in_ms": null, "loop_out_ms": null, "loop_active": false,
+                "hot_cues": [null,null,null,null,null,null,null,null],
+                "copilot_engaged": false, "bpm": 0.0, "beat_grid_anchor_ms": 0,
+                "beat_period_ms": 0.0, "phase_offset_ms": 0,
+                "effects": [{"effect_id":0,"params":{},"wet_dry":0.0,"enabled":false},
+                            {"effect_id":0,"params":{},"wet_dry":0.0,"enabled":false},
+                            {"effect_id":0,"params":{},"wet_dry":0.0,"enabled":false}],
+                "handoff_until_frame": 0
+            },
+            "crossfader": 0.5,
+            "master_volume_db": 0.0,
+            "session_active": false
+        }"#;
+        let s: EngineState = serde_json::from_str(json).expect("old snapshot must deserialize");
+        // Missing limiter fields fall back to the serde defaults.
+        assert!(s.master_limiter_enabled);
+        assert!(
+            (s.master_limiter_threshold_db - crate::audio::MASTER_LIMITER_DEFAULT_THRESHOLD_DB)
+                .abs()
+                < 1e-6
         );
     }
 }
