@@ -20,9 +20,31 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Sample, SampleFormat, Stream, StreamConfig};
+use cpal::{Sample, SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
 
 use crate::audio::{AudioConsumer, AudioMixer, DecodeService, SharedClock};
+
+/// Extract the sample rate from a [`SupportedStreamConfig`] as `u32`.
+///
+/// Why a helper:
+///
+/// cpal 0.16 (current pinned) returns `SampleRate(u32)` — a newtype —
+/// from `SupportedStreamConfig::sample_rate()`. cpal 0.17 (tracked by
+/// issue #14, the audio-stack dependabot bump) changes the return type
+/// to `u32` directly. The version bump is otherwise a clean drop-in,
+/// but every call site that goes through `.0` to unwrap the newtype
+/// will fail to compile on 0.17.
+///
+/// Funnelling the cast through this helper means the bump becomes a
+/// single-line patch (drop the `.0`) in one place, not a sed across the
+/// callback path. See also issue #26 (parent — Rust 1.88 toolchain
+/// bump + deferred dependabot PRs).
+#[inline]
+fn supported_sample_rate(c: &SupportedStreamConfig) -> u32 {
+    // cpal 0.16: `sample_rate()` -> `SampleRate(u32)`; `.0` extracts the inner u32.
+    // cpal 0.17: `sample_rate()` -> `u32` directly; drop the `.0` here when bumping.
+    c.sample_rate().0
+}
 
 /// Owns the cpal `Stream` (which keeps the audio callback alive). When
 /// the handle is dropped the stream is torn down + the OS thread joins.
@@ -48,7 +70,7 @@ pub fn spawn_audio_thread(
         .default_output_config()
         .map_err(|e| anyhow!("default_output_config failed: {e}"))?;
 
-    let sample_rate = supported.sample_rate().0;
+    let sample_rate = supported_sample_rate(&supported);
     let channels = supported.channels();
     let sample_format = supported.sample_format();
     let config: StreamConfig = supported.into();
