@@ -734,6 +734,53 @@ the UI can warn the operator without polling.
 `kind` is a free-form string today (`"xrun"`, `"underrun"`, etc.); the
 set may be tightened to an enum once the audio thread lands.
 
+### `engine.decode_error`
+
+Surfaces a decode-pipeline failure on a `DeckLoad` event. The Rust
+engine's `DecodeService::open` call may fail for several reasons (file
+not found, unsupported format, exhausted decode slots, …). Instead of
+silently dropping the load, the bridge fans out an `engine.decode_error`
+notification so connected UIs can render a transient toast and the
+operator immediately sees what went wrong. Deck state stays unchanged —
+this notification is a side channel, not a reducer event.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "engine.decode_error",
+  "params": {
+    "deck": "A",
+    "track_id": "abc-123",
+    "category": "file_not_found",
+    "error": "io error opening /tracks/missing.mp3: No such file or directory (os error 2)"
+  }
+}
+```
+
+`category` is a coarse, stable failure-class string the UI uses to pick
+icons / copy without pattern-matching the underlying error message.
+Today's set, with the underlying `DecodeError` variant it maps from:
+
+| `category`              | `DecodeError` variant       | Surfaces                                                        |
+|-------------------------|-----------------------------|-----------------------------------------------------------------|
+| `file_not_found`        | `Io`                        | Open-time IO error (path missing, perms denied, etc.).          |
+| `format_unsupported`    | `Probe`, `NoTrack`          | `symphonia` couldn't probe the container or no decodable track. |
+| `decoder_error`         | `Resampler`                 | Decoder thread init failed mid-stream (rubato config invalid).  |
+| `resource_exhausted`    | `NoFreeSlot`                | All `MAX_DECODE_SLOTS` slots occupied; close a deck and retry.  |
+| `unknown_inline_source` | `UnknownInlineSource`       | Test/in-memory `mem://` key not registered.                     |
+| `decoder_thread_spawn`  | `Spawn`                     | OS refused to spawn the per-track decoder thread.               |
+
+`error` is the human-readable stringification of the underlying
+`DecodeError` and is meant for display + log capture, not for parsing.
+
+Today, only `DeckLoad` events produce this notification — the audio
+thread has no in-flight failure path that surfaces a decode_error
+(decoder-thread errors mid-stream silence-pad the ring instead). A
+future PR may extend the same notification to mid-stream resync
+failures; clients should treat `category` as a forward-compatible
+union and fall back to a generic "Decode error" label for unknown
+values.
+
 ## Error codes
 
 Standard JSON-RPC 2.0 codes:

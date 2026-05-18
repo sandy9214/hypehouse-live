@@ -54,8 +54,8 @@ use tracing::{debug, info, warn};
 use super::auth::AuthConfig;
 use super::error::RpcError;
 use super::rpc::{
-    audio_alert_notification, dispatch_with_auth_async, state_changed_notification, AuthState,
-    BridgeNotice, EngineHandle, RpcRequest, RpcResponse,
+    audio_alert_notification, decode_error_notification, dispatch_with_auth_async,
+    state_changed_notification, AuthState, BridgeNotice, EngineHandle, RpcRequest, RpcResponse,
 };
 
 /// How long a pending-auth (header-less) connection has to send a
@@ -324,6 +324,23 @@ async fn handle_client(
                 }
                 Ok(BridgeNotice::AudioAlert { kind, details }) => {
                     let n = audio_alert_notification(&kind, &details);
+                    if let Ok(text) = serde_json::to_string(&n) {
+                        if out_for_notices
+                            .send(Message::Text(text.into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                Ok(BridgeNotice::DecodeError {
+                    deck,
+                    track_id,
+                    category,
+                    error,
+                }) => {
+                    let n = decode_error_notification(deck, &track_id, &category, &error);
                     if let Ok(text) = serde_json::to_string(&n) {
                         if out_for_notices
                             .send(Message::Text(text.into()))
