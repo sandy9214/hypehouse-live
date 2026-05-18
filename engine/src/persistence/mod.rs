@@ -517,9 +517,7 @@ mod tests {
         // Path must be under the override dir, NOT under XDG/HOME.
         assert!(
             path.starts_with(&dir),
-            "path {:?} not under override {:?}",
-            path,
-            dir
+            "path {path:?} not under override {dir:?}"
         );
         fs::remove_dir_all(&dir).ok();
     }
