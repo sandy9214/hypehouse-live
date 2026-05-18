@@ -77,6 +77,22 @@ export interface Deck {
   copilot_enabled: boolean;
   /** Per-deck effects chain (ADR-006). Length 3. */
   effects: readonly [EffectSlotState, EffectSlotState, EffectSlotState];
+  /**
+   * Per-stem linear gain when the deck is loaded with separated stems
+   * via `EventKind::DeckLoadStems`. Indexed canonically —
+   * `0=vocals`, `1=drums`, `2=bass`, `3=other`. Mirror of
+   * `Deck::stem_gains` in `engine/src/state.rs`. Default
+   * `[1, 1, 1, 1]` so the UI mute toggles render in the "on" state
+   * before the engine has confirmed a stem load.
+   */
+  stem_gains: readonly [number, number, number, number];
+  /**
+   * `true` after a successful `DeckLoadStems` reducer pass — the
+   * `StemRack` mute controls activate only in this mode. Mirror of
+   * `Deck::stem_mode` in `engine/src/state.rs`. A subsequent
+   * `DeckLoad` clears it (mutually exclusive with full-mix playback).
+   */
+  stem_mode: boolean;
 }
 
 export interface EngineState {
@@ -138,6 +154,8 @@ const emptyDeck = (id: DeckId): Deck => ({
   loop_out_ms: null,
   copilot_enabled: false,
   effects: [emptyEffectSlot(), emptyEffectSlot(), emptyEffectSlot()],
+  stem_gains: [1, 1, 1, 1],
+  stem_mode: false,
 });
 
 /**

@@ -25,6 +25,7 @@ import {
   type EqBand,
 } from "./DeckControls";
 import { EffectRack } from "./EffectRack";
+import { StemRack } from "./StemRack";
 import { useEffectsManifest } from "../store/effectsManifest";
 import {
   getLoadedTrack,
@@ -33,6 +34,8 @@ import {
   subscribeLoadedTrack,
 } from "../store/hotCuePersist";
 import { useWaveform } from "../store/waveform";
+import { useLibrary } from "../store/library";
+import { requestStems, useStemStatus } from "../store/stems";
 
 export interface DeckProps {
   deck: DeckState;
@@ -108,6 +111,84 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
     if (!loaded && loadedTrackId !== null) setLoadedTrackId(null);
   }, [loaded, loadedTrackId]);
   const peaks = useWaveform(client, loadedTrackId);
+  // Resolve the full LibraryTrack for the deck's currently-loaded id
+  // by indexing the library cache. This is the same source TrackRow
+  // loaded from, so the bpm / beatgrid / hot_cues we ship in a
+  // subsequent `DeckLoadStems` event match the original `DeckLoad`
+  // payload bit-for-bit. Falls back to `null` when (a) no track is
+  // loaded, or (b) the cache hasn't hydrated yet — the Stems button
+  // disables itself in both cases.
+  const library = useLibrary(client);
+  const loadedTrackMeta = useMemo<LibraryTrack | null>(
+    (): LibraryTrack | null => {
+      if (loadedTrackId === null) return null;
+      return (
+        library.tracks.find(
+          (t: LibraryTrack): boolean => t.id === loadedTrackId,
+        ) ?? null
+      );
+    },
+    [loadedTrackId, library.tracks],
+  );
+  // Stem-cache status for whatever track is currently loaded. Null
+  // trackId = inert hook (no polling). When the user clicks "Stems"
+  // we kick `library.compute_stems`; the hook flips status to
+  // `"pending"` → `"ready"` on its 2s cadence, then we wire the
+  // four paths into the engine via `DeckLoadStems`.
+  const stemStatus = useStemStatus(client, loadedTrackId);
+  // Track whether the user has *asked* for stems on this deck — we
+  // don't want to auto-load stems for every track-cached-on-disk that
+  // happens to already have ready stems sitting in the library (that
+  // would silently flip mode without consent).
+  const [stemsRequested, setStemsRequested] = useState<boolean>(false);
+  // Reset request flag whenever the deck unloads — fresh track, fresh
+  // intent. Stays sticky during in-flight pending → ready transition.
+  useEffect((): void => {
+    if (!loaded) setStemsRequested(false);
+  }, [loaded]);
+  // Auto-emit `DeckLoadStems` once the cache flips to `ready` AFTER
+  // the user clicked the button. Using `useEffect` (not the
+  // requestStems callback) gives us a single emit per ready-flip,
+  // even if the hook re-renders mid-poll.
+  useEffect((): void => {
+    if (
+      !stemsRequested ||
+      stemStatus.status !== "ready" ||
+      stemStatus.paths === null ||
+      loadedTrackMeta === null
+    ) {
+      return;
+    }
+    submit(client, {
+      DeckLoadStems: {
+        deck: deck.id,
+        track: { id: loadedTrackMeta.id, path: loadedTrackMeta.path },
+        // Engine reducer expects `[vocals, drums, bass, other]` —
+        // `useStemStatus` already returns them in this order.
+        stem_paths: [
+          stemStatus.paths[0],
+          stemStatus.paths[1],
+          stemStatus.paths[2],
+          stemStatus.paths[3],
+        ],
+        bpm: loadedTrackMeta.bpm,
+        beat_grid_anchor_ms: loadedTrackMeta.beat_grid_anchor_ms,
+        downbeats_ms: Array.from(loadedTrackMeta.downbeats_ms),
+        hot_cues: Array.from(loadedTrackMeta.hot_cues),
+      },
+    });
+    // Clear the request flag — a future click can re-trigger.
+    setStemsRequested(false);
+  }, [stemsRequested, stemStatus, loadedTrackMeta, client, deck.id]);
+
+  const onStems = (): void => {
+    if (!loaded || loadedTrackId === null) return;
+    setStemsRequested(true);
+    // Fire-and-forget — the hook picks up the resulting status flip
+    // via its 2s poll. Errors (e.g. demucs not installed) are
+    // swallowed for v0.1; a future PR adds a toast.
+    void requestStems(client, loadedTrackId).catch((): void => undefined);
+  };
   // Track duration (ms) for playhead positioning. Captured at
   // DeckLoad time from the LibraryTrack payload — the engine's deck
   // state mirror doesn't carry duration today (it isn't needed by the
@@ -264,12 +345,55 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
         <span aria-label="play-state">{deck.playing ? "PLAY" : "PAUSE"}</span>
       </header>
 
-      <div aria-label="track-title">
-        {deck.track_title ?? (
-          <span data-testid={`deck-${deck.id}-empty-hint`} style={{ opacity: 0.6 }}>
-            Pick a track from the library ↓ (or drop one here)
-          </span>
-        )}
+      <div
+        aria-label="track-title"
+        style={{ display: "flex", alignItems: "center", gap: 8 }}
+      >
+        <span style={{ flex: 1, minWidth: 0 }}>
+          {deck.track_title ?? (
+            <span
+              data-testid={`deck-${deck.id}-empty-hint`}
+              style={{ opacity: 0.6 }}
+            >
+              Pick a track from the library ↓ (or drop one here)
+            </span>
+          )}
+        </span>
+        {/*
+          Stems action — kicks `library.compute_stems` for the loaded
+          track, then on the next ready-flip auto-emits
+          `DeckLoadStems`. Disabled until the deck has a loaded library
+          track to operate on (we need its bpm + beatgrid + hot_cues
+          for the stem-load event payload). Label flips during the
+          compute → ready window so the user sees progress without a
+          spinner asset.
+        */}
+        <button
+          type="button"
+          aria-label={`Load stems on deck ${deck.id}`}
+          data-testid={`stems-load-${deck.id}`}
+          disabled={!loaded || loadedTrackMeta === null || stemsRequested}
+          onClick={onStems}
+          style={{
+            background: "#222",
+            color: "#ddd",
+            border: "1px solid #444",
+            borderRadius: 4,
+            padding: "2px 8px",
+            cursor:
+              !loaded || loadedTrackMeta === null ? "not-allowed" : "pointer",
+            fontFamily: "monospace",
+            fontSize: 12,
+          }}
+        >
+          {stemsRequested
+            ? stemStatus.status === "ready"
+              ? "Stems ✓"
+              : stemStatus.status === "failed"
+                ? "Stems ✗"
+                : "Stems…"
+            : "Stems"}
+        </button>
       </div>
 
       <Waveform
@@ -306,6 +430,13 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
         onPitch={onPitch}
         onTempoPct={onTempoPct}
         onEq={onEq}
+      />
+
+      <StemRack
+        deck={deck.id}
+        stemGains={deck.stem_gains}
+        stemMode={deck.stem_mode}
+        client={client}
       />
 
       <dl style={dlStyle}>
