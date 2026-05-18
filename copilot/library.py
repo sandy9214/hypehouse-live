@@ -43,12 +43,14 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Bumped to v3 in the hot-cue persistence PR. v2 added beat-grid columns
-# (anchor_ms / period_ms / downbeats_json); v3 adds ``hot_cues_json`` so
-# the 8-slot per-track hot-cue grid survives track unload/reload.
+# Bumped to v4 in the waveform-render PR. v2 added beat-grid columns
+# (anchor_ms / period_ms / downbeats_json); v3 added ``hot_cues_json``
+# so the 8-slot per-track hot-cue grid survives track unload/reload;
+# v4 adds ``waveform_peaks`` — a packed min/max peak-pairs BLOB used by
+# the UI to draw a real waveform instead of a flat placeholder line.
 # Migrations dispatch on the gap between this constant and the value
 # recorded in the ``schema_version`` table.
-TRACK_SCHEMA_VERSION = 3
+TRACK_SCHEMA_VERSION = 4
 
 # Number of hot-cue slots per deck — mirrors the engine's
 # ``Deck::hot_cues: [Option<u64>; 8]`` array in ``engine/src/state.rs``.
@@ -238,6 +240,16 @@ class TrackLibrary:
                 "ALTER TABLE tracks "
                 f"ADD COLUMN hot_cues_json TEXT NOT NULL DEFAULT '{_HOT_CUES_EMPTY_JSON}'"
             )
+        if "waveform_peaks" not in cols:
+            # v4 migration — adds the packed peak-pairs BLOB column.
+            # NULL = "not yet computed"; the RPC handler treats NULL
+            # as an explicit "compute on demand" signal so existing
+            # rows don't need a backfill pass on schema upgrade.
+            # Format is documented in ``copilot.waveform.compute_peaks``
+            # (2*N i8 bytes, min/max per bucket).
+            self._conn.execute(
+                "ALTER TABLE tracks ADD COLUMN waveform_peaks BLOB"
+            )
         # Stamp the current schema version. The ``schema_version``
         # table is conceptually single-row but ``version`` is also the
         # primary key — using ``INSERT OR REPLACE`` would leave stale
@@ -364,6 +376,19 @@ class TrackLibrary:
             downbeats_ms=downbeats_ms,
         )
         self.add_track(ref)
+        # Compute + persist visual peak-pairs for the UI's waveform
+        # canvas. Wrapped in a broad except because a decode failure
+        # here mustn't abort track ingestion — BPM / key are the
+        # mashing-critical fields, peaks are a render-time nicety.
+        # The RPC handler's NULL-peaks branch handles the fallback.
+        try:
+            from .waveform import compute_peaks  # local import — librosa cold-start.
+
+            peaks = compute_peaks(path_obj)
+            self.set_waveform(ref.track_id, peaks)
+        except Exception:  # noqa: BLE001 — peaks are best-effort.
+            # Leave waveform_peaks NULL; UI falls back to flat line.
+            pass
         return ref
 
     # --- read path --------------------------------------------------------
@@ -376,6 +401,49 @@ class TrackLibrary:
             "SELECT * FROM tracks WHERE track_id = ?", (track_id,)
         ).fetchone()
         return self._row_to_ref(r) if r else None
+
+    def get_waveform(self, track_id: str) -> bytes | None:
+        """Return the stored peak-pairs BLOB for a track, or ``None``.
+
+        Returns ``None`` when:
+
+        * ``track_id`` doesn't exist in the catalog, OR
+        * the row exists but ``waveform_peaks`` is still NULL (the
+          analyzer hasn't filled it yet — pre-v4 row that wasn't
+          re-analyzed, or a stub ``add_track`` insert from a test).
+
+        Callers (the RPC handler) translate both cases into the same
+        ``{peaks_b64: null}`` wire shape so the UI's "no peaks ⇒ draw
+        flat line" branch covers them both. Lazy-compute on first
+        request lives at the RPC layer, not here — keeping this method
+        a pure read keeps it cheap to call from tests + tight loops.
+        """
+        r = self._conn.execute(
+            "SELECT waveform_peaks FROM tracks WHERE track_id = ?",
+            (track_id,),
+        ).fetchone()
+        if r is None:
+            return None
+        blob = r["waveform_peaks"]
+        if blob is None:
+            return None
+        return bytes(blob)
+
+    def set_waveform(self, track_id: str, peaks: bytes) -> None:
+        """Persist a peak-pairs BLOB against an existing track.
+
+        Used by the analyzer (during ``add_track_from_path``) and by
+        the RPC handler's lazy-compute path. Raises :class:`KeyError`
+        if ``track_id`` doesn't exist — surfaced so a stale UI track
+        id doesn't silently no-op into a missing waveform.
+        """
+        cursor = self._conn.execute(
+            "UPDATE tracks SET waveform_peaks = ? WHERE track_id = ?",
+            (peaks, track_id),
+        )
+        if cursor.rowcount == 0:
+            raise KeyError(track_id)
+        self._conn.commit()
 
     def count_tracks(self) -> int:
         """Total row count — used by paginated ``list_tracks`` for the UI."""

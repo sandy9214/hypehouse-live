@@ -47,6 +47,29 @@ const pending = new Map<string, PendingFlush>();
  */
 const loadedTrack = new Map<string, string>();
 
+/** Subscribers notified whenever a deck's loaded track id changes. */
+type LoadedTrackListener = (deckId: string, trackId: string | null) => void;
+const loadedTrackListeners = new Set<LoadedTrackListener>();
+
+/** Subscribe to track-load notifications. Used by the Waveform peaks
+ * fetcher so it can pull the right track's peaks as soon as a new
+ * track is dropped on a deck. Returns an unsubscribe thunk. */
+export const subscribeLoadedTrack = (
+  listener: LoadedTrackListener,
+): (() => void) => {
+  loadedTrackListeners.add(listener);
+  return (): void => {
+    loadedTrackListeners.delete(listener);
+  };
+};
+
+/** Read the currently-loaded library track id for a deck. Public
+ * read API so the Waveform / future consumers can pull peaks for the
+ * right id without their own bookkeeping. Returns `null` when no
+ * library track is bound. */
+export const getLoadedTrack = (deckId: string): string | null =>
+  loadedTrack.get(deckId) ?? null;
+
 /** Record which library track is currently loaded on a deck. */
 export const noteLoadedTrack = (deckId: string, trackId: string): void => {
   loadedTrack.set(deckId, trackId);
@@ -58,9 +81,13 @@ export const noteLoadedTrack = (deckId: string, trackId: string): void => {
     clearTimeout(queued.timer);
   }
   pending.delete(deckId);
+  // Fan out so subscribers (Waveform peaks fetcher) can react.
+  for (const l of loadedTrackListeners) l(deckId, trackId);
 };
 
-/** Read which track id is currently loaded on a deck — testing helper. */
+/** Read which track id is currently loaded on a deck — testing helper.
+ * Kept for backwards compatibility with existing tests; new callers
+ * should prefer the public ``getLoadedTrack`` above. */
 export const __getLoadedTrack = (deckId: string): string | undefined =>
   loadedTrack.get(deckId);
 
