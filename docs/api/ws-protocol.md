@@ -414,6 +414,88 @@ Reserved `id` values:
 | 3  | reverb  | Schroeder 4-comb + 2-allpass |
 | 4  | gate    | beat-synced gate (master BPM x period_div) |
 
+### `library.list_tracks` (co-pilot)
+
+Paginated dump of the co-pilot's SQLite track catalog. Exposed by
+`copilot.library_rpc.LibraryRpcHandler`; the UI calls it on mount to
+populate the Library panel.
+
+**Params** (all optional)
+
+```json
+{ "limit": 100, "offset": 0 }
+```
+
+`limit` is clamped silently to `[1, 1000]`; `offset` is clamped to `>= 0`.
+
+**Result**
+
+```json
+{
+  "tracks": [
+    {
+      "id": "kanye-stronger",
+      "path": "/music/kanye-stronger.mp3",
+      "bpm": 124.0,
+      "camelot_key": "8B",
+      "energy": 0.21,
+      "duration_s": 265.3,
+      "beat_grid_anchor_ms": 0,
+      "beat_period_ms": 483.87,
+      "downbeats_ms": [0, 1935, 3870]
+    }
+  ],
+  "total": 1,
+  "limit": 100,
+  "offset": 0
+}
+```
+
+The `id` / `path` pair is wire-compatible with `state::TrackRef` so a
+returned row can be passed straight into a `DeckLoad` event's `track`
+field.
+
+### `library.search_tracks` (co-pilot)
+
+Substring + shorthand filter search. Shorthand tokens AND together with
+substring tokens.
+
+| Token            | Match                                                    |
+|------------------|----------------------------------------------------------|
+| `foo` (default)  | case-insensitive substring on `track_id` or `path`       |
+| `key:8B`         | exact Camelot key match                                  |
+| `bpm:120-130`    | inclusive BPM range                                      |
+
+**Params**: `{ "query": "<string>", "limit": 100 }` — empty query returns
+the first `limit` rows in alphabetical id order.
+
+**Result**: `{ "tracks": [...], "query": "<echo>", "limit": <int> }`.
+
+### `library.add_track` (co-pilot)
+
+Run the analyzer on a single local file and persist the result.
+
+**Params**: `{ "path": "/absolute/path/to/file.mp3" }`.
+
+**Errors**: `-32602` if `path` is missing or the file doesn't exist /
+isn't a regular file; `-32603` if the analyzer raises.
+
+**Result**: `{ "track": <TrackRef wire shape> }`.
+
+### `library.add_track_from_directory` (co-pilot)
+
+Recursively scan a server-side directory and analyze every supported
+file (`.mp3`, `.wav`, `.flac`, `.m4a`, `.aac`, `.ogg`). Idempotent —
+files already in the catalog (matched by stem) are skipped. Used by
+the UI's empty-state because the browser file picker can't surface
+server-resolvable paths.
+
+**Params**: `{ "path": "/absolute/path/to/music/dir" }`.
+
+**Errors**: `-32602` on bad path; `-32603` on analyzer failure.
+
+**Result**: `{ "added": [...], "added_count": <int>, "total": <int> }`.
+
 ## Server-pushed notifications
 
 Notifications have no `id` and expect no response.

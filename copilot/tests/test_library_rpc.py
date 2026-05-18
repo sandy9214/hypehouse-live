@@ -1,0 +1,270 @@
+"""Library JSON-RPC handler tests.
+
+Covers the four methods exposed by :class:`copilot.library_rpc.LibraryRpcHandler`:
+``library.list_tracks``, ``library.add_track``, ``library.search_tracks``,
+``library.add_track_from_directory``.
+
+Heavy analyzer paths (``add_track_from_path`` / ``add_tracks_from_directory``)
+are exercised via monkeypatching the analyzer wrapper so the tests run
+without librosa/madmom CPU.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from copilot.library import TrackLibrary, TrackRef
+from copilot.library_rpc import (
+    JSONRPC_INVALID_PARAMS,
+    LibraryRpcHandler,
+    RpcError,
+    track_ref_to_wire,
+)
+
+# Most tests in this module are async (they exercise the
+# ``LibraryRpcHandler.dispatch`` coroutine). The two
+# ``test_track_ref_to_wire_*`` / ``test_handler_handles_*`` tests at the
+# bottom are sync and explicitly opt out of the marker.
+_asyncio = pytest.mark.asyncio
+
+
+def _seed(lib: TrackLibrary) -> list[TrackRef]:
+    rows = [
+        TrackRef("alpha", "/m/alpha.mp3", 120.0, "8B", 0.2, 200.0),
+        TrackRef("bravo", "/m/bravo.mp3", 124.0, "8B", 0.3, 210.0),
+        TrackRef("charlie", "/m/charlie.mp3", 128.0, "9B", 0.4, 220.0),
+        TrackRef("delta", "/m/delta.mp3", 130.0, "10A", 0.5, 230.0),
+        TrackRef("echo", "/m/echo.mp3", 140.0, "11A", 0.6, 240.0),
+    ]
+    for r in rows:
+        lib.add_track(r)
+    return rows
+
+
+# ---- list_tracks ----------------------------------------------------
+
+
+@_asyncio
+async def test_list_tracks_returns_all_with_total(library: TrackLibrary):
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.list_tracks", {})
+    assert result["total"] == 5
+    assert len(result["tracks"]) == 5
+    assert result["limit"] == 100
+    assert result["offset"] == 0
+    # Tracks ordered by id alphabetically (stable for scroll).
+    ids = [t["id"] for t in result["tracks"]]
+    assert ids == sorted(ids)
+
+
+@_asyncio
+async def test_list_tracks_paginates(library: TrackLibrary):
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    page1 = await handler.dispatch(
+        "library.list_tracks", {"limit": 2, "offset": 0}
+    )
+    page2 = await handler.dispatch(
+        "library.list_tracks", {"limit": 2, "offset": 2}
+    )
+    page3 = await handler.dispatch(
+        "library.list_tracks", {"limit": 2, "offset": 4}
+    )
+    page_empty = await handler.dispatch(
+        "library.list_tracks", {"limit": 2, "offset": 10}
+    )
+    assert [t["id"] for t in page1["tracks"]] == ["alpha", "bravo"]
+    assert [t["id"] for t in page2["tracks"]] == ["charlie", "delta"]
+    assert [t["id"] for t in page3["tracks"]] == ["echo"]
+    assert page_empty["tracks"] == []
+    # Total is page-independent — UI uses it for the scrollbar.
+    assert page1["total"] == page2["total"] == 5
+
+
+@_asyncio
+async def test_list_tracks_validates_limit_type(library: TrackLibrary):
+    handler = LibraryRpcHandler(library)
+    with pytest.raises(RpcError) as exc:
+        await handler.dispatch("library.list_tracks", {"limit": "not-a-number"})
+    assert exc.value.code == JSONRPC_INVALID_PARAMS
+
+
+@_asyncio
+async def test_list_tracks_clamps_extreme_limit(library: TrackLibrary):
+    """A negative or huge limit shouldn't crash — clamp silently."""
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch(
+        "library.list_tracks", {"limit": -5, "offset": 0}
+    )
+    # Clamped up to 1 — we still get one row back.
+    assert result["limit"] == 1
+    assert len(result["tracks"]) == 1
+
+
+# ---- search_tracks --------------------------------------------------
+
+
+@_asyncio
+async def test_search_substring_matches_id_or_path(library: TrackLibrary):
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.search_tracks", {"query": "echo"})
+    assert [t["id"] for t in result["tracks"]] == ["echo"]
+
+
+@_asyncio
+async def test_search_key_shorthand(library: TrackLibrary):
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.search_tracks", {"query": "key:8B"})
+    assert sorted(t["id"] for t in result["tracks"]) == ["alpha", "bravo"]
+
+
+@_asyncio
+async def test_search_bpm_range_shorthand(library: TrackLibrary):
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch(
+        "library.search_tracks", {"query": "bpm:124-130"}
+    )
+    assert sorted(t["id"] for t in result["tracks"]) == ["bravo", "charlie", "delta"]
+
+
+@_asyncio
+async def test_search_empty_query_returns_all(library: TrackLibrary):
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.search_tracks", {"query": ""})
+    assert len(result["tracks"]) == 5
+
+
+# ---- add_track -------------------------------------------------------
+
+
+@_asyncio
+async def test_add_track_validates_path_missing(library: TrackLibrary):
+    handler = LibraryRpcHandler(library)
+    with pytest.raises(RpcError) as exc:
+        await handler.dispatch(
+            "library.add_track", {"path": "/does/not/exist.mp3"}
+        )
+    assert exc.value.code == JSONRPC_INVALID_PARAMS
+
+
+@_asyncio
+async def test_add_track_requires_path_param(library: TrackLibrary):
+    handler = LibraryRpcHandler(library)
+    with pytest.raises(RpcError) as exc:
+        await handler.dispatch("library.add_track", {})
+    assert exc.value.code == JSONRPC_INVALID_PARAMS
+
+
+@_asyncio
+async def test_add_track_runs_analyzer_and_returns_ref(
+    library: TrackLibrary,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake_track = TrackRef(
+        track_id="fake",
+        path=str(tmp_path / "fake.mp3"),
+        bpm=124.0,
+        camelot_key="8B",
+        energy=0.21,
+        duration_s=200.0,
+        beat_grid_anchor_ms=0,
+        beat_period_ms=483.87,
+        downbeats_ms=[0, 1935, 3870],
+    )
+    (tmp_path / "fake.mp3").write_bytes(b"\x00")
+    monkeypatch.setattr(
+        library,
+        "add_track_from_path",
+        lambda *a, **kw: (library.add_track(fake_track), fake_track)[1],
+    )
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch(
+        "library.add_track", {"path": str(tmp_path / "fake.mp3")}
+    )
+    assert result["track"]["id"] == "fake"
+    assert result["track"]["camelot_key"] == "8B"
+    assert result["track"]["downbeats_ms"] == [0, 1935, 3870]
+
+
+# ---- add_track_from_directory --------------------------------------
+
+
+@_asyncio
+async def test_add_track_from_directory_scans_and_persists(
+    library: TrackLibrary,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    (tmp_path / "song1.mp3").write_bytes(b"\x00")
+    (tmp_path / "song2.mp3").write_bytes(b"\x00")
+    (tmp_path / "notes.txt").write_text("ignore me")
+
+    def fake_analyzer(path, **_):
+        ref = TrackRef(
+            track_id=Path(path).stem,
+            path=str(path),
+            bpm=120.0,
+            camelot_key="8B",
+            energy=0.2,
+            duration_s=180.0,
+        )
+        library.add_track(ref)
+        return ref
+
+    monkeypatch.setattr(library, "add_track_from_path", fake_analyzer)
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch(
+        "library.add_track_from_directory", {"path": str(tmp_path)}
+    )
+    assert result["added_count"] == 2
+    assert {t["id"] for t in result["added"]} == {"song1", "song2"}
+    assert result["total"] == 2
+
+
+@_asyncio
+async def test_add_track_from_directory_rejects_missing(library: TrackLibrary):
+    handler = LibraryRpcHandler(library)
+    with pytest.raises(RpcError) as exc:
+        await handler.dispatch(
+            "library.add_track_from_directory", {"path": "/no/such/dir"}
+        )
+    assert exc.value.code == JSONRPC_INVALID_PARAMS
+
+
+# ---- shape / wire helpers ------------------------------------------
+
+
+def test_track_ref_to_wire_renames_id_field() -> None:
+    ref = TrackRef(
+        "kid_cudi-day_n_night",
+        "/m/cudi.mp3",
+        128.0,
+        "8A",
+        0.3,
+        240.0,
+        beat_period_ms=60_000.0 / 128.0,
+    )
+    wire = track_ref_to_wire(ref)
+    assert wire["id"] == "kid_cudi-day_n_night"
+    assert "track_id" not in wire
+    assert wire["downbeats_ms"] == []
+    assert wire["beat_period_ms"] == pytest.approx(60_000.0 / 128.0)
+
+
+def test_handler_handles_and_namespace_match() -> None:
+    handler = LibraryRpcHandler.__new__(LibraryRpcHandler)
+    handler._library = None  # type: ignore[attr-defined]
+    assert handler.handles("library.list_tracks")
+    assert handler.handles("library.search_tracks")
+    assert not handler.handles("engine.list_effects")
+    assert handler.NAMESPACE == "library"
+
+
