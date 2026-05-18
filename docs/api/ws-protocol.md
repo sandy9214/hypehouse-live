@@ -548,6 +548,43 @@ The returned `track` is the freshly-persisted row including the new
 
 **Result**: `{ "added": [...], "added_count": <int>, "total": <int> }`.
 
+### `library.get_waveform` (co-pilot)
+
+Return packed min/max peak pairs used by the UI's `Waveform` canvas
+to draw a real waveform (instead of the v0.1 placeholder flat line).
+Peaks are computed copilot-side at ingest time (see
+`copilot/waveform.py`) and stored in the `waveform_peaks` BLOB column.
+Tracks that pre-date schema v4 (or were inserted without peaks via
+the test path) trigger a lazy compute on first request.
+
+**Params**:
+
+```json
+{ "track_id": "kanye-stronger" }
+```
+
+**Result**:
+
+```json
+{
+  "track_id": "kanye-stronger",
+  "peaks_b64": "AAECAwQF..."
+}
+```
+
+* `peaks_b64` — base64-encoded packed peak-pairs bytes. Layout is
+  `[min_0, max_0, min_1, max_1, ...]` where each value is an `i8` in
+  `[-128, 127]` mapping audio `[-1.0, 1.0]`. Default 2000 buckets ⇒
+  4000 bytes raw ⇒ ~5400 b64 chars.
+* `peaks_b64` is `null` when the track is unknown, when peaks haven't
+  been computed yet, or when a lazy-compute attempt failed (file
+  moved, codec missing). The UI's `null` branch falls back to the
+  flat-line render so this is a graceful degradation rather than an
+  error.
+
+**Errors**: `-32602` if `track_id` is missing / empty. Unknown
+`track_id` is *not* an error — it returns `peaks_b64: null`.
+
 ## Server-pushed notifications
 
 Notifications have no `id` and expect no response.

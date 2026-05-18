@@ -6,6 +6,7 @@
 // Sub-rows (transport buttons, knob row, hot-cue grid) live in
 // DeckControls.tsx; this file owns the layout + RPC-emit wiring.
 
+import { useEffect, useState } from "react";
 import type { CSSProperties, DragEvent as ReactDragEvent, JSX } from "react";
 import type { JsonRpcWS } from "../ws/client";
 import type { Deck as DeckState } from "../store/engine";
@@ -23,9 +24,12 @@ import {
 import { EffectRack } from "./EffectRack";
 import { useEffectsManifest } from "../store/effectsManifest";
 import {
+  getLoadedTrack,
   noteLoadedTrack,
   recordHotCueSet,
+  subscribeLoadedTrack,
 } from "../store/hotCuePersist";
+import { useWaveform } from "../store/waveform";
 
 export interface DeckProps {
   deck: DeckState;
@@ -74,6 +78,39 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
   const hasLoopIn = deck.loop_in_ms !== null;
   const looping = loopActive(deck);
   const manifest = useEffectsManifest(client);
+
+  // Track the library track id currently bound to this deck so we can
+  // fetch peaks. `noteLoadedTrack` (fired from the drop handler below)
+  // pushes the id into a module-scope map + notifies subscribers; we
+  // mirror it here as React state so the Waveform re-renders.
+  const [loadedTrackId, setLoadedTrackId] = useState<string | null>(
+    (): string | null => getLoadedTrack(deck.id),
+  );
+  useEffect((): (() => void) => {
+    // Initial sync — covers the "deck was loaded before this component
+    // mounted" case (drag-load → re-render before first Effect runs).
+    setLoadedTrackId(getLoadedTrack(deck.id));
+    return subscribeLoadedTrack((d, t): void => {
+      if (d === deck.id) setLoadedTrackId(t);
+    });
+  }, [deck.id]);
+  // When the engine reports an empty deck (track unloaded by some other
+  // surface), clear our id so the Waveform falls back to flat. We can't
+  // detect "engine cleared the deck" any other way — the engine state
+  // mirror has no track_id field.
+  useEffect((): void => {
+    if (!loaded && loadedTrackId !== null) setLoadedTrackId(null);
+  }, [loaded, loadedTrackId]);
+  const peaks = useWaveform(client, loadedTrackId);
+  // Track duration (ms) for playhead positioning. Captured at
+  // DeckLoad time from the LibraryTrack payload — the engine's deck
+  // state mirror doesn't carry duration today (it isn't needed by the
+  // audio thread). When deck is unloaded we drop back to 0 so the
+  // playhead stops drawing.
+  const [durationMs, setDurationMs] = useState<number>(0);
+  useEffect((): void => {
+    if (!loaded) setDurationMs(0);
+  }, [loaded]);
 
   const onPlayPause = (): void => {
     if (!loaded) return;
@@ -169,6 +206,10 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
     // is now bound to. Subsequent `HotCueSet` events for this deck
     // will debounce-write back to this `track_id`.
     noteLoadedTrack(deck.id, track.id);
+    // Capture duration locally so the Waveform playhead can position
+    // itself. Engine state mirror doesn't carry duration — it isn't
+    // needed by the audio thread, only by the visualiser.
+    setDurationMs(Math.round((track.duration_s ?? 0) * 1000));
   };
 
   return (
@@ -192,7 +233,11 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
         )}
       </div>
 
-      <Waveform />
+      <Waveform
+        peaks={peaks}
+        positionMs={deck.position_ms}
+        durationMs={durationMs}
+      />
 
       <TransportRow
         deck={deck}

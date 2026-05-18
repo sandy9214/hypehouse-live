@@ -43,6 +43,7 @@ anchor / downbeats fields the engine needs.
 """
 from __future__ import annotations
 
+import base64
 import logging
 from pathlib import Path
 from typing import Any
@@ -143,6 +144,7 @@ class LibraryRpcHandler:
         "search_tracks",
         "add_track_from_directory",
         "set_hot_cues",
+        "get_waveform",
     )
 
     def __init__(self, library: TrackLibrary):
@@ -177,6 +179,8 @@ class LibraryRpcHandler:
             return self._add_track_from_directory(params)
         if method == "library.set_hot_cues":
             return self._set_hot_cues(params)
+        if method == "library.get_waveform":
+            return self._get_waveform(params)
         raise RpcError(-32601, f"method not found: {method}")
 
     # --- handlers -----------------------------------------------------
@@ -266,6 +270,66 @@ class LibraryRpcHandler:
                 data={"track_id": track_id},
             ) from exc
         return {"track": track_ref_to_wire(ref)}
+
+    def _get_waveform(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Return base64-encoded peak-pairs bytes for ``track_id``.
+
+        Wire shape::
+
+            { "track_id": "..." }
+
+        Returns::
+
+            { "track_id": "...", "peaks_b64": "<base64>" }   # success
+            { "track_id": "...", "peaks_b64": null }         # missing/un-analyzed
+
+        Lazy-compute path: if the row exists but ``waveform_peaks`` is
+        NULL (e.g. a pre-v4 row that wasn't re-analyzed), attempt to
+        compute peaks from the on-disk audio path *now* and persist
+        them. A compute failure (file moved, codec missing) returns
+        ``peaks_b64: null`` rather than an error envelope so the UI's
+        flat-line fallback path still works.
+
+        Why base64 rather than a binary frame: keeps the wire shape a
+        plain JSON-RPC ``result`` dict, no out-of-band framing. 2000
+        peak pairs = 4000 bytes → ~5400 b64 chars, well under any
+        practical JSON message size limit.
+        """
+        track_id = _coerce_str(params.get("track_id"), field="track_id")
+        ref = self._library.get(track_id)
+        if ref is None:
+            # No such track. Return a "not found" envelope rather than
+            # an error — keeps the UI's single fetch path simple
+            # (always check ``peaks_b64 != null`` before rendering).
+            return {"track_id": track_id, "peaks_b64": None}
+
+        peaks = self._library.get_waveform(track_id)
+        if peaks is None:
+            # Lazy compute on first request. Wrapped in a broad except
+            # because the underlying audio file might be unreachable
+            # (NFS mount lost, file deleted post-ingest) — the UI
+            # falls back gracefully on null.
+            try:
+                from .waveform import compute_peaks  # lazy librosa import
+
+                computed = compute_peaks(Path(ref.path))
+            except Exception:  # noqa: BLE001 — peaks are best-effort
+                log.warning(
+                    "get_waveform: lazy compute failed for %s", track_id
+                )
+                return {"track_id": track_id, "peaks_b64": None}
+            # Persist so the next request is a fast read.
+            try:
+                self._library.set_waveform(track_id, computed)
+            except KeyError:
+                # Track removed between the .get and the set — rare race.
+                pass
+            peaks = computed
+
+        return {
+            "track_id": track_id,
+            "peaks_b64": base64.b64encode(peaks).decode("ascii"),
+        }
 
     def _add_track_from_directory(
         self, params: dict[str, Any]
