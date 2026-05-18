@@ -1,6 +1,6 @@
 # ADR-007 — External clock sync (Ableton Link, MIDI clock)
 
-**Status**: Accepted 2026-05-17 — scope: v0.1 = MIDI clock OUT only; v0.2+ = Ableton Link.
+**Status**: Accepted 2026-05-17 — scope: v0.1 = MIDI clock OUT only (**implemented** — see `engine/src/midi/clock_out.rs`); v0.2+ = Ableton Link.
 **Decider**: Sandeep Gorai
 **Trigger**: Council review flagged this as a long-term refactor risk if punted (Cohere).
 
@@ -57,6 +57,18 @@ Every audio buffer, the engine advances `frame` by buffer-size + recomputes `mas
 ## What v0.1 ships
 
 Stub `EngineClock` with `ClockSource::Internal` only. MIDI clock OUT module behind a feature flag, default off. Real wiring lands in a v0.1.x PR after audio thread is in place.
+
+### v0.1 implementation notes (PR `engine-midi-clock-out-v01`)
+
+The MIDI clock OUT module landed against `main` with the following shape:
+
+* **Module**: [`engine/src/midi/clock_out.rs`](../../engine/src/midi/clock_out.rs) — `MidiClockOut::start(Some("device-substring"), shared_clock)` opens a `midir::MidiOutput` port (substring match, case-insensitive), spawns a `std::thread` named `hypehouse-midi-clock-out`, and emits MIDI **Start** (0xFA) once, then **Clock** (0xF8) at 24 PPQN derived from `SharedClock::master_bpm()` (re-read every tick so `SetMasterBpm` propagates within one tick).
+* **Shutdown**: `Drop` on the handle sets a cancellation flag, joins the worker (≤1 tick period), and emits **Stop** (0xFC).
+* **Configuration**: env var `MIDI_CLOCK_OUT_DEVICE` selects the port. Empty / unset = disabled. Cargo feature `midi-clock-out` gates compilation of the `midir` output binding — default off.
+* **Tempo source**: `EventKind::SetMasterBpm { bpm: f32 }` updates `EngineState::master_bpm` (validated f32) AND mirrors into `SharedClock` via a side-channel atomic (`AtomicU32` storing `f32::to_bits`). The audio thread does not consume `SetMasterBpm` — only the MIDI clock OUT (and, in v0.2, Ableton Link) reads `SharedClock::master_bpm()`.
+* **Anchor deck**: not yet wired. `ClockSource::Internal { anchor_deck: None }` is implied. v0.1.x will add an `EventKind::SetClockAnchor { deck: Option<DeckId> }` and the control loop will mirror that deck's BPM on `DeckLoad` / `PitchBend`.
+* **Timing**: ~10 ms `thread::sleep` + spin-yield tail. Measured ~35 µs mean / 400 µs stddev / ~6 ms max jitter on a 2024 M2 MacBook Air running a release build (Cargo also active). MIDI hardware tolerates ±5 ms; pure-spin opt-in is a v0.2 nice-to-have.
+* **Tests**: 12 unit tests against an in-memory `MidiSink` trait — 24 PPQN @ 120 BPM, Start emission, BPM change reactivity, Drop emits Stop, substring port selection, bad-BPM clamp, 1 BPM idle (no busy loop).
 
 ## What v0.2+ unlocks
 

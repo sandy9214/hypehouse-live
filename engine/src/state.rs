@@ -121,6 +121,13 @@ pub enum EventKind {
         deck: DeckId,
         delta_ms: i32,
     },
+    /// Set the session master BPM (ADR-007 §v0.1). Drives the MIDI clock
+    /// OUT tick thread + any future Ableton Link master. Non-finite or
+    /// non-positive values are clamped to the previous master BPM by
+    /// the reducer (no-op apply).
+    SetMasterBpm {
+        bpm: f32,
+    },
     /// Effects (ADR-006).
     EffectAssign {
         deck: DeckId,
@@ -229,6 +236,14 @@ pub struct EngineState {
     pub crossfader: f32, // 0.0 = full A, 1.0 = full B
     pub master_volume_db: f32,
     pub session_active: bool,
+    /// Session master BPM (ADR-007 §v0.1). Drives MIDI clock OUT period.
+    /// Default 120.0, updated by `EventKind::SetMasterBpm`.
+    #[serde(default = "default_master_bpm")]
+    pub master_bpm: f32,
+}
+
+fn default_master_bpm() -> f32 {
+    120.0
 }
 
 impl Default for EngineState {
@@ -239,6 +254,7 @@ impl Default for EngineState {
             crossfader: 0.5,
             master_volume_db: 0.0,
             session_active: false,
+            master_bpm: default_master_bpm(),
         }
     }
 }
@@ -404,6 +420,13 @@ impl EngineState {
             }
             EventKind::CopilotDisengage { deck: id } => {
                 next.deck_mut(*id).copilot_engaged = false;
+            }
+            EventKind::SetMasterBpm { bpm } => {
+                if bpm.is_finite() && *bpm > 0.0 {
+                    next.master_bpm = *bpm;
+                }
+                // Otherwise: no-op. The reducer is pure and the
+                // SharedClock side ignores bad values too.
             }
             EventKind::TakeOver {
                 deck: id,
