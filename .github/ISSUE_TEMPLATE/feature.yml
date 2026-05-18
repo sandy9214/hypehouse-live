@@ -1,0 +1,55 @@
+name: "Feature / refactor"
+description: New capability or planned restructure
+labels: ["type:feature"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user/operator pain does this solve? Who benefits?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Sketch of the implementation. Reference any ADR or council source.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches and why they were rejected.
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options: ["p1", "p2", "p3", "p4"]
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - "engine"
+        - "ui"
+        - "copilot"
+        - "midi"
+        - "audio"
+        - "bridge"
+        - "infra"
+        - "docs"
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      placeholder: |
+        - [ ] Code change merged
+        - [ ] Tests added
+        - [ ] ADR written if architecture changes
+        - [ ] CLAUDE.md updated if convention changes

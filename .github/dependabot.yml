@@ -1,0 +1,86 @@
+version: 2
+
+# hypehouse-live dependency updates.
+# Three language ecosystems (cargo / npm / pip) + the GitHub Actions versions
+# that pin our workflows. Weekly cadence to avoid noise; group dev/test deps.
+
+updates:
+  # Rust audio engine
+  - package-ecosystem: "cargo"
+    directory: "/engine"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 5
+    labels:
+      - "type:chore"
+      - "area:engine"
+      - "priority:p3"
+    commit-message:
+      prefix: "deps(cargo)"
+    groups:
+      audio-stack:
+        patterns: ["cpal", "symphonia*", "rubato", "midir"]
+      dev-tools:
+        patterns: ["criterion", "proptest", "assert_no_alloc"]
+
+  # TypeScript frontend
+  - package-ecosystem: "npm"
+    directory: "/ui"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 5
+    labels:
+      - "type:chore"
+      - "area:ui"
+      - "priority:p3"
+    commit-message:
+      prefix: "deps(npm)"
+    groups:
+      dev-tools:
+        patterns:
+          - "vite*"
+          - "@vitejs/*"
+          - "vitest*"
+          - "@testing-library/*"
+          - "typescript"
+          - "@types/*"
+          - "jsdom"
+
+  # Python co-pilot
+  - package-ecosystem: "pip"
+    directory: "/copilot"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 5
+    labels:
+      - "type:chore"
+      - "area:copilot"
+      - "priority:p3"
+    commit-message:
+      prefix: "deps(pip)"
+    groups:
+      dev-tools:
+        patterns: ["pytest*", "ruff", "mypy"]
+
+  # GitHub Actions pinned versions across workflows
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels:
+      - "type:chore"
+      - "area:infra"
+      - "priority:p4"
+    commit-message:
+      prefix: "deps(actions)"

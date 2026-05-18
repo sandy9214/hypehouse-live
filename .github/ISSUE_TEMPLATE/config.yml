@@ -1,0 +1,7 @@
+blank_issues_enabled: false
+# Add hypehouse-live-specific contact_links below as needed.
+# Example:
+# contact_links:
+#   - name: Roadmap
+#     url: https://github.com/<owner>/hypehouse-live/blob/main/tasks/roadmap.md
+#     about: Current roadmap

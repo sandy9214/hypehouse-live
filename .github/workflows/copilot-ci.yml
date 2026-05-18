@@ -1,0 +1,55 @@
+name: copilot-ci
+
+# Python AI co-pilot service (JSON-RPC client → engine).
+# Runs only when copilot/ changes. mypy starts non-blocking; promote to
+# blocking once the codebase is fully type-annotated.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'copilot/**'
+      - '.github/workflows/copilot-ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'copilot/**'
+      - '.github/workflows/copilot-ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: copilot lint + test (ubuntu / py3.11)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: copilot
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: copilot/pyproject.toml
+
+      - name: Install copilot (with test extras) + lint tooling
+        # pyproject defines a `test` extra (pytest + pytest-asyncio). ruff + mypy
+        # aren't declared as dev deps yet — install them inline so this workflow
+        # is self-contained until a future PR adds a `dev` extra.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+          pip install ruff mypy
+
+      - name: ruff (lint)
+        run: ruff check .
+
+      - name: mypy (non-blocking initially)
+        run: mypy . || true
+
+      - name: pytest
+        run: pytest

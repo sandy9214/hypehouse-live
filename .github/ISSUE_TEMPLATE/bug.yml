@@ -1,0 +1,79 @@
+name: "Bug"
+description: A defect or unexpected behavior
+labels: ["type:bug"]
+body:
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Exact steps to reproduce. Include OS, audio device, MIDI controller if relevant.
+      placeholder: |
+        1. Start engine with `cargo run`
+        2. Load track A.mp3 on deck A
+        3. Move crossfader to center
+        4. Engine panics in audio callback
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+      description: What should have happened.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual
+      description: What actually happened. Include logs, stack traces, dropouts, MIDI traces.
+    validations:
+      required: true
+  - type: textarea
+    id: root-cause
+    attributes:
+      label: Suspected root cause
+      description: Best guess + which file:line you believe is wrong.
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - "p1 (critical, live-set break, audio dropouts, data loss)"
+        - "p2 (high, fix this sprint)"
+        - "p3 (medium, next sprint)"
+        - "p4 (nice-to-have)"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - "engine"
+        - "ui"
+        - "copilot"
+        - "midi"
+        - "audio"
+        - "bridge"
+        - "infra"
+        - "docs"
+    validations:
+      required: true
+  - type: checkboxes
+    id: hot-path
+    attributes:
+      label: Hot path / safety risk?
+      options:
+        - label: Touches the audio-thread callback (must stay alloc-free per ADR-004)
+        - label: Touches MIDI input validation
+        - label: Could drop event-sourced log entries
+        - label: Cosmetic / observability only
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      placeholder: |
+        - [ ] Failing test added that demonstrates the bug
+        - [ ] Fix passes the test
+        - [ ] ADR / runbook updated if architecture / convention changes
