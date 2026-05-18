@@ -454,7 +454,7 @@ mod tests {
     fn list_sessions_caps_at_50_sessions() {
         let root = scratch_root("cap");
         for i in 0..55 {
-            let sid = format!("20260101T00{:02}00Z-cap{i}", i);
+            let sid = format!("20260101T00{i:02}00Z-cap{i}");
             let path = root.join(&sid).join("events.jsonl");
             let e = Event {
                 id: 1,
