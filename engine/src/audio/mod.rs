@@ -28,6 +28,7 @@ pub mod decode;
 pub mod effects;
 pub mod io;
 pub mod mixer;
+pub mod pitch_tempo;
 pub mod ring;
 pub mod translator;
 
@@ -43,5 +44,9 @@ pub use effects::{
     EFFECT_REVERB, MAX_PARAMS as EFFECT_MAX_PARAMS,
 };
 pub use mixer::AudioMixer;
+pub use pitch_tempo::{
+    clamp_pitch_semitones, clamp_tempo_ratio, semitones_to_ratio, PitchTempo, MAX_PITCH_SEMITONES,
+    MAX_TEMPO_RATIO, MIN_PITCH_SEMITONES, MIN_TEMPO_RATIO,
+};
 pub use ring::{AudioConsumer, AudioProducer, AudioRing, RING_CAPACITY};
 pub use translator::{event_to_commands, AudioCmdBatch, BAR_BEATS, DEFAULT_RAMP_MS};

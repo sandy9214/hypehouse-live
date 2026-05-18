@@ -106,13 +106,38 @@ export const TransportRow = ({
   </div>
 );
 
+// Pioneer-style tempo slider range: ±8% (a `tempo_ratio` of 0.92..1.08).
+// The knob's slider value lives in **percent** so the UX matches CDJ
+// hardware labelling (0 % = nominal, +8 % = faster); we transform to a
+// ratio at the wire boundary (`onTempoPct` → submit `TempoBend { ratio
+// = 1 + pct / 100 }`).
+const TEMPO_PCT_MIN = -8;
+const TEMPO_PCT_MAX = 8;
+const TEMPO_PCT_STEP = 0.05;
+
+/** Format a tempo-percent value for the knob readout, e.g. `+3.20 %`. */
+const fmtTempoPct = (pct: number): string =>
+  `${pct >= 0 ? "+" : ""}${pct.toFixed(2)} %`;
+
+/** Convert `Deck::tempo_ratio` (e.g. 1.03) → percent for the knob (3). */
+export const tempoRatioToPct = (ratio: number): number => (ratio - 1) * 100;
+
+/** Convert knob percent (e.g. 3) → `Deck::tempo_ratio` (1.03). */
+export const tempoPctToRatio = (pct: number): number => 1 + pct / 100;
+
 export interface KnobRowProps {
   deck: DeckState;
   onPitch: (v: number) => void;
+  onTempoPct: (pct: number) => void;
   onEq: (band: EqBand, v: number) => void;
 }
 
-export const KnobRow = ({ deck, onPitch, onEq }: KnobRowProps): JSX.Element => (
+export const KnobRow = ({
+  deck,
+  onPitch,
+  onTempoPct,
+  onEq,
+}: KnobRowProps): JSX.Element => (
   <div style={knobRowStyle}>
     <Knob
       label="PITCH"
@@ -124,6 +149,20 @@ export const KnobRow = ({ deck, onPitch, onEq }: KnobRowProps): JSX.Element => (
       testId={`pitch-${deck.id}`}
       ariaLabel={`pitch-${deck.id}`}
       format={fmtSt}
+    />
+    <Knob
+      label="TEMPO"
+      min={TEMPO_PCT_MIN}
+      max={TEMPO_PCT_MAX}
+      step={TEMPO_PCT_STEP}
+      // The store mirrors `tempo_ratio` directly; convert for display so
+      // a double-click reset (knob.resetValue = 0) snaps the slider to
+      // nominal speed (1.0× = 0 %).
+      value={tempoRatioToPct(deck.tempo_ratio)}
+      onChange={onTempoPct}
+      testId={`tempo-${deck.id}`}
+      ariaLabel={`tempo-${deck.id}`}
+      format={fmtTempoPct}
     />
     {EQ_BANDS.map((b): JSX.Element => (
       <Knob
@@ -141,6 +180,33 @@ export const KnobRow = ({ deck, onPitch, onEq }: KnobRowProps): JSX.Element => (
     ))}
   </div>
 );
+
+/**
+ * Render the effective BPM (= `bpm × tempo_ratio`) with a small "±"
+ * marker showing how far we are from the deck's nominal BPM. Hidden
+ * when `bpm` is missing or when tempo_ratio is exactly 1.0.
+ *
+ * Returns a single inline span so the parent's `<dd>` cell can hold the
+ * combined "<bpm> ±<delta>" readout next to the static BPM number.
+ */
+export const formatEffectiveBpm = (
+  bpm: number | null,
+  tempoRatio: number,
+): { effective: string; delta: string | null } => {
+  if (bpm === null) return { effective: "—", delta: null };
+  const effective = bpm * tempoRatio;
+  const delta = (effective - bpm).toFixed(2);
+  // The marker is purely informational; sub-0.01 BPM drifts are below
+  // the resolution of any DJ display, so suppress them to avoid jitter.
+  if (Math.abs(effective - bpm) < 0.01) {
+    return { effective: effective.toFixed(2), delta: null };
+  }
+  const sign = effective - bpm >= 0 ? "+" : "-";
+  return {
+    effective: effective.toFixed(2),
+    delta: `${sign}${Math.abs(Number(delta)).toFixed(2)}`,
+  };
+};
 
 export interface HotCueGridProps {
   deck: DeckState;

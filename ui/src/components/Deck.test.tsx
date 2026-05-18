@@ -32,6 +32,7 @@ const baseDeck = (): DeckState => ({
   eq_mid: 0,
   eq_high: 0,
   pitch_semitones: 0,
+  tempo_ratio: 1.0,
   hot_cues: [null, null, null, null, null, null, null, null],
   loop_in_ms: null,
   loop_out_ms: null,
