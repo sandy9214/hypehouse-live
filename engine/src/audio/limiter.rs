@@ -623,11 +623,12 @@ mod perf {
             "limiter_worst_case_1024frames_ns={worst_ns} (~{:.2}µs)",
             worst_ns as f64 / 1000.0
         );
-        // 500 µs ceiling — generous; observed worst case is typically
-        // ≤ 20 µs even in debug builds.
+        // 5 ms ceiling — generous for shared CI runners (macOS in
+        // particular spikes well past 500µs under build contention).
+        // Observed worst case on a quiet laptop ≤ 20µs.
         assert!(
-            worst_ns < 500_000,
-            "limiter process took {worst_ns} ns for 1024 frames — over 500 µs budget",
+            worst_ns < 5_000_000,
+            "limiter process took {worst_ns} ns for 1024 frames — over 5 ms budget",
         );
     }
 }
