@@ -141,6 +141,134 @@ async def test_search_empty_query_returns_all(library: TrackLibrary):
     assert len(result["tracks"]) == 5
 
 
+# ---- smart filters: bpm_min / bpm_max / compatible_with_track_id ---
+
+
+@_asyncio
+async def test_search_bpm_min_max_inclusive_range(library: TrackLibrary):
+    """Structured ``bpm_min`` + ``bpm_max`` filter (chip UI surface).
+
+    Seed BPMs are 120/124/128/130/140 — a 124..130 inclusive range
+    must return exactly bravo/charlie/delta.
+    """
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch(
+        "library.search_tracks",
+        {"query": "", "bpm_min": 124, "bpm_max": 130},
+    )
+    assert sorted(t["id"] for t in result["tracks"]) == [
+        "bravo",
+        "charlie",
+        "delta",
+    ]
+
+
+@_asyncio
+async def test_search_bpm_only_one_bound(library: TrackLibrary):
+    """A missing bound means "open on that side"."""
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    high = await handler.dispatch(
+        "library.search_tracks", {"query": "", "bpm_min": 130}
+    )
+    assert sorted(t["id"] for t in high["tracks"]) == ["delta", "echo"]
+    low = await handler.dispatch(
+        "library.search_tracks", {"query": "", "bpm_max": 124}
+    )
+    assert sorted(t["id"] for t in low["tracks"]) == ["alpha", "bravo"]
+
+
+@_asyncio
+async def test_search_compatible_with_returns_within_2_camelot(
+    library: TrackLibrary,
+):
+    """Camelot-distance gate (≤ 2) excludes distant keys.
+
+    Reference = ``alpha`` (8B). Distances:
+      * alpha 8B  -> 0  (excluded — reference itself)
+      * bravo 8B  -> 0  (compatible, but reference itself dropped)
+      * charlie 9B -> 1 (compatible)
+      * delta 10A  -> 3 (NOT compatible — gated out)
+      * echo 11A   -> 4 (NOT compatible — gated out)
+    """
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch(
+        "library.search_tracks",
+        {"query": "", "compatible_with_track_id": "alpha"},
+    )
+    ids = sorted(t["id"] for t in result["tracks"])
+    assert "alpha" not in ids  # reference itself is filtered
+    assert ids == ["bravo", "charlie"]
+
+
+@_asyncio
+async def test_search_compatible_with_combined_with_bpm_range(
+    library: TrackLibrary,
+):
+    """Filter composition — chip + chip must AND together."""
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch(
+        "library.search_tracks",
+        {
+            "query": "",
+            "compatible_with_track_id": "alpha",
+            "bpm_min": 125,
+        },
+    )
+    # alpha excluded (self); bravo BPM=124 < 125 -> dropped; charlie
+    # passes both gates (9B + 128 BPM).
+    assert [t["id"] for t in result["tracks"]] == ["charlie"]
+
+
+@_asyncio
+async def test_search_compatible_with_unknown_track_id_returns_empty(
+    library: TrackLibrary,
+):
+    """An unknown reference id degrades to no matches (not an error).
+
+    Matches the spec: filter is best-effort, UI surfaces empty list +
+    "no matches" hint rather than an error banner.
+    """
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch(
+        "library.search_tracks",
+        {"query": "", "compatible_with_track_id": "nope"},
+    )
+    assert result["tracks"] == []
+
+
+@_asyncio
+async def test_search_bpm_min_rejects_bool(library: TrackLibrary):
+    """``True`` is not 1.0 — boolean coercion would silently misfire."""
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    with pytest.raises(RpcError) as exc:
+        await handler.dispatch(
+            "library.search_tracks",
+            {"query": "", "bpm_min": True},
+        )
+    assert exc.value.code == JSONRPC_INVALID_PARAMS
+
+
+@_asyncio
+async def test_search_compatible_with_compounds_with_query_substring(
+    library: TrackLibrary,
+):
+    """Compat filter + free-text query AND together (post-filter on text)."""
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch(
+        "library.search_tracks",
+        {"query": "char", "compatible_with_track_id": "alpha"},
+    )
+    # Only charlie matches "char" substring AND ≤2 from 8B (charlie=9B).
+    assert [t["id"] for t in result["tracks"]] == ["charlie"]
+
+
 # ---- add_track -------------------------------------------------------
 
 
