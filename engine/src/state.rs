@@ -121,6 +121,21 @@ pub enum EventKind {
         /// direct copy.
         #[serde(default = "default_hot_cues")]
         hot_cues: [Option<u64>; 8],
+        /// Per-track loudness-leveler gain in **decibels**, sourced
+        /// from the copilot's :func:`copilot.loudness.compute_lufs`
+        /// pass. `0.0` = no change (the engine's pre-loudness-PR
+        /// behaviour). Positive = boost (the track was mastered
+        /// quieter than the streaming reference, e.g. a -23 LUFS
+        /// jazz cut → +9 dB). Negative = cut (a +8 LUFS EDM master
+        /// → -6 dB). Optional via serde default so old payloads
+        /// (and tracks whose copilot row pre-dates the v7 schema)
+        /// still deserialize — they just load with 0 dB which is
+        /// audibly identical to the v0 mixer.
+        ///
+        /// The mixer applies `10^(track_gain_db / 20)` to every
+        /// sample on the deck slice, post-decode + pre-effects.
+        #[serde(default)]
+        track_gain_db: f32,
     },
     /// ADR review Groq: explicit DeckUnload so the engine can free buffers
     /// and clear state cleanly (vs. relying on DeckLoad implicit replace).
@@ -352,6 +367,22 @@ pub struct Deck {
     pub loop_active: bool,
     pub hot_cues: [Option<u64>; 8],
     pub copilot_engaged: bool,
+    /// Per-track loudness-leveler gain in **decibels**, set by
+    /// `EventKind::DeckLoad` from the copilot's pre-computed
+    /// `track_gain_db` library column. `0.0` = no change (the
+    /// engine's pre-loudness-PR behaviour). The mixer's `DeckHot`
+    /// mirror is what the audio thread actually multiplies into the
+    /// deck slice; the state-side copy exists so a snapshot consumer
+    /// (UI, persistence) can show the user how much gain is being
+    /// applied per deck.
+    ///
+    /// Clamped by the copilot (`copilot/loudness.py` caps to
+    /// `[-20, +14]` dB) so the audio-side multiply never trips the
+    /// master limiter unnecessarily. The reducer additionally
+    /// guards against non-finite payloads (treats them as 0.0)
+    /// since serde will happily accept any f32 bit pattern.
+    #[serde(default)]
+    pub track_gain_db: f32,
     /// Council ADR-002 review (Codex): live mixing needs beatgrid + tempo
     /// + phase on the deck or beat-matching can't be reasoned about.
     pub bpm: f32,
@@ -420,6 +451,7 @@ impl Default for Deck {
             loop_active: false,
             hot_cues: [None; 8],
             copilot_engaged: false,
+            track_gain_db: 0.0,
             bpm: 0.0,
             beat_grid_anchor_ms: 0,
             beat_period_ms: 0.0,
@@ -540,6 +572,7 @@ impl EngineState {
                 beat_grid_anchor_ms,
                 downbeats_ms,
                 hot_cues,
+                track_gain_db,
             } => {
                 let d = next.deck_mut(*id);
                 d.loaded = Some(track.clone());
@@ -568,6 +601,20 @@ impl EngineState {
                 // via the serde default and so behave exactly like
                 // before.
                 d.hot_cues = *hot_cues;
+                // Loudness leveler — defensive against non-finite
+                // payloads. The copilot side already clamps to
+                // `[-20, +14]` dB but a buggy / malicious bridge
+                // client could ship a NaN, which would propagate
+                // into a NaN multiply on every audio sample. Treat
+                // non-finite as 0 dB (= passthrough). No upper / lower
+                // clamp here — that's the copilot's responsibility,
+                // and we'd rather a too-loud value land at the master
+                // limiter than silently re-shape the user's request.
+                d.track_gain_db = if track_gain_db.is_finite() {
+                    *track_gain_db
+                } else {
+                    0.0
+                };
                 // Full-mix load clears stem-mode (mutually exclusive
                 // with DeckLoadStems). Reset stem_gains to default
                 // so a later stem-load on the same deck starts from
@@ -968,6 +1015,7 @@ mod tests {
                 beat_grid_anchor_ms: 220,
                 downbeats_ms: vec![],
                 hot_cues: [None; 8],
+                track_gain_db: 0.0,
             },
         ));
         assert_eq!(s.deck_a.bpm, 128.0);
@@ -991,6 +1039,7 @@ mod tests {
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: vec![],
                 hot_cues: [None; 8],
+                track_gain_db: 0.0,
             },
         ));
         assert_eq!(s.deck_a.bpm, 120.0);
@@ -1011,6 +1060,7 @@ mod tests {
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: vec![],
                 hot_cues: [None; 8],
+                track_gain_db: 0.0,
             },
         ));
         let s = s.apply(&ev(2, EventKind::DeckPlay { deck: DeckId::A }));
@@ -1038,6 +1088,7 @@ mod tests {
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: downbeats.clone(),
                 hot_cues: [None; 8],
+                track_gain_db: 0.0,
             },
         ));
         assert_eq!(s.deck_b.downbeats.len(), downbeats.len());
@@ -1064,6 +1115,7 @@ mod tests {
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: downbeats,
                 hot_cues: [None; 8],
+                track_gain_db: 0.0,
             },
         ));
         assert_eq!(s.deck_a.downbeats.len(), DOWNBEATS_INLINE_CAPACITY);
@@ -1090,6 +1142,7 @@ mod tests {
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: vec![0, 2000, 4000, 6000],
                 hot_cues: [None; 8],
+                track_gain_db: 0.0,
             },
         ));
         assert_eq!(s.deck_a.downbeats.len(), 4);
@@ -1108,6 +1161,7 @@ mod tests {
                 beat_grid_anchor_ms: 100,
                 downbeats_ms: vec![100, 1975, 3850],
                 hot_cues: [None; 8],
+                track_gain_db: 0.0,
             },
         ));
         assert_eq!(s.deck_a.downbeats.len(), 3);
@@ -1143,6 +1197,7 @@ mod tests {
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: vec![],
                 hot_cues: cues,
+                track_gain_db: 0.0,
             },
         ));
         assert_eq!(s.deck_a.hot_cues, cues);
@@ -1169,6 +1224,7 @@ mod tests {
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: vec![],
                 hot_cues: super::default_hot_cues(),
+                track_gain_db: 0.0,
             },
         ));
         assert!(s.deck_b.hot_cues.iter().all(Option::is_none));
@@ -1202,6 +1258,7 @@ mod tests {
                     None,
                     None,
                 ],
+                track_gain_db: 0.0,
             },
         ));
         assert_eq!(s.deck_a.hot_cues[0], Some(1_000));
@@ -1219,6 +1276,7 @@ mod tests {
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: vec![],
                 hot_cues: [None, None, None, None, None, None, None, Some(99_000)],
+                track_gain_db: 0.0,
             },
         ));
         assert_eq!(s.deck_a.hot_cues[0], None);
@@ -1244,6 +1302,101 @@ mod tests {
                 assert!(hot_cues.iter().all(Option::is_none));
             }
             other => panic!("expected DeckLoad, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deck_load_propagates_track_gain_db_to_deck() {
+        // Loudness leveler: the per-track gain on the DeckLoad
+        // payload lands on `Deck::track_gain_db` so a snapshot
+        // consumer + the mixer's command translator can both see
+        // it. Positive (boost) and negative (cut) both round-trip.
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::DeckLoad {
+                deck: DeckId::A,
+                track: TrackRef {
+                    id: "quiet".into(),
+                    path: "/q.mp3".into(),
+                },
+                bpm: 120.0,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![],
+                hot_cues: [None; 8],
+                track_gain_db: 9.0, // quiet jazz at -23 LUFS
+            },
+        ));
+        assert!((s.deck_a.track_gain_db - 9.0).abs() < f32::EPSILON);
+        // Deck B unaffected.
+        assert_eq!(s.deck_b.track_gain_db, 0.0);
+
+        // Negative (loud master needs cutting) — same plumbing.
+        let s = s.apply(&ev(
+            2,
+            EventKind::DeckLoad {
+                deck: DeckId::B,
+                track: TrackRef {
+                    id: "loud".into(),
+                    path: "/l.mp3".into(),
+                },
+                bpm: 128.0,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![],
+                hot_cues: [None; 8],
+                track_gain_db: -6.0,
+            },
+        ));
+        assert!((s.deck_b.track_gain_db - (-6.0)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn deck_load_track_gain_db_serde_default_is_zero() {
+        // Wire compat: an old payload (pre-loudness-PR) without the
+        // `track_gain_db` field deserializes with 0 dB = passthrough.
+        let json = r#"{
+            "DeckLoad": {
+                "deck": "A",
+                "track": { "id": "t1", "path": "/p.mp3" },
+                "bpm": 120.0,
+                "beat_grid_anchor_ms": 0
+            }
+        }"#;
+        let kind: EventKind = serde_json::from_str(json).expect("deserialize");
+        match kind {
+            EventKind::DeckLoad { track_gain_db, .. } => {
+                assert_eq!(track_gain_db, 0.0);
+            }
+            other => panic!("expected DeckLoad, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deck_load_non_finite_track_gain_db_clamps_to_zero() {
+        // Defensive: a buggy / malicious copilot payload could ship
+        // NaN, which would propagate into a NaN multiply on every
+        // audio sample. Reducer guard maps non-finite → 0 dB.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let s = EngineState::default();
+            let s = s.apply(&ev(
+                1,
+                EventKind::DeckLoad {
+                    deck: DeckId::A,
+                    track: TrackRef {
+                        id: "t".into(),
+                        path: "/p.mp3".into(),
+                    },
+                    bpm: 120.0,
+                    beat_grid_anchor_ms: 0,
+                    downbeats_ms: vec![],
+                    hot_cues: [None; 8],
+                    track_gain_db: bad,
+                },
+            ));
+            assert_eq!(
+                s.deck_a.track_gain_db, 0.0,
+                "non-finite payload {bad} must be filtered"
+            );
         }
     }
 
@@ -1908,6 +2061,7 @@ mod tests {
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: vec![],
                 hot_cues: [None; 8],
+                track_gain_db: 0.0,
             },
         ));
         assert!(!s.deck_a.stem_mode);

@@ -111,6 +111,14 @@ def track_ref_to_wire(t: TrackRef) -> dict[str, Any]:
         # ``hot_cues`` field. Built fresh per call so callers can't
         # accidentally mutate the dataclass's default list.
         "hot_cues": [None if c is None else int(c) for c in t.hot_cues],
+        # Loudness leveler (schema v7). ``lufs`` = raw integrated
+        # loudness; ``track_gain_db`` = engine-ready dB gain to land
+        # at -14 LUFS. Both ``null`` for tracks that pre-date the v7
+        # ingest; the engine reads null track_gain_db as 0 dB.
+        "lufs": None if t.lufs is None else float(t.lufs),
+        "track_gain_db": (
+            None if t.track_gain_db is None else float(t.track_gain_db)
+        ),
     }
 
 

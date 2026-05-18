@@ -142,7 +142,7 @@ def test_schema_version_is_current():
     a >= comparison so a future regression that *lowers* the version
     fails loudly.
     """
-    assert TRACK_SCHEMA_VERSION == 6
+    assert TRACK_SCHEMA_VERSION == 7
     assert HOT_CUE_SLOTS == 8
 
 

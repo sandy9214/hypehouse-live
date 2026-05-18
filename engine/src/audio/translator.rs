@@ -272,7 +272,12 @@ pub fn event_to_commands_with_errors(
                 kind: AudioCommandKind::LoopDisarm { deck: *deck },
             });
         }
-        EventKind::DeckLoad { deck, track, .. } => {
+        EventKind::DeckLoad {
+            deck,
+            track,
+            track_gain_db,
+            ..
+        } => {
             // Ask the streaming decode service to open the track. The
             // service spawns a decoder thread off the control plane;
             // the returned handle is what the audio thread reads
@@ -281,6 +286,11 @@ pub fn event_to_commands_with_errors(
             // control loop can fan them out as `engine.decode_error`
             // notifications to connected clients. State stays
             // un-mutated — the deck simply doesn't load.
+            //
+            // `track_gain_db` is forwarded verbatim — the mixer
+            // applies the linear conversion + per-sample multiply.
+            // Non-finite values are filtered out by the reducer's
+            // guard above, but the mixer also defensive-clamps.
             match decode.open(track, sample_rate) {
                 Ok(handle) => {
                     out.push(AudioCommand {
@@ -288,6 +298,7 @@ pub fn event_to_commands_with_errors(
                         kind: AudioCommandKind::DeckLoad {
                             deck: *deck,
                             handle,
+                            track_gain_db: *track_gain_db,
                         },
                     });
                 }
@@ -735,13 +746,14 @@ mod tests {
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: vec![],
                 hot_cues: [None; 8],
+                track_gain_db: 0.0,
             },
         );
         let next = prev.apply(&e);
         let cmds = translate(&prev, &next, &e, 0);
         assert_eq!(cmds.len(), 1);
         match cmds[0].kind {
-            AudioCommandKind::DeckLoad { deck, handle } => {
+            AudioCommandKind::DeckLoad { deck, handle, .. } => {
                 assert_eq!(deck, DeckId::B);
                 assert!(
                     handle.is_some(),
@@ -1094,6 +1106,7 @@ mod tests {
                     beat_grid_anchor_ms: 0,
                     downbeats_ms: vec![],
                     hot_cues: [None; 8],
+                    track_gain_db: 0.0,
                 },
             )
         };
@@ -1194,6 +1207,7 @@ mod tests {
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: vec![],
                 hot_cues: [None; 8],
+                track_gain_db: 0.0,
             },
         )
     }

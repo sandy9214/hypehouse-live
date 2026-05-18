@@ -103,6 +103,7 @@ async fn ws_submit_event_deck_load_forwards_to_control_loop_channel() {
             beat_grid_anchor_ms,
             downbeats_ms,
             hot_cues,
+            ..
         } => {
             assert_eq!(track.id, "trk-1");
             assert_eq!(track.path, "/music/song.mp3");
