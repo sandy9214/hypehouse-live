@@ -24,8 +24,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: short
-  # rust-version in engine/Cargo.toml = 1.85 (bumped from 1.83 for clap_lex edition2024)
-  RUST_TOOLCHAIN: "1.85"
+  # rust-version in engine/Cargo.toml = 1.88 (bumped from 1.85 to unlock
+  # ringbuf 0.5 / criterion 0.8 / cpal 0.17 dep upgrades — issue #26)
+  RUST_TOOLCHAIN: "1.88"
 
 jobs:
   changes:
@@ -52,7 +53,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        rust: ["1.85"]
+        rust: ["1.88"]
     defaults:
       run:
         working-directory: engine

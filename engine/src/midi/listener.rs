@@ -308,7 +308,7 @@ mod tests {
         let kind = translate_note(0x90, 0x0B, &mapping()).expect("known mapping");
         match kind {
             EventKind::DeckPlay { deck } => assert_eq!(deck, DeckId::A),
-            other => panic!("expected DeckPlay, got {:?}", other),
+            other => panic!("expected DeckPlay, got {other:?}"),
         }
     }
 
@@ -318,7 +318,7 @@ mod tests {
         let kind = translate_note(0x91, 0x0B, &mapping()).expect("known mapping");
         match kind {
             EventKind::DeckPlay { deck } => assert_eq!(deck, DeckId::B),
-            other => panic!("expected DeckPlay, got {:?}", other),
+            other => panic!("expected DeckPlay, got {other:?}"),
         }
     }
 
@@ -331,7 +331,7 @@ mod tests {
                 // 64/127 ≈ 0.5039 — close enough to half.
                 assert!((value - 0.5).abs() < 0.01, "got {value}");
             }
-            other => panic!("expected Crossfader, got {:?}", other),
+            other => panic!("expected Crossfader, got {other:?}"),
         }
     }
 
@@ -341,12 +341,12 @@ mod tests {
         let lo = translate_cc(0xBF, 0x1F, 0, &m).expect("xfader");
         match lo {
             EventKind::Crossfader { value } => assert_eq!(value, 0.0),
-            other => panic!("got {:?}", other),
+            other => panic!("got {other:?}"),
         }
         let hi = translate_cc(0xBF, 0x1F, 127, &m).expect("xfader");
         match hi {
             EventKind::Crossfader { value } => assert!((value - 1.0).abs() < 1e-6),
-            other => panic!("got {:?}", other),
+            other => panic!("got {other:?}"),
         }
     }
 
@@ -374,7 +374,7 @@ mod tests {
                 assert_eq!(deck, DeckId::A);
                 assert!(semitones.abs() < 1e-6, "got {semitones}");
             }
-            other => panic!("expected PitchBend, got {:?}", other),
+            other => panic!("expected PitchBend, got {other:?}"),
         }
     }
 
@@ -386,7 +386,7 @@ mod tests {
             EventKind::PitchBend { semitones, .. } => {
                 assert!((semitones - 2.0).abs() < 1e-3, "got {semitones}");
             }
-            other => panic!("expected PitchBend, got {:?}", other),
+            other => panic!("expected PitchBend, got {other:?}"),
         }
     }
 
@@ -398,7 +398,7 @@ mod tests {
             EventKind::PitchBend { semitones, .. } => {
                 assert!((semitones + 2.0).abs() < 1e-3, "got {semitones}");
             }
-            other => panic!("expected PitchBend, got {:?}", other),
+            other => panic!("expected PitchBend, got {other:?}"),
         }
     }
 
@@ -443,11 +443,11 @@ mod tests {
         let ev = rx.try_recv().expect("event emitted");
         match ev.kind {
             EventKind::DeckPlay { deck } => assert_eq!(deck, DeckId::A),
-            other => panic!("expected DeckPlay, got {:?}", other),
+            other => panic!("expected DeckPlay, got {other:?}"),
         }
         match ev.source {
             EventSource::Midi { ref device, .. } => assert_eq!(device, "test"),
-            ref other => panic!("expected Midi source, got {:?}", other),
+            ref other => panic!("expected Midi source, got {other:?}"),
         }
     }
 
@@ -492,7 +492,7 @@ mod tests {
             EventKind::PitchBend { semitones, .. } => {
                 assert!(semitones.abs() < 1e-6, "got {semitones}");
             }
-            other => panic!("got {:?}", other),
+            other => panic!("got {other:?}"),
         }
     }
 
@@ -507,7 +507,7 @@ mod tests {
         let kind = translate_cc(0xB0, 0x10, 127, &m).expect("binding");
         match kind {
             EventKind::EqAdjust { value_db, .. } => assert!((value_db - 10.0).abs() < 1e-3),
-            other => panic!("got {:?}", other),
+            other => panic!("got {other:?}"),
         }
     }
 }
