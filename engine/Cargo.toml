@@ -7,6 +7,12 @@ description = "hypehouse-live audio engine — 2-deck mixing with sub-5ms latenc
 license = "MIT"
 publish = false
 
+[features]
+default = []
+# Enables the MIDI clock OUT v0.1 module (ADR-007). When off, the
+# module compiles in trait-only form and main.rs skips device probe.
+midi-clock-out = []
+
 [dependencies]
 # Audio I/O — cpal gives us a lock-free callback into the audio thread.
 cpal = "0.16"

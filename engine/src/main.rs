@@ -18,10 +18,10 @@ use anyhow::Result;
 use crossbeam::channel::{self, Receiver};
 use hypehouse_engine::audio::{
     event_to_commands, io::spawn_audio_thread, AudioProducer, AudioRing, DecodeService,
-    EngineClock, SymphoniaDecodeService,
+    EngineClock, SharedClock, SymphoniaDecodeService,
 };
 use hypehouse_engine::bridge::{self, EngineHandle};
-use hypehouse_engine::state::{EngineState, Event};
+use hypehouse_engine::state::{EngineState, Event, EventKind};
 use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -64,6 +64,12 @@ async fn main() -> Result<()> {
         "audio thread up — cpal stream playing"
     );
 
+    // MIDI clock OUT (ADR-007 §v0.1). Gated by both the `midi-clock-out`
+    // Cargo feature AND the `MIDI_CLOCK_OUT_DEVICE` env var (substring
+    // match against output port names; empty/unset = disabled).
+    // Owned by `main` so the worker thread joins cleanly on shutdown.
+    let _midi_clock_out = spawn_midi_clock_out_if_enabled(clock.shared.clone());
+
     // Event channel — fed by WS bridge / MIDI / co-pilot, drained by
     // the control-thread loop.
     let (event_tx, event_rx) = channel::unbounded::<Event>();
@@ -72,8 +78,16 @@ async fn main() -> Result<()> {
     // block the async runtime.
     let sample_rate = stream.sample_rate;
     let decode_for_control = Arc::clone(&decode_service);
+    let shared_clock_for_control = clock.shared.clone();
     std::thread::spawn(move || {
-        control_loop(event_rx, producer, clock, sample_rate, decode_for_control)
+        control_loop(
+            event_rx,
+            producer,
+            clock,
+            sample_rate,
+            decode_for_control,
+            shared_clock_for_control,
+        )
     });
 
     // Bridge handle is wired to the control-loop event channel so every
@@ -110,11 +124,21 @@ fn control_loop(
     clock: EngineClock,
     sample_rate: u32,
     decode: Arc<dyn DecodeService>,
+    shared_clock: SharedClock,
 ) {
     let mut state = EngineState::default();
 
     while let Ok(ev) = event_rx.recv() {
         let next = state.apply(&ev);
+
+        // Side-channel: propagate master_bpm to the SharedClock so the
+        // MIDI clock OUT tick thread (ADR-007 §v0.1) can re-derive its
+        // period without polling EngineState. The reducer has already
+        // validated the value.
+        if let EventKind::SetMasterBpm { bpm } = &ev.kind {
+            shared_clock.set_master_bpm(*bpm);
+        }
+
         let now_frame = clock.frame();
         let cmds = event_to_commands(&state, &next, &ev, now_frame, sample_rate, decode.as_ref());
         for cmd in cmds.into_iter() {
@@ -128,6 +152,56 @@ fn control_loop(
         state = next;
     }
     info!("control loop: event channel closed — shutting down");
+}
+
+/// Spawn the MIDI clock OUT worker if the user has configured it.
+///
+/// Selection rules (per ADR-007 §"Open questions"):
+/// * Env var `MIDI_CLOCK_OUT_DEVICE` unset / empty → disabled, returns `None`.
+/// * `midi-clock-out` feature off at compile time → disabled even if env set.
+/// * Substring match (case-insensitive) against the available output port
+///   names. No match → log a warning, return `None`. We never fail the
+///   whole engine on a missing MIDI device — DJ rigs commonly boot
+///   without all the hardware plugged in.
+fn spawn_midi_clock_out_if_enabled(
+    shared_clock: SharedClock,
+) -> Option<hypehouse_engine::midi::MidiClockOut> {
+    let device = std::env::var("MIDI_CLOCK_OUT_DEVICE").unwrap_or_default();
+    let _ = shared_clock; // keep signature stable when feature is off
+    if device.trim().is_empty() {
+        info!("midi-clock-out: MIDI_CLOCK_OUT_DEVICE unset — disabled");
+        return None;
+    }
+
+    #[cfg(feature = "midi-clock-out")]
+    {
+        match hypehouse_engine::midi::MidiClockOut::start(Some(&device), shared_clock) {
+            Ok(handle) => {
+                info!(
+                    port = %handle.port_name,
+                    device_filter = %device,
+                    "midi-clock-out: started — emitting 24 PPQN @ master_bpm"
+                );
+                Some(handle)
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    device_filter = %device,
+                    "midi-clock-out: failed to open output port — continuing without"
+                );
+                None
+            }
+        }
+    }
+    #[cfg(not(feature = "midi-clock-out"))]
+    {
+        warn!(
+            device_filter = %device,
+            "midi-clock-out: env var set but feature `midi-clock-out` not enabled at compile time"
+        );
+        None
+    }
 }
 
 #[cfg(unix)]

@@ -8,19 +8,23 @@
 //! 5. Emit to a `tokio::sync::mpsc` channel handed to the control thread.
 //!
 //! Module layout:
-//! * `mapping`  — JSON-deserializable schema + DDJ-200 default (embedded).
-//! * `clamp`    — value-clamping primitives. Every MIDI-derived value
+//! * `mapping`   — JSON-deserializable schema + DDJ-200 default (embedded).
+//! * `clamp`     — value-clamping primitives. Every MIDI-derived value
 //!   passes through here before becoming an `Event`.
-//! * `listener` — `MidiListener::start` opens a port + spawns the callback.
+//! * `listener`  — `MidiListener::start` opens a port + spawns the callback.
+//! * `clock_out` — MIDI clock OUT v0.1 per ADR-007 (24 PPQN, behind the
+//!   `midi-clock-out` Cargo feature).
 //!
 //! The default mapping ships at `mappings/ddj200.json` and is bundled into
 //! the binary via `include_str!`. Users can override by setting the
 //! `HYPEHOUSE_MIDI_MAPPING` environment variable to a JSON file path.
 
 pub mod clamp;
+pub mod clock_out;
 pub mod listener;
 pub mod mapping;
 
+pub use clock_out::{ClockOutError, MidiClockOut, MidiSink};
 pub use listener::{ListenerError, MidiListener, MidiListenerHandle};
 pub use mapping::{
     CcAction, CcBinding, MapDeck, Mapping, MappingError, NoteAction, NoteBinding, PitchBendBinding,

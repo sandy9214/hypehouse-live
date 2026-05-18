@@ -464,6 +464,76 @@ path.
 
 `u32` ms ceiling = ~71 minutes, well beyond any sane DJ track.
 
+## MIDI clock OUT (ADR-007 v0.1)
+
+The engine can act as a MIDI clock **master**, emitting 24 PPQN MIDI
+realtime messages so external hardware (drum machines, synths, MPCs,
+modular sequencers) lock to the session tempo. **There is no protocol
+surface** — MIDI clock OUT does not flow through the WebSocket bridge.
+Documented here because it shares the master-tempo abstraction with the
+event log.
+
+### Enabling
+
+| Knob | Value | Effect |
+|---|---|---|
+| Cargo feature | `midi-clock-out` (default **off**) | Compiles the `midir` output binding. Without it the env var is logged and ignored. |
+| Env var       | `MIDI_CLOCK_OUT_DEVICE=<substring>`  | Case-insensitive substring matched against MIDI output port names. Empty / unset = disabled. |
+
+```bash
+# Native build with MIDI clock OUT, locking to the first port whose
+# name contains "Maschine".
+MIDI_CLOCK_OUT_DEVICE=maschine cargo run --features midi-clock-out
+```
+
+### Tempo source
+
+Master tempo lives in `EngineState::master_bpm` (default 120.0) and is
+mirrored into a lock-free `SharedClock::master_bpm()` atomic so the
+clock-out tick thread can re-derive its period every iteration without
+locking.
+
+Update master tempo via a new event kind:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "engine.submit_event",
+  "params": {
+    "kind": { "SetMasterBpm": { "bpm": 128.0 } }
+  },
+  "id": 7
+}
+```
+
+The reducer validates the value (`f32::is_finite && > 0.0`); bad inputs
+are silently ignored. The MIDI clock OUT tick thread picks up the new
+period within one tick (≤ ~21 ms at 120 BPM, ≤ ~17 ms at 144 BPM).
+
+### Wire format
+
+Single-byte MIDI realtime messages, no data bytes:
+
+| Byte  | Name  | When |
+|------:|-------|------|
+| 0xFA  | Start | Once when the worker thread enters its run loop (i.e. when `MidiClockOut::start` succeeds). |
+| 0xF8  | Clock | Every `60_000_000 / (bpm × 24)` µs. 24 PPQN per MIDI spec. |
+| 0xFC  | Stop  | On `Drop` of the `MidiClockOut` handle (engine shutdown). |
+
+No SongPositionPointer (0xF2) — v0.1 doesn't have a transport "play
+head" concept; downstream gear assumes start-from-zero on 0xFA.
+
+### Failure modes (non-fatal)
+
+* `MIDI_CLOCK_OUT_DEVICE` set but the feature is disabled → log warn,
+  continue without MIDI clock.
+* No MIDI output ports available → log warn, continue.
+* Substring matched no port → log warn, continue.
+* `midir` connection failed → log warn, continue.
+
+The engine never refuses to boot because of a missing MIDI device — DJ
+rigs frequently start without all hardware plugged in.
+
 ## Test coverage
 
 Unit + integration tests live under `engine/src/bridge/*` (per-module

@@ -318,11 +318,14 @@ pub fn event_to_commands(
             });
         }
         // Non-audio-relevant events — pure state, no audio command needed.
+        // (`SetMasterBpm` updates the SharedClock side-channel separately;
+        // see ADR-007 §v0.1 — the audio thread doesn't consume it.)
         EventKind::HotCueSet { .. }
         | EventKind::LoopIn { .. }
         | EventKind::PhaseNudge { .. }
         | EventKind::CopilotEngage { .. }
         | EventKind::CopilotDisengage { .. }
+        | EventKind::SetMasterBpm { .. }
         | EventKind::SessionStart
         | EventKind::SessionEnd => {}
     }

@@ -23,6 +23,15 @@ Rust audio engine (sub-5ms latency) + Tauri/WebSocket bridge + TypeScript UI + n
 | **Co-pilot** | AI picks next track + executes phrase-aligned transitions | Yes | User can take over with no audio glitch (deck handoff) |
 | **Hybrid** | User manual on deck A; AI co-pilot on deck B | Per-deck independent | Default for hardware sets |
 
+## Features
+
+- 2-deck live mixing engine (`cpal` + `symphonia` + `rubato`), MIDI input via `midir`
+- Event-sourced state log (ADR-003) — replayable session for live-set debugging
+- Effects chain v0.1 — filter / echo / reverb / gate (ADR-006)
+- WebSocket + JSON-RPC bridge with bearer-token auth (browser + native modes)
+- **MIDI clock OUT (alpha, ADR-007 v0.1)** — engine acts as master, emits 24 PPQN to hardware drum machines / synths. Enable with `cargo run --features midi-clock-out` and `MIDI_CLOCK_OUT_DEVICE=<substring>`. See [`docs/api/ws-protocol.md`](docs/api/ws-protocol.md#midi-clock-out-adr-007-v01).
+- Co-pilot service (Python): beat-grid + downbeat analysis, mashup scoring, next-track suggestions
+
 ## Status
 
 - v0.1 in development
