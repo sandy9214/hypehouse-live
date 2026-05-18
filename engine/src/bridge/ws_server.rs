@@ -306,11 +306,13 @@ async fn handle_client(
                     state,
                     last_event_id,
                     master_limiter_gain_reduction_db,
+                    clock_source,
                 }) => {
                     let n = state_changed_notification(
                         state.as_ref(),
                         last_event_id,
                         master_limiter_gain_reduction_db,
+                        clock_source,
                     );
                     if let Ok(text) = serde_json::to_string(&n) {
                         if out_for_notices

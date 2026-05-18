@@ -82,7 +82,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::audio::clock::SharedClock;
+use crate::audio::clock::{ClockSource, SharedClock};
 
 /// MIDI realtime message bytes (single-byte status, no data bytes).
 pub const MIDI_CLOCK: u8 = 0xF8;
@@ -334,6 +334,24 @@ pub fn process_byte(state: &mut ClockInState, byte: u8, now: Instant) -> Option<
     }
 }
 
+/// Map a realtime status byte to the [`ClockSource`] transition it
+/// implies, if any. `Some(MidiIn)` on a Start (0xFA) so the bridge can
+/// surface a "LOCKED" badge once an external master engages;
+/// `Some(Internal)` on a Stop (0xFC) so the badge reverts when the
+/// master goes quiet. Every other byte (including the per-tick 0xF8) is
+/// `None` — we don't want to flip the source on every tick.
+///
+/// Pure helper, lifted out so unit tests cover the transition table
+/// without spinning up the midir callback machinery.
+#[inline]
+pub fn clock_source_for_byte(byte: u8) -> Option<ClockSource> {
+    match byte {
+        MIDI_START => Some(ClockSource::MidiIn),
+        MIDI_STOP => Some(ClockSource::Internal),
+        _ => None,
+    }
+}
+
 /// Decide whether `smoothed_bpm` differs from `live_bpm` enough to
 /// warrant a `SharedClock::set_master_bpm` write.
 ///
@@ -380,6 +398,13 @@ impl MidiClockIn {
         source.run(move |byte| {
             if cancel_for_cb.load(Ordering::Relaxed) {
                 return;
+            }
+            // Flip the active tempo source on Start / Stop so the
+            // bridge's `engine.state_changed` notification surfaces the
+            // current lock state. Done OUTSIDE the state mutex — the
+            // SharedClock atomic is lock-free.
+            if let Some(src) = clock_source_for_byte(byte) {
+                clock_for_cb.set_clock_source(src);
             }
             // We hold the state lock for the body of the byte handler
             // only — it never crosses an await / I/O boundary. The
@@ -463,6 +488,12 @@ impl MidiClockIn {
                     // Realtime messages are single-byte. Some midir
                     // backends batch multiple bytes per callback; loop.
                     for &byte in bytes {
+                        // Flip the SharedClock source on Start/Stop so
+                        // the UI badge tracks the master's transport
+                        // (atomic store — outside the state mutex).
+                        if let Some(src) = clock_source_for_byte(byte) {
+                            clock_for_cb.set_clock_source(src);
+                        }
                         let mut s = match state_for_cb.lock() {
                             Ok(g) => g,
                             Err(poisoned) => poisoned.into_inner(),
@@ -853,5 +884,43 @@ mod tests {
             (bpm - 50.0).abs() > BPM_DEADBAND,
             "SharedClock never updated past initial 50.0, got {bpm}"
         );
+    }
+
+    #[test]
+    fn clock_source_for_byte_only_flips_on_transport_bytes() {
+        // The 24 PPQN tick byte (0xF8) MUST NOT flip the source — that
+        // would write to the atomic every ~20 ms during normal playback.
+        // Only Start (0xFA) and Stop (0xFC) change the active source.
+        assert_eq!(clock_source_for_byte(MIDI_START), Some(ClockSource::MidiIn));
+        assert_eq!(
+            clock_source_for_byte(MIDI_STOP),
+            Some(ClockSource::Internal)
+        );
+        assert_eq!(clock_source_for_byte(MIDI_CLOCK), None);
+        // Active sensing / system reset / random data bytes are no-ops.
+        assert_eq!(clock_source_for_byte(0xFE), None);
+        assert_eq!(clock_source_for_byte(0x00), None);
+        assert_eq!(clock_source_for_byte(0x90), None);
+    }
+
+    #[test]
+    fn from_source_flips_shared_clock_source_on_start_and_stop() {
+        // End-to-end through the same path the real midir callback
+        // takes: a Start byte locks the engine to MidiIn, a Stop byte
+        // reverts to Internal. The badge in the UI keys off this byte.
+        let clock = SharedClock::with_bpm(120.0);
+        assert_eq!(clock.clock_source(), ClockSource::Internal);
+        let _h = MidiClockIn::from_source(
+            "src-flip".into(),
+            VecSource::new(vec![MIDI_START]),
+            clock.clone(),
+        );
+        assert_eq!(clock.clock_source(), ClockSource::MidiIn);
+        let _h2 = MidiClockIn::from_source(
+            "src-flip-stop".into(),
+            VecSource::new(vec![MIDI_STOP]),
+            clock.clone(),
+        );
+        assert_eq!(clock.clock_source(), ClockSource::Internal);
     }
 }

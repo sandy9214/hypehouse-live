@@ -12,12 +12,55 @@
 //! synchronization fence. The ring buffer itself synchronizes the
 //! commands.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 /// Default master BPM seeded into a fresh [`SharedClock`] — matches the
 /// default chosen in ADR-007 ("Open questions").
 pub const DEFAULT_MASTER_BPM: f32 = 120.0;
+
+/// Which tempo source is currently driving `master_bpm`. Surfaced to the
+/// UI on every `engine.state_changed` notification so a "BPM LOCKED"
+/// badge can render when an external master is active. Stored as a
+/// single byte inside [`SharedClock`] — the MIDI clock-IN callback flips
+/// it to `MidiIn` on a 0xFA Start, back to `Internal` on a 0xFC Stop,
+/// and the future Ableton Link backend will flip it to `AbletonLink`
+/// when the engine joins a peer session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ClockSource {
+    /// Engine drives its own master_bpm — the default at boot.
+    Internal = 0,
+    /// External MIDI clock master is currently feeding `master_bpm`.
+    MidiIn = 1,
+    /// Ableton Link peer session is driving `master_bpm` (ADR-007 §v0.2 future).
+    AbletonLink = 2,
+}
+
+impl ClockSource {
+    /// Stable kebab-case wire label. Mirrored on the UI store as a
+    /// string union; keep the values in lockstep with
+    /// `ui/src/store/engine.ts ClockSourceLabel`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ClockSource::Internal => "internal",
+            ClockSource::MidiIn => "midi_in",
+            ClockSource::AbletonLink => "ableton_link",
+        }
+    }
+
+    /// Decode a byte (read off the atomic) into the enum. Unknown
+    /// values fall back to `Internal` — defensive, since the byte
+    /// originates from our own writes but a future variant could land
+    /// out of order during a rolling deploy.
+    pub fn from_byte(b: u8) -> Self {
+        match b {
+            1 => ClockSource::MidiIn,
+            2 => ClockSource::AbletonLink,
+            _ => ClockSource::Internal,
+        }
+    }
+}
 
 /// Constant audio-thread parameters + the live frame counter pointer.
 #[derive(Clone)]
@@ -76,6 +119,13 @@ struct SharedClockInner {
     /// (ADR-007) updates its tempo. Read by both the audio thread and
     /// the MIDI clock OUT tick thread.
     bpm_bits: AtomicU32,
+    /// Active tempo source, encoded as a [`ClockSource`] discriminant.
+    /// Default = `Internal`. The MIDI clock-IN callback flips this to
+    /// `MidiIn` on a Start byte (0xFA) and back to `Internal` on a Stop
+    /// byte (0xFC). The bridge samples it once per `state_changed`
+    /// notification so the UI lock-indicator stays in sync without
+    /// adding a separate event channel.
+    clock_source: AtomicU8,
 }
 
 impl Default for SharedClock {
@@ -95,6 +145,7 @@ impl SharedClock {
             inner: Arc::new(SharedClockInner {
                 frame: AtomicU64::new(0),
                 bpm_bits: AtomicU32::new(bpm.to_bits()),
+                clock_source: AtomicU8::new(ClockSource::Internal as u8),
             }),
         }
     }
@@ -130,6 +181,22 @@ impl SharedClock {
         if bpm.is_finite() && bpm > 0.0 {
             self.inner.bpm_bits.store(bpm.to_bits(), Ordering::Relaxed);
         }
+    }
+
+    /// Read the active tempo source. Lock-free; the bridge thread
+    /// samples this once per outgoing `engine.state_changed` so the UI
+    /// lock-indicator badge stays current without a separate channel.
+    #[inline]
+    pub fn clock_source(&self) -> ClockSource {
+        ClockSource::from_byte(self.inner.clock_source.load(Ordering::Relaxed))
+    }
+
+    /// Flip the active tempo source. Called by the MIDI clock-IN
+    /// callback on Start / Stop, and (future v0.2) by the Ableton Link
+    /// backend on session join / leave.
+    #[inline]
+    pub fn set_clock_source(&self, src: ClockSource) {
+        self.inner.clock_source.store(src as u8, Ordering::Relaxed);
     }
 }
 
@@ -189,5 +256,31 @@ mod tests {
     fn engine_clock_seeds_shared_bpm() {
         let c = EngineClock::new(48_000, 140.0);
         assert!((c.shared.master_bpm() - 140.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn shared_clock_defaults_to_internal_source() {
+        let c = SharedClock::new();
+        assert_eq!(c.clock_source(), ClockSource::Internal);
+        // Wire label is the kebab-case string the UI mirrors.
+        assert_eq!(c.clock_source().as_str(), "internal");
+    }
+
+    #[test]
+    fn shared_clock_source_round_trips_across_clones() {
+        // Cheap-clone sharing must extend to the source byte — both
+        // sides see the same atomic. Otherwise the MIDI-IN callback
+        // would flip its private copy and the bridge sampler would
+        // never see it.
+        let c = SharedClock::new();
+        let c2 = c.clone();
+        c.set_clock_source(ClockSource::MidiIn);
+        assert_eq!(c2.clock_source(), ClockSource::MidiIn);
+        assert_eq!(c2.clock_source().as_str(), "midi_in");
+        c2.set_clock_source(ClockSource::AbletonLink);
+        assert_eq!(c.clock_source(), ClockSource::AbletonLink);
+        assert_eq!(c.clock_source().as_str(), "ableton_link");
+        c.set_clock_source(ClockSource::Internal);
+        assert_eq!(c2.clock_source(), ClockSource::Internal);
     }
 }

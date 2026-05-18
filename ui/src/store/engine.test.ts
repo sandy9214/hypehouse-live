@@ -88,6 +88,48 @@ describe("engine store — master limiter", () => {
   });
 });
 
+describe("engine store — clock source", () => {
+  afterEach((): void => {
+    __resetEngineState();
+  });
+
+  it("seeds the mirror with clock_source = 'internal'", (): void => {
+    const { result } = renderHook(() => useEngineState());
+    expect(result.current.clock_source).toBe("internal");
+  });
+
+  it("absorbs clock_source from the envelope (sibling of state)", (): void => {
+    // The engine ships `clock_source` alongside `state` — same shape as
+    // `master_limiter_gain_reduction_db`. The store must read it from
+    // the envelope, not from `state.*`.
+    emit({ state: {}, last_event_id: 1, clock_source: "midi_in" });
+    const { result } = renderHook(() => useEngineState());
+    expect(result.current.clock_source).toBe("midi_in");
+  });
+
+  it("keeps the previous clock_source when the envelope omits it", (): void => {
+    // Sticky semantics so a partial replay (pre-PR engine binary) doesn't
+    // reset the badge to INT every push.
+    emit({ state: {}, last_event_id: 1, clock_source: "ableton_link" });
+    emit({ state: {}, last_event_id: 2 });
+    const { result } = renderHook(() => useEngineState());
+    expect(result.current.clock_source).toBe("ableton_link");
+  });
+
+  it("falls back to 'internal' for an unknown clock_source variant", (): void => {
+    // Defensive: a future engine variant shouldn't crash the UI. The
+    // badge falls back to INT (no-lock visual) rather than rendering a
+    // glitched label.
+    emit({
+      state: {},
+      last_event_id: 1,
+      clock_source: "future_variant_we_dont_know",
+    });
+    const { result } = renderHook(() => useEngineState());
+    expect(result.current.clock_source).toBe("internal");
+  });
+});
+
 describe("engine store — extrapolated position", () => {
   let mockNow = 1_000_000;
   const tick = (deltaMs: number): void => {

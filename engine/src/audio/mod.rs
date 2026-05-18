@@ -34,7 +34,7 @@ pub mod ring;
 pub mod translator;
 pub mod wsola;
 
-pub use clock::{EngineClock, SharedClock};
+pub use clock::{ClockSource, EngineClock, SharedClock};
 pub use command::{AudioCommand, AudioCommandKind, RAMP_BUFFER_MAX};
 pub use decode::{
     DecodeError, DecodeHandle, DecodeService, StubDecodeService, SymphoniaDecodeService,
