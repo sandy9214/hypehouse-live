@@ -49,6 +49,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from .key_match import camelot_to_semitones
 from .library import (
     STEMS_STATUS_FAILED,
     STEMS_STATUS_PENDING,
@@ -196,6 +197,14 @@ class LibraryRpcHandler:
         "compute_stems",
         "get_stems",
     )
+    # ``key_match.compute_offset`` lives in a sibling namespace but
+    # needs read access to the same library, so we dispatch it through
+    # this handler rather than spinning up a separate RpcHandler class.
+    # Wire layer pre-filters via :meth:`handles` which already covers
+    # both ``library.*`` and ``key_match.*``.
+    EXTRA_METHODS = (
+        "key_match.compute_offset",
+    )
 
     def __init__(self, library: TrackLibrary):
         self._library = library
@@ -210,8 +219,16 @@ class LibraryRpcHandler:
 
     @property
     def fully_qualified_methods(self) -> tuple[str, ...]:
-        """Public method names as they appear on the wire (``library.<m>``)."""
-        return tuple(f"{self.NAMESPACE}.{m}" for m in self.METHODS)
+        """Public method names as they appear on the wire.
+
+        Includes both the primary ``library.*`` surface and the
+        ``key_match.*`` sibling methods dispatched through this
+        handler (see :attr:`EXTRA_METHODS`).
+        """
+        return (
+            tuple(f"{self.NAMESPACE}.{m}" for m in self.METHODS)
+            + self.EXTRA_METHODS
+        )
 
     def handles(self, method: str) -> bool:
         return method in self.fully_qualified_methods
@@ -243,6 +260,8 @@ class LibraryRpcHandler:
             return self._compute_stems(params)
         if method == "library.get_stems":
             return self._get_stems(params)
+        if method == "key_match.compute_offset":
+            return self._key_match_compute_offset(params)
         raise RpcError(-32601, f"method not found: {method}")
 
     # --- handlers -----------------------------------------------------
@@ -620,3 +639,48 @@ class LibraryRpcHandler:
             "added_count": len(added),
             "total": self._library.count_tracks(),
         }
+
+    # --- key_match.* -------------------------------------------------
+
+    def _key_match_compute_offset(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Compute the semitone offset to pitch ``from_track`` into ``to_track``'s key.
+
+        Wire shape::
+
+            { "from_track_id": "...", "to_track_id": "..." }
+
+        Returns::
+
+            { "semitones": <float in [-6.0, 6.0]> }
+
+        Missing / unknown track ids surface as ``-32602`` rather than a
+        silent 0 — the UI button is supposed to be disabled until both
+        decks have a loaded library row, so a fetch here means the
+        client got out of sync and a loud error is the right behavior.
+
+        Tracks with an unparseable ``camelot_key`` (e.g. ``"?"`` from
+        a failed analyzer pass) return ``{semitones: 0.0}`` — the
+        underlying :func:`camelot_to_semitones` is lenient on malformed
+        codes so the UI can gracefully degrade to "no shift" rather
+        than fail the whole click.
+        """
+        from_id = _coerce_str(params.get("from_track_id"), field="from_track_id")
+        to_id = _coerce_str(params.get("to_track_id"), field="to_track_id")
+        from_ref = self._library.get(from_id)
+        if from_ref is None:
+            raise RpcError(
+                JSONRPC_INVALID_PARAMS,
+                f"track not found: {from_id}",
+                data={"track_id": from_id},
+            )
+        to_ref = self._library.get(to_id)
+        if to_ref is None:
+            raise RpcError(
+                JSONRPC_INVALID_PARAMS,
+                f"track not found: {to_id}",
+                data={"track_id": to_id},
+            )
+        offset = camelot_to_semitones(from_ref.camelot_key, to_ref.camelot_key)
+        return {"semitones": float(offset)}
