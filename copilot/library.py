@@ -43,10 +43,25 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Bumped to v2 in the beat-grid analysis PR (this one). Stamped into the
-# DB on first init; migrations dispatch on the gap between this constant
-# and the value recorded in the ``schema_version`` table.
-TRACK_SCHEMA_VERSION = 2
+# Bumped to v3 in the hot-cue persistence PR. v2 added beat-grid columns
+# (anchor_ms / period_ms / downbeats_json); v3 adds ``hot_cues_json`` so
+# the 8-slot per-track hot-cue grid survives track unload/reload.
+# Migrations dispatch on the gap between this constant and the value
+# recorded in the ``schema_version`` table.
+TRACK_SCHEMA_VERSION = 3
+
+# Number of hot-cue slots per deck — mirrors the engine's
+# ``Deck::hot_cues: [Option<u64>; 8]`` array in ``engine/src/state.rs``.
+# Keeping the constant here means the library + RPC + tests don't drift
+# from the engine when slot count changes (a remote possibility but the
+# wire shape would break loudly).
+HOT_CUE_SLOTS = 8
+
+# DB-side default for the ``hot_cues_json`` column — a JSON array of 8
+# nulls representing "no slot is set". Stored as a SQL literal so a
+# pre-existing row migrated in via ``ALTER TABLE ADD COLUMN`` gets the
+# correct backfill without a row-level UPDATE pass.
+_HOT_CUES_EMPTY_JSON = "[null,null,null,null,null,null,null,null]"
 
 # Camelot wheel ordering — same convention as HypeHouse v1 analyzer.py.
 # Index = (number-1) * 2 + (0 if A else 1). Used for circular distance only.
@@ -80,6 +95,16 @@ class TrackRef:
     beat_grid_anchor_ms: int = 0
     beat_period_ms: float = 500.0  # 120 BPM default
     downbeats_ms: list[int] = field(default_factory=list)
+    # 8-slot hot-cue grid. Each slot stores either a track-relative ms
+    # position (``int >= 0``) or ``None`` for an empty slot. Mirrors the
+    # engine's ``Deck::hot_cues: [Option<u64>; 8]`` so a row can be
+    # passed straight into a ``DeckLoad`` event extension. Defaulting
+    # to a fresh list of 8 ``None``s keeps existing positional call
+    # sites (TrackRef(id, path, bpm, key, energy, dur)) working —
+    # they get an empty hot-cue grid for free.
+    hot_cues: list[int | None] = field(
+        default_factory=lambda: [None] * HOT_CUE_SLOTS
+    )
 
 
 # Hard compatibility gates. Tracks outside these can sometimes mix but the
@@ -202,10 +227,26 @@ class TrackLibrary:
                 "ALTER TABLE tracks "
                 "ADD COLUMN downbeats_json TEXT NOT NULL DEFAULT '[]'"
             )
-        # Stamp the current schema version. Multiple-row safety via
-        # INSERT OR REPLACE; the table only ever holds one row.
+        if "hot_cues_json" not in cols:
+            # v3 migration — adds the 8-slot hot-cue grid persistence
+            # column. Existing rows are backfilled by SQLite with the
+            # DEFAULT literal (8 nulls), no UPDATE needed. The column
+            # is NOT NULL so a buggy writer can't insert a row without
+            # an explicit cue array — fail loud at insert time rather
+            # than fall back to a silent ``"[]"`` on read.
+            self._conn.execute(
+                "ALTER TABLE tracks "
+                f"ADD COLUMN hot_cues_json TEXT NOT NULL DEFAULT '{_HOT_CUES_EMPTY_JSON}'"
+            )
+        # Stamp the current schema version. The ``schema_version``
+        # table is conceptually single-row but ``version`` is also the
+        # primary key — using ``INSERT OR REPLACE`` would leave stale
+        # rows behind on a v2→v3 migration (REPLACE matches on PK, so
+        # a different version is a NEW row). DELETE-then-INSERT keeps
+        # the table truly single-row across all migration paths.
+        self._conn.execute("DELETE FROM schema_version")
         self._conn.execute(
-            "INSERT OR REPLACE INTO schema_version (version) VALUES (?)",
+            "INSERT INTO schema_version (version) VALUES (?)",
             (TRACK_SCHEMA_VERSION,),
         )
         self._conn.commit()
@@ -219,8 +260,9 @@ class TrackLibrary:
         self._conn.execute(
             "INSERT OR REPLACE INTO tracks "
             "(track_id, path, bpm, camelot_key, energy, duration_s, "
-            " beat_grid_anchor_ms, beat_period_ms, downbeats_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " beat_grid_anchor_ms, beat_period_ms, downbeats_json, "
+            " hot_cues_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 track.track_id,
                 track.path,
@@ -231,9 +273,40 @@ class TrackLibrary:
                 int(track.beat_grid_anchor_ms),
                 float(track.beat_period_ms),
                 json.dumps([int(d) for d in track.downbeats_ms]),
+                _hot_cues_to_json(track.hot_cues),
             ),
         )
         self._conn.commit()
+
+    def set_hot_cues(
+        self, track_id: str, hot_cues: list[int | None]
+    ) -> TrackRef:
+        """Persist an updated hot-cue grid against an existing track.
+
+        Validates the array shape (exactly :data:`HOT_CUE_SLOTS` slots,
+        each ``None`` or a non-negative ``int``) and writes the JSON
+        column atomically. Raises :class:`ValueError` on shape errors
+        and :class:`KeyError` if ``track_id`` is not in the catalog —
+        callers (the RPC handler) translate these into JSON-RPC error
+        envelopes.
+        """
+        cues = _normalize_hot_cues(hot_cues)
+        cursor = self._conn.execute(
+            "UPDATE tracks SET hot_cues_json = ? WHERE track_id = ?",
+            (_hot_cues_to_json(cues), track_id),
+        )
+        if cursor.rowcount == 0:
+            # No row matched — surface so the caller can return a
+            # JSON-RPC -32602 with a clear message rather than silently
+            # no-op (which would mask a stale UI track id).
+            raise KeyError(track_id)
+        self._conn.commit()
+        # Re-fetch to return the freshly persisted shape. Cheap (one
+        # PK lookup) and avoids re-implementing the row->TrackRef map
+        # at the caller.
+        updated = self.get(track_id)
+        assert updated is not None  # invariant: UPDATE just touched it
+        return updated
 
     def add_track_from_path(
         self,
@@ -497,6 +570,10 @@ class TrackLibrary:
             # Defensive: a corrupted downbeats_json shouldn't make the
             # whole row unreadable. Log path is the caller's concern.
             downbeats_ms = []
+        hot_cues_raw = (
+            r["hot_cues_json"] if "hot_cues_json" in keys else _HOT_CUES_EMPTY_JSON
+        )
+        hot_cues = _hot_cues_from_json(hot_cues_raw)
         bpm = float(r["bpm"])
         beat_period_default = 60_000.0 / bpm if bpm > 0 else 500.0
         return TrackRef(
@@ -517,7 +594,93 @@ class TrackLibrary:
                 else beat_period_default
             ),
             downbeats_ms=downbeats_ms,
+            hot_cues=hot_cues,
         )
+
+
+# --- hot-cue helpers (module-level so tests + RPC can import) -------
+
+
+def _normalize_hot_cues(hot_cues: list[int | None]) -> list[int | None]:
+    """Validate + normalize a caller-supplied 8-slot hot-cue array.
+
+    Returns a fresh list (caller-mutation safety). Raises
+    :class:`ValueError` on:
+
+    * wrong length (must be exactly :data:`HOT_CUE_SLOTS`),
+    * a slot value that isn't ``None`` / ``int``,
+    * a negative slot value (positions are non-negative).
+
+    Bools are rejected explicitly because Python treats ``bool`` as a
+    subclass of ``int`` — without the check, ``True`` would silently
+    become ``1`` ms and ``False`` would become ``0`` ms.
+    """
+    if not isinstance(hot_cues, list):
+        raise ValueError(
+            f"hot_cues must be a list, got {type(hot_cues).__name__}"
+        )
+    if len(hot_cues) != HOT_CUE_SLOTS:
+        raise ValueError(
+            f"hot_cues must have exactly {HOT_CUE_SLOTS} slots, "
+            f"got {len(hot_cues)}"
+        )
+    out: list[int | None] = []
+    for i, v in enumerate(hot_cues):
+        if v is None:
+            out.append(None)
+            continue
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError(
+                f"hot_cues[{i}] must be int or None, "
+                f"got {type(v).__name__}"
+            )
+        if v < 0:
+            raise ValueError(
+                f"hot_cues[{i}] must be non-negative, got {v}"
+            )
+        out.append(int(v))
+    return out
+
+
+def _hot_cues_to_json(hot_cues: list[int | None]) -> str:
+    """Serialize a hot-cue array to JSON for SQLite storage.
+
+    Skips re-validation in the hot path — :func:`_normalize_hot_cues`
+    runs at the boundary (``set_hot_cues`` / ``add_track`` callers).
+    """
+    return json.dumps(list(hot_cues))
+
+
+def _hot_cues_from_json(raw: str | None) -> list[int | None]:
+    """Parse the ``hot_cues_json`` column into the in-memory shape.
+
+    Returns a fresh 8-slot list of ``None``s when the JSON is missing
+    or malformed — a corrupted cell shouldn't propagate as a row-read
+    error. Length mismatches (e.g. an old column with fewer slots) are
+    padded/truncated to :data:`HOT_CUE_SLOTS` so the engine's fixed
+    array always lines up.
+    """
+    if not raw:
+        return [None] * HOT_CUE_SLOTS
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return [None] * HOT_CUE_SLOTS
+    if not isinstance(parsed, list):
+        return [None] * HOT_CUE_SLOTS
+    out: list[int | None] = []
+    for v in parsed[:HOT_CUE_SLOTS]:
+        if v is None:
+            out.append(None)
+        elif isinstance(v, bool):  # reject bool early — see _normalize.
+            out.append(None)
+        elif isinstance(v, int) and v >= 0:
+            out.append(v)
+        else:
+            out.append(None)
+    while len(out) < HOT_CUE_SLOTS:
+        out.append(None)
+    return out
 
 
 def _cli(argv: list[str] | None = None) -> int:

@@ -102,6 +102,7 @@ async fn ws_submit_event_deck_load_forwards_to_control_loop_channel() {
             bpm,
             beat_grid_anchor_ms,
             downbeats_ms,
+            hot_cues,
         } => {
             assert_eq!(track.id, "trk-1");
             assert_eq!(track.path, "/music/song.mp3");
@@ -109,6 +110,8 @@ async fn ws_submit_event_deck_load_forwards_to_control_loop_channel() {
             assert_eq!(beat_grid_anchor_ms, 12);
             // Wire payload omitted `downbeats_ms`; serde default = [].
             assert!(downbeats_ms.is_empty());
+            // Wire payload omitted `hot_cues`; serde default = all None.
+            assert!(hot_cues.iter().all(Option::is_none));
         }
         other => panic!("unexpected event kind on channel: {other:?}"),
     }

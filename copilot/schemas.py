@@ -36,12 +36,38 @@ class EqBand(str, Enum):
 
 
 class TrackRef(BaseModel):
-    """Mirrors ``state::TrackRef``. ``id`` is library-stable; ``path`` is local FS."""
+    """Mirrors ``state::TrackRef``. ``id`` is library-stable; ``path`` is local FS.
 
-    model_config = ConfigDict(frozen=True)
+    Hot-cue persistence PR: ``hot_cues`` is a library-side metadata
+    extension that the engine doesn't store on its own ``state::TrackRef``
+    (the engine carries it on ``EventKind::DeckLoad`` + ``Deck`` instead).
+    It's mirrored here so the co-pilot's typed ``library.*`` responses
+    have a Pydantic model to validate against — the engine's wire shape
+    accepts the field via ``extra="ignore"`` on ``Deck`` and the
+    externally-tagged ``DeckLoad`` payload.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
 
     id: str
     path: str
+    # 8-slot hot-cue grid; each slot is either a ms-position (int >= 0)
+    # or None when unset. Defaults to all-None so existing call sites
+    # that only pass id/path continue to parse cleanly.
+    hot_cues: list[int | None] = Field(
+        default_factory=lambda: [None] * 8  # type: ignore[arg-type]
+    )
+
+    @field_validator("hot_cues")
+    @classmethod
+    def _exactly_eight_slots(
+        cls, v: list[int | None]
+    ) -> list[int | None]:
+        if len(v) != 8:
+            raise ValueError(
+                f"hot_cues must have exactly 8 slots, got {len(v)}"
+            )
+        return v
 
 
 class EffectSlot(BaseModel):
@@ -154,6 +180,24 @@ class DeckLoad(_EventKindBase):
     # callers that haven't migrated yet wire-compatible. Field name
     # matches the Rust serde naming (snake_case).
     downbeats_ms: list[int] = Field(default_factory=list)
+    # 8-slot hot-cue grid (hot-cue persistence PR). Mirrors the engine's
+    # `EventKind::DeckLoad.hot_cues: [Option<u64>; 8]`. Default = all
+    # None so a pre-PR DeckLoad emit still validates cleanly; the
+    # engine fills the same default via `#[serde(default)]`.
+    hot_cues: list[int | None] = Field(
+        default_factory=lambda: [None] * 8  # type: ignore[arg-type]
+    )
+
+    @field_validator("hot_cues")
+    @classmethod
+    def _exactly_eight_slots(
+        cls, v: list[int | None]
+    ) -> list[int | None]:
+        if len(v) != 8:
+            raise ValueError(
+                f"hot_cues must have exactly 8 slots, got {len(v)}"
+            )
+        return v
 
 
 class DeckPlay(_EventKindBase):

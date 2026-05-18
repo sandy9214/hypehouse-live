@@ -556,6 +556,7 @@ mod tests {
                 bpm: 128.0,
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: vec![],
+                hot_cues: [None; 8],
             },
         );
         let next = prev.apply(&e);
@@ -838,6 +839,7 @@ mod tests {
                     bpm: 120.0,
                     beat_grid_anchor_ms: 0,
                     downbeats_ms: vec![],
+                    hot_cues: [None; 8],
                 },
             )
         };

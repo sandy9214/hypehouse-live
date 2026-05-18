@@ -90,6 +90,13 @@ def track_ref_to_wire(t: TrackRef) -> dict[str, Any]:
         "beat_grid_anchor_ms": int(t.beat_grid_anchor_ms),
         "beat_period_ms": float(t.beat_period_ms),
         "downbeats_ms": [int(d) for d in t.downbeats_ms],
+        # 8-slot hot-cue grid — ``int`` ms position per set slot,
+        # ``None`` per empty slot. Shape matches the engine's
+        # ``Deck::hot_cues: [Option<u64>; 8]`` so a row can be passed
+        # straight into the extended ``DeckLoad`` event's
+        # ``hot_cues`` field. Built fresh per call so callers can't
+        # accidentally mutate the dataclass's default list.
+        "hot_cues": [None if c is None else int(c) for c in t.hot_cues],
     }
 
 
@@ -135,6 +142,7 @@ class LibraryRpcHandler:
         "add_track",
         "search_tracks",
         "add_track_from_directory",
+        "set_hot_cues",
     )
 
     def __init__(self, library: TrackLibrary):
@@ -167,6 +175,8 @@ class LibraryRpcHandler:
             return self._search_tracks(params)
         if method == "library.add_track_from_directory":
             return self._add_track_from_directory(params)
+        if method == "library.set_hot_cues":
+            return self._set_hot_cues(params)
         raise RpcError(-32601, f"method not found: {method}")
 
     # --- handlers -----------------------------------------------------
@@ -219,6 +229,43 @@ class LibraryRpcHandler:
             "query": query,
             "limit": max(1, min(limit, 1000)),
         }
+
+    def _set_hot_cues(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Persist a new 8-slot hot-cue array for ``track_id``.
+
+        Wire shape::
+
+            { "track_id": "...", "hot_cues": [int|null, ... * 8] }
+
+        Returns ``{ "track": <TrackRef wire shape> }`` mirroring
+        ``library.add_track`` so the UI can swap the row into its
+        cache without a follow-up fetch.
+        """
+        track_id = _coerce_str(params.get("track_id"), field="track_id")
+        raw_cues = params.get("hot_cues")
+        if not isinstance(raw_cues, list):
+            raise RpcError(
+                JSONRPC_INVALID_PARAMS,
+                "hot_cues must be a list",
+            )
+        try:
+            ref = self._library.set_hot_cues(track_id, raw_cues)
+        except ValueError as exc:
+            # Shape errors (length / type / negative) surface as
+            # -32602; the wire layer translates these into the proper
+            # JSON-RPC error envelope.
+            raise RpcError(
+                JSONRPC_INVALID_PARAMS,
+                str(exc),
+                data={"track_id": track_id},
+            ) from exc
+        except KeyError as exc:
+            raise RpcError(
+                JSONRPC_INVALID_PARAMS,
+                f"track not found: {track_id}",
+                data={"track_id": track_id},
+            ) from exc
+        return {"track": track_ref_to_wire(ref)}
 
     def _add_track_from_directory(
         self, params: dict[str, Any]

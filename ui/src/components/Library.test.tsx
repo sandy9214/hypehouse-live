@@ -25,6 +25,7 @@ const makeTrack = (id: string, extra: Partial<LibraryTrack> = {}): LibraryTrack 
   beat_grid_anchor_ms: 0,
   beat_period_ms: 60_000.0 / 124.0,
   downbeats_ms: [],
+  hot_cues: [null, null, null, null, null, null, null, null],
   ...extra,
 });
 
@@ -113,6 +114,10 @@ describe("Library", () => {
           bpm: 128.0,
           beat_grid_anchor_ms: 42,
           downbeats_ms: [0, 1875, 3750],
+          // Hot-cue persistence PR: the load button forwards the
+          // library's saved cue array onto the DeckLoad event. Fresh
+          // tracks come in with 8 nulls.
+          hot_cues: [null, null, null, null, null, null, null, null],
         },
       });
     });
@@ -181,6 +186,49 @@ describe("Library", () => {
         (c: unknown[]): boolean => c[0] === "library.search_tracks",
       ).length,
     ).toBe(1);
+  });
+
+  it("clicking '→ A' forwards saved hot_cues from the library row", async (): Promise<void> => {
+    const cues: ReadonlyArray<number | null> = [
+      0,
+      1500,
+      null,
+      8000,
+      null,
+      null,
+      60_000,
+      null,
+    ];
+    const track = makeTrack("hot", {
+      bpm: 128.0,
+      beat_grid_anchor_ms: 0,
+      downbeats_ms: [],
+      hot_cues: cues,
+    });
+    const { client, call } = makeClient({
+      "library.list_tracks": {
+        tracks: [track],
+        total: 1,
+        limit: 100,
+        offset: 0,
+      },
+      submit_event: undefined,
+    });
+    render(<Library client={client} />);
+    await waitFor((): void => {
+      expect(screen.getByTestId("track-row-hot")).toBeTruthy();
+    });
+    fireEvent.click(screen.getByTestId("load-hot-A"));
+    await waitFor((): void => {
+      const sent = call.mock.calls.find(
+        (c: unknown[]): boolean => c[0] === "submit_event",
+      );
+      expect(sent).toBeDefined();
+      const payload = sent?.[1] as {
+        DeckLoad: { hot_cues: ReadonlyArray<number | null> };
+      };
+      expect(payload.DeckLoad.hot_cues).toEqual(cues);
+    });
   });
 
   it("surfaces error banner when RPC fails", async (): Promise<void> => {
