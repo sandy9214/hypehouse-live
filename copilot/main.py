@@ -49,6 +49,29 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "Default is the new loop (PR copilot-engine-ws-subscribe)."
         ),
     )
+    # HTTP RPC server — default ON. The engine bridge proxy (PR #53)
+    # forwards library.* calls to http://127.0.0.1:8766/rpc, so the
+    # listener must exist for the UI's library panel to work.
+    http_group = p.add_mutually_exclusive_group()
+    http_group.add_argument(
+        "--http-server",
+        action="store_true",
+        default=True,
+        dest="http_server",
+        help=(
+            "expose the JSON-RPC HTTP endpoint at http://127.0.0.1:8766/rpc "
+            "(default; override port via $HYPEHOUSE_COPILOT_HTTP_PORT)."
+        ),
+    )
+    http_group.add_argument(
+        "--no-http-server",
+        action="store_false",
+        dest="http_server",
+        help=(
+            "disable the HTTP RPC endpoint; only the engine WS subscriber "
+            "runs. Use for pure WS-subscriber mode (no library.* proxy)."
+        ),
+    )
     p.add_argument(
         "--library-db",
         default=os.environ.get(
@@ -77,7 +100,14 @@ async def _run(args: argparse.Namespace) -> int:
         engine_ws_url=args.engine_ws,
         bridge_token=args.bridge_token,
     )
-    run_coro = service.run() if args.legacy_loop else service.run_with_proposer()
+    if args.http_server:
+        run_coro = service.run_with_http_server(
+            use_legacy_engine_loop=args.legacy_loop,
+        )
+    else:
+        run_coro = (
+            service.run() if args.legacy_loop else service.run_with_proposer()
+        )
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
