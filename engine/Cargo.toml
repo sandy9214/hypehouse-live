@@ -47,7 +47,7 @@ anyhow = "1"
 thiserror = "2"
 
 [dev-dependencies]
-criterion = "0.7"
+criterion = "0.8"
 proptest = "1"
 # Asserts no heap allocation happens within a gated scope — used to prove
 # the audio-thread hot path is alloc-free per ADR-004.
