@@ -43,6 +43,17 @@ mashup = [
     "soundfile>=0.12.1",
     "demucs>=4.0",
 ]
+# Stem separation — vocals/drums/bass/other split via Facebook demucs.
+# Heavy (torch wheel ~2 GB, htdemucs checkpoint ~2 GB on first run),
+# so we keep it optional. ``copilot.stems`` lazy-imports demucs and
+# raises ``StemsDependencyError`` when the user hasn't opted in;
+# ``library.compute_stems`` RPC surfaces this as ``-32000``. Pinned to
+# 4.0.x as that's the line ``htdemucs`` ships in — bumping major needs
+# a re-test of the ``Separator.separate_audio_file`` shape.
+stems = [
+    "demucs>=4.0,<5",
+    "torch>=2.0",
+]
 
 [project.scripts]
 hypehouse-copilot = "copilot.main:main"

@@ -135,12 +135,12 @@ def test_pick_compatible_empty_library(library: TrackLibrary):
 def test_schema_version_is_current():
     """The constant must match the migration plan documented in library.py.
 
-    Bumped from v3 → v4 in the waveform-render PR (adds the
-    ``waveform_peaks`` BLOB column). Pinning to a literal here rather
-    than a >= comparison so a future regression that *lowers* the
-    version fails loudly.
+    Bumped from v4 → v5 in the stem-separation scaffold PR (adds the
+    ``stems_dir`` + ``stems_status`` columns). Pinning to a literal
+    here rather than a >= comparison so a future regression that
+    *lowers* the version fails loudly.
     """
-    assert TRACK_SCHEMA_VERSION == 4
+    assert TRACK_SCHEMA_VERSION == 5
     assert HOT_CUE_SLOTS == 8
 
 

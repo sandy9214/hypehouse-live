@@ -43,14 +43,27 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Bumped to v4 in the waveform-render PR. v2 added beat-grid columns
-# (anchor_ms / period_ms / downbeats_json); v3 added ``hot_cues_json``
-# so the 8-slot per-track hot-cue grid survives track unload/reload;
-# v4 adds ``waveform_peaks`` — a packed min/max peak-pairs BLOB used by
-# the UI to draw a real waveform instead of a flat placeholder line.
+# Bumped to v5 in the stem-separation scaffold PR.
+# v2 added beat-grid columns (anchor_ms / period_ms / downbeats_json);
+# v3 added ``hot_cues_json`` so the 8-slot per-track hot-cue grid
+# survives track unload/reload;
+# v4 added ``waveform_peaks`` — a packed min/max peak-pairs BLOB used
+# by the UI to draw a real waveform instead of a flat placeholder line;
+# v5 adds ``stems_dir`` + ``stems_status`` — filesystem path to the
+# per-track 4-stem cache (vocals/drums/bass/other WAVs) and the
+# computation status string ("pending" / "ready" / "failed"). NULL on
+# both columns = stems have never been requested for this track. See
+# ``copilot/stems.py`` for the on-disk layout.
 # Migrations dispatch on the gap between this constant and the value
 # recorded in the ``schema_version`` table.
-TRACK_SCHEMA_VERSION = 4
+TRACK_SCHEMA_VERSION = 5
+
+# Per-track stem-status enum values. Persisted as plain strings (not a
+# SQL enum) so older readers can still introspect the column. The
+# pipeline never writes anything outside this set.
+STEMS_STATUS_PENDING = "pending"
+STEMS_STATUS_READY = "ready"
+STEMS_STATUS_FAILED = "failed"
 
 # Number of hot-cue slots per deck — mirrors the engine's
 # ``Deck::hot_cues: [Option<u64>; 8]`` array in ``engine/src/state.rs``.
@@ -250,6 +263,25 @@ class TrackLibrary:
             self._conn.execute(
                 "ALTER TABLE tracks ADD COLUMN waveform_peaks BLOB"
             )
+        if "stems_dir" not in cols:
+            # v5 migration — filesystem path to the per-track stem
+            # cache directory (``vocals.wav`` / ``drums.wav`` /
+            # ``bass.wav`` / ``other.wav``). NULL = stems have never
+            # been requested. Stored as a string rather than computed
+            # at read time so a future change to the cache-root layout
+            # doesn't strand existing rows.
+            self._conn.execute(
+                "ALTER TABLE tracks ADD COLUMN stems_dir TEXT"
+            )
+        if "stems_status" not in cols:
+            # v5 migration — computation status. NULL = never
+            # requested; "pending" = computation kicked off; "ready" =
+            # all four WAVs on disk; "failed" = demucs raised (the
+            # error message is in the engine log, not persisted here —
+            # we'd need a status_detail column for that, deferred).
+            self._conn.execute(
+                "ALTER TABLE tracks ADD COLUMN stems_status TEXT"
+            )
         # Stamp the current schema version. The ``schema_version``
         # table is conceptually single-row but ``version`` is also the
         # primary key — using ``INSERT OR REPLACE`` would leave stale
@@ -444,6 +476,131 @@ class TrackLibrary:
         if cursor.rowcount == 0:
             raise KeyError(track_id)
         self._conn.commit()
+
+    # --- stems persistence (v5) ------------------------------------------
+
+    def get_stems_status(
+        self, track_id: str
+    ) -> tuple[str | None, str | None] | None:
+        """Return ``(status, stems_dir)`` for ``track_id`` or ``None``.
+
+        ``None`` is returned when the track row doesn't exist. When the
+        row exists but stems haven't been computed, ``status`` and
+        ``stems_dir`` are both ``None`` — caller distinguishes
+        "unknown track" from "stems not requested yet" via this two-tier
+        signal.
+        """
+        r = self._conn.execute(
+            "SELECT stems_status, stems_dir FROM tracks WHERE track_id = ?",
+            (track_id,),
+        ).fetchone()
+        if r is None:
+            return None
+        status = r["stems_status"]
+        stems_dir = r["stems_dir"]
+        return (status, stems_dir)
+
+    def set_stems(
+        self,
+        track_id: str,
+        *,
+        status: str,
+        stems_dir: str | Path | None,
+    ) -> None:
+        """Persist stem-cache metadata against an existing track row.
+
+        Args:
+            track_id: Library row id.
+            status: One of ``"pending"`` / ``"ready"`` / ``"failed"`` —
+                or any custom string; validation belongs at the caller
+                (we don't enum here because adding a status string
+                later shouldn't break old DB writers).
+            stems_dir: Absolute filesystem path to the per-track
+                cache. ``None`` is allowed (e.g. when status flips to
+                ``"failed"`` before a dir was even created).
+
+        Raises:
+            KeyError: ``track_id`` not in the catalog.
+        """
+        path_str: str | None = (
+            str(stems_dir) if stems_dir is not None else None
+        )
+        cursor = self._conn.execute(
+            "UPDATE tracks SET stems_status = ?, stems_dir = ? "
+            "WHERE track_id = ?",
+            (status, path_str, track_id),
+        )
+        if cursor.rowcount == 0:
+            raise KeyError(track_id)
+        self._conn.commit()
+
+    def compute_track_stems(
+        self,
+        track_id: str,
+        output_root: str | Path | None = None,
+    ) -> dict[str, Path]:
+        """Run stem separation for ``track_id`` and persist the result.
+
+        Looks up the track, resolves the per-track cache directory
+        under ``output_root`` (defaults to
+        :func:`copilot.stems.default_stems_root`), then calls
+        :func:`copilot.stems.compute_stems`. Status is flipped to
+        ``"pending"`` before the heavy call and to ``"ready"`` /
+        ``"failed"`` after.
+
+        Returns the same dict :func:`copilot.stems.compute_stems`
+        returns: ``{"vocals": <Path>, ...}``.
+
+        Raises:
+            KeyError: ``track_id`` not in the catalog.
+            StemsDependencyError: demucs not installed (the caller —
+                typically the RPC layer — surfaces this as a
+                "pip install [stems]" hint).
+            Exception: any other failure from demucs propagates; the
+                ``stems_status`` row is updated to ``"failed"`` first
+                so a follow-up ``library.get_stems`` reports the
+                failure cleanly.
+        """
+        # Lazy import to keep ``copilot.library`` itself free of the
+        # demucs dependency at import time (and to let tests monkey-
+        # patch ``copilot.stems.compute_stems`` without hitting an
+        # ``ImportError`` from the top of this module).
+        from . import stems as stems_mod
+
+        ref = self.get(track_id)
+        if ref is None:
+            raise KeyError(track_id)
+
+        root = (
+            Path(output_root).expanduser()
+            if output_root is not None
+            else stems_mod.default_stems_root()
+        )
+        track_dir = root / track_id
+
+        self.set_stems(
+            track_id,
+            status=STEMS_STATUS_PENDING,
+            stems_dir=str(track_dir),
+        )
+        try:
+            result = stems_mod.compute_stems(Path(ref.path), track_dir)
+        except Exception:
+            # Persist failure state and re-raise — the RPC layer wants
+            # to see the exception type (specifically StemsDependency-
+            # Error gets a different wire code).
+            self.set_stems(
+                track_id,
+                status=STEMS_STATUS_FAILED,
+                stems_dir=str(track_dir),
+            )
+            raise
+        self.set_stems(
+            track_id,
+            status=STEMS_STATUS_READY,
+            stems_dir=str(track_dir),
+        )
+        return result
 
     def count_tracks(self) -> int:
         """Total row count — used by paginated ``list_tracks`` for the UI."""

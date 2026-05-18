@@ -145,7 +145,12 @@ def test_schema_migration_adds_waveform_peaks_column(tmp_path: Path) -> None:
         version = lib._conn.execute(
             "SELECT version FROM schema_version"
         ).fetchone()
-        assert version["version"] == TRACK_SCHEMA_VERSION == 4
+        # Schema version stamp tracks ``TRACK_SCHEMA_VERSION`` — updated
+        # each time a new column lands (v4 added ``waveform_peaks``,
+        # v5 added ``stems_dir`` / ``stems_status``). The test only
+        # cares that this v3→current migration path advances to the
+        # latest constant, not the specific literal.
+        assert version["version"] == TRACK_SCHEMA_VERSION
     finally:
         lib.close()
 

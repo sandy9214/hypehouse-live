@@ -518,7 +518,8 @@ UI can offer the file path for direct playback.
 
 All `library.*` JSON-RPC methods (`list_tracks`, `add_track`,
 `search_tracks`, `add_track_from_directory`, `set_hot_cues`,
-`get_waveform`) are received by the **engine bridge** on
+`get_waveform`, `compute_stems`, `get_stems`) are received by the
+**engine bridge** on
 `ws://127.0.0.1:8765` and forwarded over HTTP to the copilot service.
 The UI therefore holds only **one** WebSocket — the engine — and never
 opens a direct connection to the copilot.
@@ -716,6 +717,87 @@ the test path) trigger a lazy compute on first request.
 
 **Errors**: `-32602` if `track_id` is missing / empty. Unknown
 `track_id` is *not* an error — it returns `peaks_b64: null`.
+
+### `library.compute_stems` (co-pilot)
+
+Kick off **stem separation** for a track — run Facebook's `demucs`
+model to split the track into four mono/stereo WAVs (`vocals.wav` /
+`drums.wav` / `bass.wav` / `other.wav`). See [`docs/stems.md`](../stems.md)
+for the design + perf budget.
+
+The actual compute is heavy (~30 s on GPU, ~3 min on CPU), so the call
+returns **immediately** with a `pending` envelope and the work runs in
+a background asyncio task. The UI polls `library.get_stems` for
+completion.
+
+**Params**:
+
+```json
+{ "track_id": "kanye-stronger" }
+```
+
+**Result**:
+
+```json
+{ "track_id": "kanye-stronger", "status": "pending" }
+```
+
+Calling this method again while a task is already in flight is a no-op
+— the same `{status: "pending"}` envelope comes back without
+scheduling a second demucs run.
+
+**Errors**:
+
+| Code     | Reason                                                            |
+|----------|-------------------------------------------------------------------|
+| `-32602` | `track_id` missing or unknown.                                    |
+| `-32000` | Optional `demucs` dependency not installed (`pip install hypehouse-copilot[stems]`). |
+
+### `library.get_stems` (co-pilot)
+
+Poll the current stem-cache state for a track. Returns the four WAV
+paths once stem separation has completed.
+
+**Params**:
+
+```json
+{ "track_id": "kanye-stronger" }
+```
+
+**Result** (ready):
+
+```json
+{
+  "track_id": "kanye-stronger",
+  "status": "ready",
+  "stems": {
+    "vocals": "/home/sandy/.local/share/hypehouse-live/stems/kanye-stronger/vocals.wav",
+    "drums":  "/home/sandy/.local/share/hypehouse-live/stems/kanye-stronger/drums.wav",
+    "bass":   "/home/sandy/.local/share/hypehouse-live/stems/kanye-stronger/bass.wav",
+    "other":  "/home/sandy/.local/share/hypehouse-live/stems/kanye-stronger/other.wav"
+  }
+}
+```
+
+**Result** (pending / failed / never requested):
+
+```json
+{ "track_id": "kanye-stronger", "status": "pending", "stems": null }
+```
+
+* `status: "pending"` — `library.compute_stems` was called and the
+  task is still running.
+* `status: "failed"` — demucs raised, OR a previously-`ready` cache
+  was nuked from disk between requests. The UI can offer a retry by
+  re-calling `library.compute_stems`.
+* `status: null` — the track exists but stems have never been
+  requested.
+* Missing track (unknown `track_id`) returns
+  `{status: null, stems: null}` rather than an error envelope —
+  mirrors the `library.get_waveform` "missing = graceful null"
+  convention so the UI's single fetch path stays simple.
+
+**Errors**: `-32602` if `track_id` is missing / empty.
 
 ## Server-pushed notifications
 

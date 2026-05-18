@@ -43,12 +43,19 @@ anchor / downbeats fields the engine needs.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 from pathlib import Path
 from typing import Any
 
-from .library import TrackLibrary, TrackRef
+from .library import (
+    STEMS_STATUS_FAILED,
+    STEMS_STATUS_PENDING,
+    STEMS_STATUS_READY,
+    TrackLibrary,
+    TrackRef,
+)
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +63,12 @@ log = logging.getLogger(__name__)
 # JSON-RPC 2.0 error codes (see docs/api/ws-protocol.md).
 JSONRPC_INVALID_PARAMS = -32602
 JSONRPC_INTERNAL_ERROR = -32603
+
+# Reserved server-defined error range. We use ``-32000`` for the
+# "optional feature not installed" branch — distinct from
+# ``-32603 internal error`` because a missing optional dep is a
+# configuration problem the user can fix, not an engine bug.
+JSONRPC_FEATURE_NOT_INSTALLED = -32000
 
 
 class RpcError(Exception):
@@ -145,10 +158,20 @@ class LibraryRpcHandler:
         "add_track_from_directory",
         "set_hot_cues",
         "get_waveform",
+        "compute_stems",
+        "get_stems",
     )
 
     def __init__(self, library: TrackLibrary):
         self._library = library
+        # Per-process registry of in-flight stem-computation tasks,
+        # keyed by ``track_id``. Kicking ``library.compute_stems``
+        # twice for the same track is a no-op — the second call
+        # returns ``{status: "pending"}`` without scheduling a second
+        # demucs run. We hold a strong ref so the asyncio loop doesn't
+        # garbage-collect the task mid-compute (see
+        # https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task).
+        self._stem_tasks: dict[str, asyncio.Task[None]] = {}
 
     @property
     def fully_qualified_methods(self) -> tuple[str, ...]:
@@ -181,6 +204,10 @@ class LibraryRpcHandler:
             return self._set_hot_cues(params)
         if method == "library.get_waveform":
             return self._get_waveform(params)
+        if method == "library.compute_stems":
+            return self._compute_stems(params)
+        if method == "library.get_stems":
+            return self._get_stems(params)
         raise RpcError(-32601, f"method not found: {method}")
 
     # --- handlers -----------------------------------------------------
@@ -329,6 +356,181 @@ class LibraryRpcHandler:
         return {
             "track_id": track_id,
             "peaks_b64": base64.b64encode(peaks).decode("ascii"),
+        }
+
+    # --- stem separation (v5 schema) ---------------------------------
+
+    async def _run_stem_task(self, track_id: str) -> None:
+        """Background coroutine that runs the heavy demucs call.
+
+        SQLite connections are pinned to the thread that opened them
+        (``check_same_thread=True`` default), so we can't just shove
+        :meth:`TrackLibrary.compute_track_stems` into
+        :func:`asyncio.to_thread`. Instead we split the work:
+
+        * Status writes (``pending`` → ``ready`` / ``failed``) and the
+          track lookup happen on the event-loop thread (synchronous
+          SQLite calls — they're sub-millisecond).
+        * The heavy demucs invocation runs in
+          :func:`asyncio.to_thread` so it doesn't block the loop.
+
+        All exceptions are caught — the ``"failed"`` status is
+        persisted explicitly so subsequent ``library.get_stems``
+        calls report the failure correctly.
+        """
+        from . import stems as stems_mod
+
+        try:
+            ref = self._library.get(track_id)
+            if ref is None:
+                # Row vanished between scheduling + run — rare. Nothing
+                # to persist; just bail.
+                return
+
+            root = stems_mod.default_stems_root()
+            track_dir = root / track_id
+            self._library.set_stems(
+                track_id,
+                status=STEMS_STATUS_PENDING,
+                stems_dir=str(track_dir),
+            )
+
+            try:
+                await asyncio.to_thread(
+                    stems_mod.compute_stems, Path(ref.path), track_dir
+                )
+            except Exception:  # noqa: BLE001 — see below
+                self._library.set_stems(
+                    track_id,
+                    status=STEMS_STATUS_FAILED,
+                    stems_dir=str(track_dir),
+                )
+                raise
+            self._library.set_stems(
+                track_id,
+                status=STEMS_STATUS_READY,
+                stems_dir=str(track_dir),
+            )
+        except Exception:  # noqa: BLE001 — outer guard
+            log.exception("stem computation failed for %s", track_id)
+        finally:
+            # Drop the task from the registry so a follow-up call
+            # (e.g. after a "failed" status) can re-schedule.
+            self._stem_tasks.pop(track_id, None)
+
+    def _compute_stems(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Kick off stem separation for ``track_id`` as a background task.
+
+        Returns immediately with ``{status: "pending", track_id: ...}``
+        — the caller polls ``library.get_stems`` to learn when the
+        computation finishes. The actual demucs invocation runs in a
+        worker thread (see :meth:`_run_stem_task`).
+
+        Errors:
+
+        * ``-32602`` — ``track_id`` missing / unknown.
+        * ``-32000`` — demucs not installed (raised by
+          :class:`copilot.stems.StemsDependencyError`). The probe
+          import is done synchronously here so the user gets the
+          install hint on the *first* call rather than via a status
+          flip to ``"failed"`` after a polling round-trip.
+        """
+        track_id = _coerce_str(params.get("track_id"), field="track_id")
+        if self._library.get(track_id) is None:
+            raise RpcError(
+                JSONRPC_INVALID_PARAMS,
+                f"track not found: {track_id}",
+                data={"track_id": track_id},
+            )
+
+        # Probe the optional dep synchronously so we can surface the
+        # install hint immediately. Lazy-imported so module load
+        # doesn't pay the torch import cost.
+        try:
+            import demucs.api  # type: ignore[import-not-found]  # noqa: F401
+        except ImportError as exc:
+            raise RpcError(
+                JSONRPC_FEATURE_NOT_INSTALLED,
+                "stems feature not installed: "
+                "pip install hypehouse-copilot[stems]",
+                data={"track_id": track_id},
+            ) from exc
+
+        # De-dupe in-flight requests. A second call while a task is
+        # running returns the same {pending} envelope — UI doesn't
+        # have to track its own "did I already ask?" state.
+        if track_id in self._stem_tasks and not self._stem_tasks[track_id].done():
+            return {"track_id": track_id, "status": STEMS_STATUS_PENDING}
+
+        task = asyncio.create_task(self._run_stem_task(track_id))
+        self._stem_tasks[track_id] = task
+        return {"track_id": track_id, "status": STEMS_STATUS_PENDING}
+
+    def _get_stems(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Return the current stem-cache state for ``track_id``.
+
+        Wire shape::
+
+            { "track_id": "...",
+              "status":   "ready" | "pending" | "failed" | null,
+              "stems":    { "vocals": "...", "drums": "...",
+                            "bass":   "...", "other": "..." } | null }
+
+        ``status: null`` + ``stems: null`` means the track exists but
+        stems have never been requested. ``status: "ready"`` with
+        ``stems`` populated is the success case the engine integration
+        will consume.
+
+        A missing track returns ``{status: null, stems: null}`` rather
+        than an error — mirrors :meth:`_get_waveform`'s graceful
+        degradation so the UI's single fetch path stays simple.
+        """
+        track_id = _coerce_str(params.get("track_id"), field="track_id")
+        info = self._library.get_stems_status(track_id)
+        if info is None:
+            # Track row doesn't exist — graceful null.
+            return {"track_id": track_id, "status": None, "stems": None}
+
+        status, stems_dir = info
+        if status != STEMS_STATUS_READY or stems_dir is None:
+            return {
+                "track_id": track_id,
+                "status": status,
+                "stems": None,
+            }
+
+        # Re-resolve the four stem paths from the on-disk cache so the
+        # response reflects current filesystem reality (e.g. an
+        # operator could have nuked the cache between compute + get).
+        from .stems import STEM_NAMES
+
+        cache_dir = Path(stems_dir)
+        stems_map: dict[str, str] = {}
+        for name in STEM_NAMES:
+            wav = cache_dir / f"{name}.wav"
+            if not wav.exists():
+                # Cache directory exists but a stem is missing — flip
+                # the status to "failed" so the UI can offer a retry
+                # button. Don't raise; the caller wants a status, not
+                # an error envelope.
+                try:
+                    self._library.set_stems(
+                        track_id,
+                        status=STEMS_STATUS_FAILED,
+                        stems_dir=stems_dir,
+                    )
+                except KeyError:
+                    pass
+                return {
+                    "track_id": track_id,
+                    "status": STEMS_STATUS_FAILED,
+                    "stems": None,
+                }
+            stems_map[name] = str(wav)
+        return {
+            "track_id": track_id,
+            "status": STEMS_STATUS_READY,
+            "stems": stems_map,
         }
 
     def _add_track_from_directory(
