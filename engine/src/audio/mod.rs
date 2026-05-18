@@ -29,6 +29,7 @@ pub mod effects;
 pub mod io;
 pub mod limiter;
 pub mod mixer;
+pub mod perf;
 pub mod pitch_tempo;
 pub mod ring;
 pub mod translator;
@@ -54,6 +55,7 @@ pub use limiter::{
     MIN_THRESHOLD_DB as MASTER_LIMITER_MIN_THRESHOLD_DB,
 };
 pub use mixer::AudioMixer;
+pub use perf::{PerfMetrics, PerfSnapshot};
 pub use pitch_tempo::{
     clamp_pitch_semitones, clamp_tempo_ratio, semitones_to_ratio, PitchTempo, MAX_PITCH_SEMITONES,
     MAX_TEMPO_RATIO, MIN_PITCH_SEMITONES, MIN_TEMPO_RATIO,

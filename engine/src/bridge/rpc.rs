@@ -33,6 +33,7 @@ use crate::audio::effects::{
     descriptors, EffectId, ParamDescriptor, EFFECT_ECHO, EFFECT_FILTER, EFFECT_GATE, EFFECT_REVERB,
 };
 use crate::audio::ClockSource;
+use crate::audio::{PerfMetrics, PerfSnapshot};
 use crate::state::{DeckId, EngineState, Event, EventKind, EventSource};
 
 use super::auth::AuthConfig;
@@ -225,6 +226,12 @@ pub enum BridgeNotice {
         /// reducer state. `ClockSource::Internal` when no shared clock
         /// is wired (the bare `EngineHandle::new()` test path).
         clock_source: ClockSource,
+        /// Audio-thread performance snapshot — CPU%, render p99,
+        /// underrun + dropped-frame counts. Same envelope-not-state
+        /// reasoning as the gain-reduction field: live measurement off
+        /// the audio thread, NOT part of the event-sourced reducer.
+        /// Defaults to a zero-snapshot when no audio thread is wired.
+        perf: PerfSnapshot,
     },
     AudioAlert {
         kind: String,
@@ -283,6 +290,13 @@ struct EngineInner {
     /// tests that don't spin up a real audio thread; the wire payload
     /// then carries `"internal"`.
     shared_clock: std::sync::Mutex<Option<SharedClock>>,
+    /// Optional handle on the audio thread's [`PerfMetrics`]. When
+    /// `Some`, every outgoing `engine.state_changed` snapshots the
+    /// audio-side counters so the UI perf dashboard can render CPU%,
+    /// render-time peak, and underrun counts live. `None` in tests that
+    /// don't spin up a real audio thread; the wire payload then carries
+    /// a zero-snapshot (gauge reads 0% / no underruns).
+    perf_metrics: std::sync::Mutex<Option<PerfMetrics>>,
 }
 
 impl EngineHandle {
@@ -313,6 +327,7 @@ impl EngineHandle {
             event_sink,
             master_limiter_gr: std::sync::Mutex::new(None),
             shared_clock: std::sync::Mutex::new(None),
+            perf_metrics: std::sync::Mutex::new(None),
         };
         Self {
             inner: Arc::new(inner),
@@ -373,6 +388,36 @@ impl EngineHandle {
         match slot.as_ref() {
             None => ClockSource::Internal,
             Some(c) => c.clock_source(),
+        }
+    }
+
+    /// Wire the audio thread's [`PerfMetrics`] handle into this engine
+    /// handle. Called once at startup (`main.rs`); the bridge then
+    /// snapshots the counters for every outgoing `state_changed`.
+    /// Re-calling replaces the previous handle so a hot-swap of the
+    /// audio stack is safe.
+    pub fn attach_perf_metrics(&self, perf: PerfMetrics) {
+        let mut slot = self
+            .inner
+            .perf_metrics
+            .lock()
+            .expect("engine perf_metrics poisoned");
+        *slot = Some(perf);
+    }
+
+    /// Snapshot the audio-thread perf counters. Returns a zero snapshot
+    /// when no audio thread is wired (test/bare mode). The snapshot
+    /// also atomically resets the sliding-window render peak — see
+    /// [`PerfMetrics::snapshot`] for the rationale.
+    pub fn perf_snapshot(&self) -> PerfSnapshot {
+        let slot = self
+            .inner
+            .perf_metrics
+            .lock()
+            .expect("engine perf_metrics poisoned");
+        match slot.as_ref() {
+            None => PerfSnapshot::default(),
+            Some(p) => p.snapshot(),
         }
     }
 
@@ -511,11 +556,13 @@ impl EngineHandle {
 
         let gr_db = self.master_limiter_gain_reduction_db();
         let clock_source = self.clock_source();
+        let perf = self.perf_snapshot();
         let _ = self.inner.notices.send(BridgeNotice::StateChanged {
             state: Box::new(next_state),
             last_event_id: id,
             master_limiter_gain_reduction_db: gr_db,
             clock_source,
+            perf,
         });
 
         id
@@ -906,6 +953,7 @@ pub fn state_changed_notification(
     last_event_id: u64,
     master_limiter_gain_reduction_db: f32,
     clock_source: ClockSource,
+    perf: PerfSnapshot,
 ) -> RpcNotification {
     RpcNotification::new(
         method::NOTIFY_STATE_CHANGED,
@@ -914,6 +962,7 @@ pub fn state_changed_notification(
             "last_event_id": last_event_id,
             "master_limiter_gain_reduction_db": master_limiter_gain_reduction_db,
             "clock_source": clock_source.as_str(),
+            "perf": perf,
         }),
     )
 }
@@ -1142,6 +1191,7 @@ mod tests {
                 last_event_id,
                 master_limiter_gain_reduction_db,
                 clock_source,
+                perf,
             } => {
                 assert_eq!(last_event_id, 1);
                 assert!(state.deck_a.playing);
@@ -1149,6 +1199,8 @@ mod tests {
                 assert!(master_limiter_gain_reduction_db.abs() < f32::EPSILON);
                 // No shared clock wired in tests; source defaults to Internal.
                 assert_eq!(clock_source, ClockSource::Internal);
+                // No audio thread wired in tests; perf defaults to zero-snapshot.
+                assert_eq!(perf, PerfSnapshot::default());
             }
             BridgeNotice::AudioAlert { .. } | BridgeNotice::DecodeError { .. } => {
                 panic!("expected StateChanged")
@@ -1238,8 +1290,13 @@ mod tests {
             }
         }
         // And the wire-frame builder mirrors the same value.
-        let frame =
-            state_changed_notification(&EngineState::default(), 1, -3.0, ClockSource::Internal);
+        let frame = state_changed_notification(
+            &EngineState::default(),
+            1,
+            -3.0,
+            ClockSource::Internal,
+            PerfSnapshot::default(),
+        );
         let payload = serde_json::to_value(&frame).unwrap();
         let gr_v = payload["params"]["master_limiter_gain_reduction_db"]
             .as_f64()
@@ -1271,18 +1328,88 @@ mod tests {
         }
         // Wire frame must serialize the kebab-case label, NOT a numeric
         // discriminant — the UI's `ClockSourceLabel` is a string union.
-        let frame =
-            state_changed_notification(&EngineState::default(), 1, 0.0, ClockSource::MidiIn);
+        let frame = state_changed_notification(
+            &EngineState::default(),
+            1,
+            0.0,
+            ClockSource::MidiIn,
+            PerfSnapshot::default(),
+        );
         let payload = serde_json::to_value(&frame).unwrap();
         assert_eq!(payload["params"]["clock_source"], "midi_in");
-        let frame2 =
-            state_changed_notification(&EngineState::default(), 1, 0.0, ClockSource::AbletonLink);
+        let frame2 = state_changed_notification(
+            &EngineState::default(),
+            1,
+            0.0,
+            ClockSource::AbletonLink,
+            PerfSnapshot::default(),
+        );
         let payload2 = serde_json::to_value(&frame2).unwrap();
         assert_eq!(payload2["params"]["clock_source"], "ableton_link");
-        let frame3 =
-            state_changed_notification(&EngineState::default(), 1, 0.0, ClockSource::Internal);
+        let frame3 = state_changed_notification(
+            &EngineState::default(),
+            1,
+            0.0,
+            ClockSource::Internal,
+            PerfSnapshot::default(),
+        );
         let payload3 = serde_json::to_value(&frame3).unwrap();
         assert_eq!(payload3["params"]["clock_source"], "internal");
+    }
+
+    #[test]
+    fn state_changed_notification_carries_perf_snapshot_when_wired() {
+        // Wire a `PerfMetrics`, record a render, and verify the bridge
+        // stamps the snapshot onto every outgoing StateChanged + the
+        // wire-frame builder serialises the same fields. Exercises the
+        // audio→bridge perf side-channel without needing a real audio
+        // thread.
+        let e = engine();
+        let perf = PerfMetrics::with_callback_period(10_000_000);
+        perf.record_render_ns(2_000_000); // 2ms render = 20% CPU
+        e.attach_perf_metrics(perf);
+        let mut rx = e.subscribe();
+        e.submit_event_kind(EventKind::DeckPlay { deck: DeckId::A }, EventSource::Ui);
+        let n = rx.try_recv().expect("notification queued");
+        match n {
+            BridgeNotice::StateChanged { perf, .. } => {
+                assert!(
+                    (perf.cpu_percent - 20.0).abs() < 1e-3,
+                    "expected ~20% CPU, got {}",
+                    perf.cpu_percent
+                );
+                assert_eq!(perf.render_count, 1);
+                assert_eq!(perf.avg_render_us, 2_000);
+            }
+            BridgeNotice::AudioAlert { .. } | BridgeNotice::DecodeError { .. } => {
+                panic!("expected StateChanged")
+            }
+        }
+
+        // Wire-frame builder embeds the snapshot under `params.perf`.
+        let snap = PerfSnapshot {
+            cpu_percent: 42.5,
+            render_p99_us: 1_234,
+            underrun_count: 3,
+            ..Default::default()
+        };
+        let frame = state_changed_notification(
+            &EngineState::default(),
+            7,
+            0.0,
+            ClockSource::Internal,
+            snap,
+        );
+        let payload = serde_json::to_value(&frame).unwrap();
+        assert!((payload["params"]["perf"]["cpu_percent"].as_f64().unwrap() - 42.5).abs() < 1e-3);
+        assert_eq!(
+            payload["params"]["perf"]["render_p99_us"].as_u64(),
+            Some(1_234)
+        );
+        assert_eq!(
+            payload["params"]["perf"]["underrun_count"].as_u64(),
+            Some(3)
+        );
     }
 
     #[test]

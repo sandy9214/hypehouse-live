@@ -247,6 +247,20 @@ async fn main() -> Result<()> {
     // BPM-lock badge. The MIDI clock-IN callback flips this byte on
     // 0xFA / 0xFC so the badge reacts to the master's transport.
     engine.attach_shared_clock(clock.shared.clone());
+    // Wire the audio-thread perf counters into the bridge so every
+    // outgoing `engine.state_changed` carries a fresh PerfSnapshot
+    // (CPU%, render p99, underrun + dropped-frame counts) for the UI
+    // perf dashboard. Refines the callback period from the device's
+    // real sample rate (the io.rs probe defaults to a 512-frame
+    // estimate at the seed-time sample rate; this set keeps the same
+    // 512-frame heuristic but pins it to whatever the device picked).
+    stream
+        .perf
+        .set_callback_period(hypehouse_engine::audio::PerfMetrics::callback_period_from(
+            512,
+            stream.sample_rate,
+        ));
+    engine.attach_perf_metrics(stream.perf.clone());
 
     // Control-thread loop runs on a dedicated OS thread so it doesn't
     // block the async runtime.

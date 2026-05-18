@@ -16,11 +16,13 @@ import { Deck } from "./Deck";
 import { Crossfader } from "./Crossfader";
 import { Library } from "./Library";
 import { MasterControls } from "./MasterControls";
+import { PerfDashboard } from "./PerfDashboard";
 import { PresetPanel } from "./PresetPanel";
 import { Sessions } from "./Sessions";
 import { JsonRpcWS } from "../ws/client";
 import { applyNotification, useEngineState } from "../store/engine";
 import { applyDecodeErrorNotification } from "../store/notifications";
+import { applyPerfNotification } from "../store/perf";
 
 /** Which secondary surface the user is looking at — live mixing
  * (default) or the read-only past-sessions History panel. Lives at
@@ -69,10 +71,12 @@ export const DeckRow = ({ client: external }: DeckRowProps = {}): JSX.Element =>
     const unsubscribeDecodeErrors = client.subscribe(
       applyDecodeErrorNotification,
     );
+    const unsubscribePerf = client.subscribe(applyPerfNotification);
     client.connect();
     return (): void => {
       unsubscribeState();
       unsubscribeDecodeErrors();
+      unsubscribePerf();
       // Only close the socket if we constructed it ourselves — when a
       // parent (App.tsx) injected the client the parent owns its
       // lifecycle.
@@ -131,6 +135,7 @@ export const DeckRow = ({ client: external }: DeckRowProps = {}): JSX.Element =>
         gainReductionDb={state.master_limiter_gain_reduction_db}
         clockSource={state.clock_source}
       />
+      <PerfDashboard />
       <PresetPanel
         client={client}
         decks={state.decks}

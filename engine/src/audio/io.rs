@@ -18,12 +18,13 @@
 
 use std::sync::atomic::AtomicI16;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
 
-use crate::audio::{AudioConsumer, AudioMixer, DecodeService, SharedClock};
+use crate::audio::{AudioConsumer, AudioMixer, DecodeService, PerfMetrics, SharedClock};
 use crate::recording::MasterRecorderSink;
 
 /// Extract the sample rate from a [`SupportedStreamConfig`] as `u32`.
@@ -59,6 +60,12 @@ pub struct AudioStreamHandle {
     /// `state_changed` notification to stamp the live GR onto the
     /// payload so the UI meter can render it without polling.
     pub master_limiter_gr: Arc<AtomicI16>,
+    /// Audio-thread performance counters (CPU%, render p99, underruns).
+    /// The audio callback writes into the shared atomics on every
+    /// render via [`PerfMetrics::record_render_ns`]; the bridge thread
+    /// snapshots them for every outgoing `engine.state_changed`. See
+    /// `audio::perf` for the contract.
+    pub perf: PerfMetrics,
 }
 
 /// Build + start the output stream. The producer side of the SPSC ring
@@ -98,18 +105,46 @@ pub fn spawn_audio_thread(
     // `engine.state_changed` notification (UI meter).
     let master_limiter_gr = mixer.master_limiter_gain_reduction_atomic();
 
+    // Live perf metrics — one set of atomics shared between the audio
+    // callback (writer) and the bridge thread (reader). The cpal config
+    // doesn't pin a buffer size on the default device probe; we seed
+    // the callback period with the engine-favoured 512-frame default
+    // and let `main()` refine it once the device's real buffer size is
+    // observed (when supported by the host).
+    let perf =
+        PerfMetrics::with_callback_period(PerfMetrics::callback_period_from(512, sample_rate));
+    let perf_for_cb = perf.clone();
+
     // Hand the consumer + mixer + clock to the callback. cpal callbacks
     // must be `Send + 'static`; we move owned values in.
     let stream = match sample_format {
-        SampleFormat::F32 => {
-            build_stream::<f32>(&device, &config, mixer, consumer, clock, channels)?
-        }
-        SampleFormat::I16 => {
-            build_stream::<i16>(&device, &config, mixer, consumer, clock, channels)?
-        }
-        SampleFormat::U16 => {
-            build_stream::<u16>(&device, &config, mixer, consumer, clock, channels)?
-        }
+        SampleFormat::F32 => build_stream::<f32>(
+            &device,
+            &config,
+            mixer,
+            consumer,
+            clock,
+            channels,
+            perf_for_cb,
+        )?,
+        SampleFormat::I16 => build_stream::<i16>(
+            &device,
+            &config,
+            mixer,
+            consumer,
+            clock,
+            channels,
+            perf_for_cb,
+        )?,
+        SampleFormat::U16 => build_stream::<u16>(
+            &device,
+            &config,
+            mixer,
+            consumer,
+            clock,
+            channels,
+            perf_for_cb,
+        )?,
         other => {
             return Err(anyhow!(
                 "unsupported sample format {other:?}; expected f32/i16/u16"
@@ -126,6 +161,7 @@ pub fn spawn_audio_thread(
         sample_rate,
         channels,
         master_limiter_gr,
+        perf,
     })
 }
 
@@ -136,6 +172,7 @@ fn build_stream<S>(
     mut consumer: AudioConsumer,
     clock: SharedClock,
     channels: u16,
+    perf: PerfMetrics,
 ) -> Result<Stream>
 where
     S: Sample + cpal::FromSample<f32> + cpal::SizedSample + Send + 'static,
@@ -146,7 +183,12 @@ where
     // touch inside the callback. If a host ever asks for more, we mix
     // in 4096-frame chunks within the callback below.
     const MAX_MONO_FRAMES: usize = 4096;
-    let err_fn = |e| {
+    // cpal's err_fn is invoked off the realtime path on stream errors
+    // (underruns, device removal). Each call counts as one audio-side
+    // underrun for the perf snapshot.
+    let perf_err = perf.clone();
+    let err_fn = move |e| {
+        perf_err.record_audio_underrun();
         // Logging from the audio thread is FORBIDDEN inside the
         // callback (ADR-004), but cpal's separate `err_fn` is invoked
         // off the realtime path on error, so it's safe.
@@ -159,6 +201,12 @@ where
         .build_output_stream::<S, _, _>(
             config,
             move |data: &mut [S], _info| {
+                // Start the render-time stopwatch. `Instant::now()` is
+                // a `clock_gettime(MONOTONIC)` on Unix + `QueryPerformance
+                // Counter` on Windows — both are vDSO / syscall-free,
+                // sub-100ns reads. Safe on the audio thread.
+                let render_start = Instant::now();
+
                 // Total interleaved samples; mono frames = total / channels.
                 let total_samples = data.len();
                 let total_mono_frames = total_samples / channels.max(1);
@@ -204,6 +252,14 @@ where
                     clock.advance(chunk as u32);
                     written_frames += chunk;
                 }
+
+                // End of render: record the wall-clock time the audio
+                // thread spent inside this callback. `as_nanos()`
+                // returns u128; clamp to u64 — a single render that ran
+                // for more than ~584 years would wrap, which is well
+                // outside the production budget.
+                let render_ns = render_start.elapsed().as_nanos() as u64;
+                perf.record_render_ns(render_ns);
             },
             err_fn,
             None,
