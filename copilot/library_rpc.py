@@ -141,6 +141,33 @@ def _coerce_str(value: object, *, field: str, allow_empty: bool = False) -> str:
     return value
 
 
+def _coerce_optional_float(value: object, *, field: str) -> float | None:
+    """Parse an optional numeric filter param.
+
+    ``None`` / missing -> ``None`` (no filter applied).
+    Numeric (int / float / numeric string) -> ``float``.
+    Anything else -> ``RpcError`` with ``-32602``.
+
+    ``bool`` is rejected explicitly because ``isinstance(True, int)``
+    is true in Python — without the check, ``"bpm_min": true`` would
+    silently become ``1.0`` BPM.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise RpcError(JSONRPC_INVALID_PARAMS, f"{field} must be a number")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError as exc:
+            raise RpcError(
+                JSONRPC_INVALID_PARAMS, f"{field} must be a number"
+            ) from exc
+    raise RpcError(JSONRPC_INVALID_PARAMS, f"{field} must be a number")
+
+
 class LibraryRpcHandler:
     """Dispatch ``library.*`` JSON-RPC methods against a :class:`TrackLibrary`.
 
@@ -254,7 +281,34 @@ class LibraryRpcHandler:
             params.get("query"), field="query", allow_empty=True
         )
         limit = _coerce_int(params.get("limit"), field="limit", default=100)
-        tracks = self._library.search_tracks(query, limit=limit)
+        # Smart-filter params (optional, layered onto the search). See
+        # ``TrackLibrary.search_tracks`` for the composition rules — UI
+        # uses these for chip-based filters (BPM range slider +
+        # "compatible with" track picker).
+        bpm_min = _coerce_optional_float(
+            params.get("bpm_min"), field="bpm_min"
+        )
+        bpm_max = _coerce_optional_float(
+            params.get("bpm_max"), field="bpm_max"
+        )
+        compat_raw = params.get("compatible_with_track_id")
+        compatible_with_track_id: str | None
+        if compat_raw is None:
+            compatible_with_track_id = None
+        else:
+            # Non-empty string required when present (a None / missing
+            # field skips the filter entirely; passing "" explicitly
+            # is a usage error).
+            compatible_with_track_id = _coerce_str(
+                compat_raw, field="compatible_with_track_id"
+            )
+        tracks = self._library.search_tracks(
+            query,
+            limit=limit,
+            bpm_min=bpm_min,
+            bpm_max=bpm_max,
+            compatible_with_track_id=compatible_with_track_id,
+        )
         return {
             "tracks": [track_ref_to_wire(t) for t in tracks],
             "query": query,

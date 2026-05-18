@@ -243,22 +243,106 @@ export const fetchLibrary = async (
 };
 
 /**
+ * Smart-filter state surfaced by the LibraryFilters component.
+ *
+ * `bpmMin` / `bpmMax`: numeric BPM range chip (dual-slider). Either
+ *    bound `null` = open on that side. Both `null` = no BPM filter.
+ * `compatibleWithTrackId`: track id selected from the "compatible
+ *    with..." picker. `null` = no harmonic filter. The copilot
+ *    resolves this to a Camelot key and post-filters candidates by
+ *    `camelot_distance ≤ 2` (= mashup-friendly envelope).
+ */
+export interface LibraryFilters {
+  readonly bpmMin: number | null;
+  readonly bpmMax: number | null;
+  readonly compatibleWithTrackId: string | null;
+}
+
+export const EMPTY_FILTERS: LibraryFilters = {
+  bpmMin: null,
+  bpmMax: null,
+  compatibleWithTrackId: null,
+};
+
+/** Quick predicate: are any filters actively narrowing the result? */
+export const hasActiveFilters = (f: LibraryFilters): boolean =>
+  f.bpmMin !== null || f.bpmMax !== null || f.compatibleWithTrackId !== null;
+
+// --- filter state (module-singleton, mirrors the tracks cache) ----
+// Active filters live in a separate slice from `current` so a search
+// debounce + filter chip toggle don't race over the same subscription.
+
+let currentFilters: LibraryFilters = EMPTY_FILTERS;
+const filterListeners = new Set<Listener>();
+
+const notifyFilters = (): void => {
+  for (const l of filterListeners) l();
+};
+
+const subscribeFilters = (l: Listener): (() => void) => {
+  filterListeners.add(l);
+  return (): void => {
+    filterListeners.delete(l);
+  };
+};
+
+const getFilterSnapshot = (): LibraryFilters => currentFilters;
+
+/** Test/internal hook — reset filter slice to its empty state. */
+export const __resetLibraryFilters = (): void => {
+  currentFilters = EMPTY_FILTERS;
+  notifyFilters();
+};
+
+/**
+ * Replace the active filters. Callers (LibraryFilters component, chip
+ * X-buttons) build the next shape and dispatch the whole object in
+ * one go — no per-field setters keeps the surface small and the
+ * "navigate away, come back" path obvious (the slice survives unmount
+ * because it's module-level, like the tracks cache).
+ */
+export const setLibraryFilters = (next: LibraryFilters): void => {
+  currentFilters = next;
+  notifyFilters();
+};
+
+/**
+ * React hook returning the active filter snapshot. Components mount
+ * this once and re-render whenever any chip toggles.
+ */
+export const useLibraryFilters = (): LibraryFilters =>
+  useSyncExternalStore(subscribeFilters, getFilterSnapshot, getFilterSnapshot);
+
+/**
  * Run `library.search_tracks` against a query string and return the
  * matching rows. Does **not** mutate the cached "all tracks" snapshot
  * — search results are presentational. The Library component owns the
  * "what to display" decision.
+ *
+ * `opts.filters` forwards the smart-filter chip state into the RPC
+ * params (`bpm_min` / `bpm_max` / `compatible_with_track_id`). Null
+ * filter values are omitted from the payload so an unset chip stays
+ * an absent field on the wire — keeps the copilot's optional-param
+ * branch trivial.
  */
 export const searchLibrary = async (
   client: JsonRpcWS,
   query: string,
-  opts: { limit?: number } = {},
+  opts: { limit?: number; filters?: LibraryFilters } = {},
 ): Promise<ReadonlyArray<LibraryTrack>> => {
   const limit = opts.limit ?? 100;
+  const filters = opts.filters ?? EMPTY_FILTERS;
+  const params: Record<string, unknown> = { query, limit };
+  if (filters.bpmMin !== null) params.bpm_min = filters.bpmMin;
+  if (filters.bpmMax !== null) params.bpm_max = filters.bpmMax;
+  if (filters.compatibleWithTrackId !== null) {
+    params.compatible_with_track_id = filters.compatibleWithTrackId;
+  }
   try {
-    const result = await client.call<unknown>("library.search_tracks", {
-      query,
-      limit,
-    });
+    const result = await client.call<unknown>(
+      "library.search_tracks",
+      params,
+    );
     if (isSearchResult(result)) return result.tracks.map(hydrateTrack);
     return [];
   } catch {

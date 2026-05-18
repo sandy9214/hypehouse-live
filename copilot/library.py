@@ -630,6 +630,9 @@ class TrackLibrary:
         query: str,
         *,
         limit: int = 100,
+        bpm_min: float | None = None,
+        bpm_max: float | None = None,
+        compatible_with_track_id: str | None = None,
     ) -> list[TrackRef]:
         """Substring + key + BPM-range search over the catalog.
 
@@ -645,10 +648,30 @@ class TrackLibrary:
 
         Multiple tokens AND together. Empty query returns the first
         ``limit`` rows of the library (same as ``list_tracks``).
+
+        Structured filter args (the smart-filters UI surface — these
+        compose with the inline shorthand above so a chip + a typed
+        ``bpm:`` token AND together rather than fighting):
+
+        * ``bpm_min`` / ``bpm_max`` — inclusive BPM range, applied as
+          an extra ``WHERE bpm BETWEEN`` clause. Either bound can be
+          ``None`` to leave that side open.
+        * ``compatible_with_track_id`` — load the reference track's
+          Camelot key, then post-filter candidates by
+          ``camelot_distance ≤ 2`` against it. Distance threshold of
+          ``2`` matches :data:`_MAX_KEY_DISTANCE` — same / adjacent /
+          relative / fifth-circle — exactly the harmonic envelope the
+          mashup ranker already considers compatible. Tracks with an
+          unknown / malformed key (returns 99 from
+          :func:`camelot_distance`) are filtered out automatically.
+          Reference track itself is excluded from results so a user
+          looking for "what mixes into this" doesn't see it back.
+          If the reference id doesn't exist in the catalog, the
+          filter degrades to a no-op (empty key match means no rows
+          pass the post-filter) — caller responsibility to validate
+          the id; we don't raise.
         """
         tokens = (query or "").strip().split()
-        if not tokens:
-            return self.list_tracks(limit=limit, offset=0)
 
         clauses: list[str] = []
         params: list[object] = []
@@ -679,15 +702,72 @@ class TrackLibrary:
                 like = f"%{tok_lc}%"
                 params.extend([like, like])
 
-        where = " AND ".join(clauses)
-        sql = (
-            "SELECT * FROM tracks "
-            f"WHERE {where} "
-            "ORDER BY track_id LIMIT ?"
+        # Structured BPM range from the chip UI. Composes with any
+        # inline ``bpm:`` token via an additional AND clause — the
+        # narrowest of the two wins, which matches user expectation
+        # ("chip says 120-130, typed bpm:124-126" -> 124-126).
+        if bpm_min is not None:
+            clauses.append("bpm >= ?")
+            params.append(float(bpm_min))
+        if bpm_max is not None:
+            clauses.append("bpm <= ?")
+            params.append(float(bpm_max))
+
+        clamped_limit = max(1, min(int(limit), 1000))
+
+        # Empty query AND no structured filters AND no harmonic
+        # filter -> degrade to the same fast path as ``list_tracks``
+        # so we don't pay for a degenerate SELECT * WHERE TRUE.
+        if not clauses and compatible_with_track_id is None:
+            return self.list_tracks(limit=clamped_limit, offset=0)
+
+        if clauses:
+            where = " AND ".join(clauses)
+            sql = (
+                "SELECT * FROM tracks "
+                f"WHERE {where} "
+                "ORDER BY track_id LIMIT ?"
+            )
+        else:
+            # ``compatible_with`` is the only filter — we still need
+            # to scan the catalog to evaluate camelot_distance in
+            # Python. Cap the pre-filter at the larger of `limit` and
+            # a conservative 1000 so post-filter still has room to
+            # find compatible tracks even when the limit is small.
+            sql = (
+                "SELECT * FROM tracks "
+                "ORDER BY track_id LIMIT ?"
+            )
+        # We over-fetch when a Python-side compat filter will trim
+        # rows after the fact — otherwise the SQL LIMIT would silently
+        # eat compatible candidates. 1000 matches the upstream clamp
+        # in ``list_tracks`` so a "show me all compatible tracks"
+        # filter sweeps a reasonable corpus without unbounded scans.
+        sql_limit = (
+            max(clamped_limit, 1000)
+            if compatible_with_track_id is not None
+            else clamped_limit
         )
-        params.append(max(1, min(int(limit), 1000)))
+        params.append(sql_limit)
         rows = self._conn.execute(sql, params).fetchall()
-        return [self._row_to_ref(r) for r in rows]
+        results = [self._row_to_ref(r) for r in rows]
+
+        if compatible_with_track_id is not None:
+            ref = self.get(compatible_with_track_id)
+            ref_key = ref.camelot_key if ref is not None else ""
+            # Empty reference key (or unknown id) -> no candidate
+            # passes the distance threshold (camelot_distance returns
+            # 99 for "" vs anything), which is the same shape as a
+            # truly empty match. UI surfaces "no matches".
+            results = [
+                t
+                for t in results
+                if t.track_id != compatible_with_track_id
+                and camelot_distance(ref_key, t.camelot_key) <= _MAX_KEY_DISTANCE
+            ]
+            results = results[:clamped_limit]
+
+        return results
 
     def add_tracks_from_directory(
         self,

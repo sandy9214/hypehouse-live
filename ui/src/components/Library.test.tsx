@@ -13,7 +13,11 @@ import {
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { Library } from "./Library";
 import type { JsonRpcWS } from "../ws/client";
-import { __resetLibraryStore, type LibraryTrack } from "../store/library";
+import {
+  __resetLibraryFilters,
+  __resetLibraryStore,
+  type LibraryTrack,
+} from "../store/library";
 
 const makeTrack = (id: string, extra: Partial<LibraryTrack> = {}): LibraryTrack => ({
   id,
@@ -47,10 +51,12 @@ const makeClient = (responses: Record<string, unknown>): {
 describe("Library", () => {
   beforeEach((): void => {
     __resetLibraryStore();
+    __resetLibraryFilters();
   });
   afterEach((): void => {
     cleanup();
     __resetLibraryStore();
+    __resetLibraryFilters();
     vi.useRealTimers();
   });
 

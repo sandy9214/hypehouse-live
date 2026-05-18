@@ -14,10 +14,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, JSX } from "react";
 import type { JsonRpcWS } from "../ws/client";
 import {
+  hasActiveFilters,
   searchLibrary,
   useLibrary,
+  useLibraryFilters,
   type LibraryTrack,
 } from "../store/library";
+import { LibraryFilters } from "./LibraryFilters";
 import { TrackRow } from "./TrackRow";
 
 export interface LibraryProps {
@@ -108,20 +111,27 @@ export const Library = ({
   searchDebounceMs = 250,
 }: LibraryProps): JSX.Element => {
   const lib = useLibrary(client);
+  const filters = useLibraryFilters();
   const [query, setQuery] = useState<string>("");
   const [searchResults, setSearchResults] = useState<
     ReadonlyArray<LibraryTrack> | null
   >(null);
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Re-search whenever EITHER the typed query or the active filter
+  // state changes. We treat any active filter as a search trigger so
+  // an empty-string query + "BPM 124-130" still narrows the list
+  // (would otherwise fall back to the full cache).
   useEffect((): (() => void) => {
     if (debounceTimer.current !== null) {
       clearTimeout(debounceTimer.current);
       debounceTimer.current = null;
     }
     const trimmed = query.trim();
-    if (!trimmed) {
-      // Empty query — clear overlay so the full library shows again.
+    const filtersActive = hasActiveFilters(filters);
+    if (!trimmed && !filtersActive) {
+      // Empty query AND no chip filters — clear overlay so the full
+      // library cache shows again.
       setSearchResults(null);
       return (): void => {
         if (debounceTimer.current !== null) {
@@ -131,7 +141,7 @@ export const Library = ({
       };
     }
     debounceTimer.current = setTimeout((): void => {
-      void searchLibrary(client, trimmed).then(
+      void searchLibrary(client, trimmed, { filters }).then(
         (rows: ReadonlyArray<LibraryTrack>): void => {
           setSearchResults(rows);
         },
@@ -143,7 +153,7 @@ export const Library = ({
         debounceTimer.current = null;
       }
     };
-  }, [query, client, searchDebounceMs]);
+  }, [query, client, searchDebounceMs, filters]);
 
   // What to actually render: search overlay if active, else the cache.
   const visible = useMemo<ReadonlyArray<LibraryTrack>>(
@@ -151,8 +161,12 @@ export const Library = ({
     [searchResults, lib.tracks],
   );
 
+  const filtersActive = hasActiveFilters(filters);
   const showEmptyState =
-    lib.loaded && lib.tracks.length === 0 && query.trim() === "";
+    lib.loaded &&
+    lib.tracks.length === 0 &&
+    query.trim() === "" &&
+    !filtersActive;
   const showNoMatches =
     lib.loaded && lib.tracks.length > 0 && visible.length === 0;
 
@@ -186,6 +200,8 @@ export const Library = ({
           library: {lib.error}
         </div>
       )}
+
+      <LibraryFilters client={client} />
 
       <div style={columnsRowStyle}>
         <span>Title</span>
