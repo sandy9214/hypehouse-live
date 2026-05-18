@@ -16,6 +16,7 @@
 //! * No blocking — no I/O, no `println!`, no panic-on-error logging
 //!   (errors are silently coalesced).
 
+use std::sync::atomic::AtomicI16;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -53,6 +54,11 @@ pub struct AudioStreamHandle {
     _stream: Stream,
     pub sample_rate: u32,
     pub channels: u16,
+    /// Cloneable handle on the master-bus limiter's gain-reduction
+    /// readout. The bridge thread reads this once per
+    /// `state_changed` notification to stamp the live GR onto the
+    /// payload so the UI meter can render it without polling.
+    pub master_limiter_gr: Arc<AtomicI16>,
 }
 
 /// Build + start the output stream. The producer side of the SPSC ring
@@ -86,6 +92,11 @@ pub fn spawn_audio_thread(
     if let Some(sink) = recorder_sink {
         mixer.attach_recorder(sink);
     }
+    // Grab the limiter's gain-reduction handle BEFORE the mixer is moved
+    // into the cpal callback closure. The bridge thread reads this to
+    // populate the `master_limiter_gain_reduction_db` field of every
+    // `engine.state_changed` notification (UI meter).
+    let master_limiter_gr = mixer.master_limiter_gain_reduction_atomic();
 
     // Hand the consumer + mixer + clock to the callback. cpal callbacks
     // must be `Send + 'static`; we move owned values in.
@@ -114,6 +125,7 @@ pub fn spawn_audio_thread(
         _stream: stream,
         sample_rate,
         channels,
+        master_limiter_gr,
     })
 }
 

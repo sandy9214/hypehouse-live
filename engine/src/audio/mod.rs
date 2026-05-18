@@ -45,8 +45,9 @@ pub use effects::{
     EFFECT_REVERB, MAX_PARAMS as EFFECT_MAX_PARAMS,
 };
 pub use limiter::{
-    clamp_threshold_db as clamp_master_limiter_threshold_db, MasterLimiter,
-    DEFAULT_THRESHOLD_DB as MASTER_LIMITER_DEFAULT_THRESHOLD_DB,
+    clamp_threshold_db as clamp_master_limiter_threshold_db, decode_gain_reduction_db,
+    MasterLimiter, DEFAULT_THRESHOLD_DB as MASTER_LIMITER_DEFAULT_THRESHOLD_DB,
+    GAIN_REDUCTION_SCALE as MASTER_LIMITER_GAIN_REDUCTION_SCALE,
     MAX_THRESHOLD_DB as MASTER_LIMITER_MAX_THRESHOLD_DB,
     MIN_THRESHOLD_DB as MASTER_LIMITER_MIN_THRESHOLD_DB,
 };

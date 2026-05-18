@@ -72,6 +72,9 @@
 //! * No `unsafe`. The tanh, ln, and exp calls go through Rust's `f32`
 //!   intrinsics which are pure.
 
+use std::sync::atomic::{AtomicI16, Ordering};
+use std::sync::Arc;
+
 /// Default threshold in dB. `-0.5 dB` linear ≈ `0.94406`.
 pub const DEFAULT_THRESHOLD_DB: f32 = -0.5;
 
@@ -93,13 +96,29 @@ pub const MAX_THRESHOLD_DB: f32 = 0.0;
 /// pick anyway), so we just early-exit the heavy math.
 const ENV_FLOOR: f32 = 1.0e-9;
 
+/// Fixed-point scale for the shared gain-reduction atomic. We store the
+/// worst-case block gain reduction as `i16` = `round(dB * 10)`, i.e.
+/// `-50 ≡ -5.0 dB`. Keeping the value `i16` lets the meter publisher
+/// read it with a single relaxed `load()` — fine for a UI-rate poll —
+/// while avoiding the `AtomicF32` portability hassle. 1/10 dB step is
+/// well under the human ear's ~1 dB JND so the lossy round-trip is
+/// inaudible.
+pub const GAIN_REDUCTION_SCALE: f32 = 10.0;
+
 /// Master-bus soft-clip limiter.
 ///
-/// Internal state is `Copy`-shaped + audio-thread safe — `process` takes
-/// `&mut self` so the envelope follower can carry over between
-/// callbacks. Construct once at audio-thread start; bypass via
+/// `process` takes `&mut self` so the envelope follower can carry over
+/// between callbacks. Construct once at audio-thread start; bypass via
 /// [`MasterLimiter::set_enabled`] when you want to skip processing.
-#[derive(Clone, Copy, Debug)]
+///
+/// The limiter owns a small `Arc<AtomicI16>` so the **control thread**
+/// (bridge / UI publisher) can read the current gain reduction in dB
+/// without locking. The audio thread writes it once per `process` call
+/// with a relaxed store; readers see eventually-consistent values which
+/// is exactly what a UI meter wants. ADR-004 compliant: the atomic is
+/// constructed up-front in [`MasterLimiter::new`] (one heap alloc,
+/// off-audio) and only `store()` is touched on the hot path.
+#[derive(Debug)]
 pub struct MasterLimiter {
     /// Linear threshold (≤ 1.0). Updated whenever `threshold_db` is
     /// changed; cached so the hot path doesn't recompute `10^(db/20)`.
@@ -123,6 +142,13 @@ pub struct MasterLimiter {
     envelope: f32,
     /// Bypass switch. When false, `process` returns immediately.
     enabled: bool,
+    /// Shared gain-reduction readout (dB × `GAIN_REDUCTION_SCALE`). The
+    /// audio thread writes the worst-case block GR here at the end of
+    /// each `process` call; the control thread reads it for the
+    /// UI meter via [`MasterLimiter::current_gain_reduction_db`] (or by
+    /// cloning the `Arc` via [`MasterLimiter::shared_gain_reduction`]).
+    /// Value is `≤ 0` — `-50` ≡ `-5.0 dB`.
+    gr_atomic: Arc<AtomicI16>,
 }
 
 impl MasterLimiter {
@@ -138,9 +164,26 @@ impl MasterLimiter {
             release_ms: DEFAULT_RELEASE_MS,
             envelope: 0.0,
             enabled: true,
+            gr_atomic: Arc::new(AtomicI16::new(0)),
         };
         m.recompute_coeffs(sample_rate);
         m
+    }
+
+    /// Cheap clone of the shared gain-reduction handle for the bridge /
+    /// state publisher. Constructed once at audio-thread start so the
+    /// audio thread itself never has to touch [`Arc::clone`]. UI thread
+    /// reads via `load(Ordering::Relaxed)` — the meter is best-effort.
+    pub fn shared_gain_reduction(&self) -> Arc<AtomicI16> {
+        Arc::clone(&self.gr_atomic)
+    }
+
+    /// Current gain reduction in dB, decoded from the shared atomic.
+    /// Always `≤ 0.0`. Returns `0.0` when the limiter isn't reducing
+    /// (envelope below threshold) or when it's bypassed.
+    #[inline]
+    pub fn current_gain_reduction_db(&self) -> f32 {
+        decode_gain_reduction_db(self.gr_atomic.load(Ordering::Relaxed))
     }
 
     /// Enable / disable bypass. When disabling, the envelope is
@@ -181,12 +224,21 @@ impl MasterLimiter {
     ///
     /// `buf` is a slice of mono master samples (one f32 per frame). The
     /// limiter applies envelope-follower gain reduction + a tanh
-    /// soft-clip and re-writes `buf` in place.
+    /// soft-clip and re-writes `buf` in place. At the end of the block
+    /// it also stores the worst-case (i.e. most negative) gain
+    /// reduction observed during the block into the shared atomic so
+    /// the UI meter can render it without any locks. The single
+    /// `store(Relaxed)` is the only side-channel touch — no allocation.
     ///
-    /// When `enabled == false` this returns immediately — zero CPU.
+    /// When `enabled == false` this returns immediately and resets the
+    /// gain-reduction readout to `0` so the meter doesn't latch a
+    /// stale reduction while the user has the limiter bypassed.
     #[inline]
     pub fn process(&mut self, buf: &mut [f32], sample_rate: u32) {
         if !self.enabled {
+            // Clear the meter on bypass — otherwise it would freeze on
+            // the last hot value the user saw before they hit toggle.
+            self.gr_atomic.store(0, Ordering::Relaxed);
             return;
         }
         if sample_rate != self.cached_sample_rate {
@@ -202,6 +254,13 @@ impl MasterLimiter {
         // under degenerate config (threshold ≈ 0).
         let c = thr.max(ENV_FLOOR);
 
+        // Track the minimum (= most attenuating) instantaneous gain
+        // across the block; we publish the corresponding GR in dB at
+        // the end so the UI meter can render the worst-case reduction
+        // for this render chunk. Start at 1.0 (= no reduction) so
+        // below-threshold blocks publish 0 dB.
+        let mut min_gain = 1.0_f32;
+
         for s in buf.iter_mut() {
             // Envelope follower — peak absolute, asymmetric one-pole.
             let abs = s.abs();
@@ -211,6 +270,9 @@ impl MasterLimiter {
 
             // Gain reduction (only when envelope > threshold).
             let gain = if env > c { thr / env } else { 1.0 };
+            if gain < min_gain {
+                min_gain = gain;
+            }
             let scaled = *s * gain;
 
             // Soft-clip via hyperbolic saturation.
@@ -226,6 +288,16 @@ impl MasterLimiter {
         }
 
         self.envelope = env;
+
+        // Publish the worst-case GR for this block. `min_gain` is in
+        // `(0, 1]`; convert to dB with a `max(ENV_FLOOR)` guard so the
+        // `ln` can't blow up under degenerate (== 0) gain. Values are
+        // clamped to the i16 range; an inaudible cap, well below the
+        // limiter's practical floor.
+        let gain_db = 20.0 * min_gain.max(ENV_FLOOR).log10();
+        let encoded = (gain_db * GAIN_REDUCTION_SCALE).round();
+        let stored = encoded.clamp(i16::MIN as f32, 0.0_f32) as i16;
+        self.gr_atomic.store(stored, Ordering::Relaxed);
     }
 
     /// Re-derive the attack/release one-pole coefficients for a new
@@ -252,6 +324,13 @@ impl MasterLimiter {
 #[inline]
 fn db_to_linear(db: f32) -> f32 {
     (db * (std::f32::consts::LN_10 / 20.0)).exp()
+}
+
+/// Decode the fixed-point i16 atomic value back to a dB float.
+/// Encodes `value × GAIN_REDUCTION_SCALE` per the storage convention.
+#[inline]
+pub fn decode_gain_reduction_db(stored: i16) -> f32 {
+    (stored as f32) / GAIN_REDUCTION_SCALE
 }
 
 /// Clamp a threshold dB value to the supported range. Used both in the
@@ -435,6 +514,62 @@ mod tests {
         assert!(
             (lim.envelope() - env_before).abs() < f32::EPSILON,
             "disabled process() must not mutate envelope state",
+        );
+    }
+
+    /// Gain-reduction readout: with a hot signal the worst-case GR
+    /// during a block should land in dB-negative territory and be
+    /// readable via the shared atomic by an off-thread observer.
+    #[test]
+    fn limiter_publishes_gain_reduction_when_hot() {
+        let mut lim = MasterLimiter::new(SR);
+        let shared = lim.shared_gain_reduction();
+        let mut buf = vec![1.5_f32; 2048];
+        lim.process(&mut buf, SR);
+        let gr = lim.current_gain_reduction_db();
+        assert!(
+            gr < -0.5,
+            "expected hot signal to produce GR < -0.5 dB, got {gr}",
+        );
+        // Shared handle observes the same value.
+        let via_shared = decode_gain_reduction_db(shared.load(Ordering::Relaxed));
+        assert!(
+            (via_shared - gr).abs() < 0.11,
+            "shared = {via_shared}, gr = {gr}"
+        );
+    }
+
+    /// Quiet (below-threshold) signal must publish 0 dB GR — meter
+    /// stays dark when nothing is being attenuated.
+    #[test]
+    fn limiter_publishes_zero_gain_reduction_when_quiet() {
+        let mut lim = MasterLimiter::new(SR);
+        let mut buf = vec![0.1_f32; 1024];
+        lim.process(&mut buf, SR);
+        let gr = lim.current_gain_reduction_db();
+        assert!(
+            gr.abs() < 0.05,
+            "expected ~0 dB GR on quiet signal, got {gr}"
+        );
+    }
+
+    /// Bypass resets the meter — otherwise toggling the limiter off
+    /// during a hot section would leave the UI showing a stale value.
+    #[test]
+    fn limiter_disabled_clears_gain_reduction_meter() {
+        let mut lim = MasterLimiter::new(SR);
+        // Drive it hot so a non-zero GR is published.
+        let mut hot = vec![1.5_f32; 1024];
+        lim.process(&mut hot, SR);
+        assert!(lim.current_gain_reduction_db() < -0.1);
+        // Now bypass and run another block — meter should clear.
+        lim.set_enabled(false);
+        let mut buf = [0.0_f32; 256];
+        lim.process(&mut buf, SR);
+        assert!(
+            lim.current_gain_reduction_db().abs() < 1e-6,
+            "disabled limiter must publish 0 dB GR, got {}",
+            lim.current_gain_reduction_db(),
         );
     }
 

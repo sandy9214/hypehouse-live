@@ -181,6 +181,10 @@ async fn main() -> Result<()> {
     // both the bridge handle (and its clones) and the local `event_tx`
     // are dropped during shutdown.
     let engine = EngineHandle::with_event_sink(event_tx.clone());
+    // Wire the audio thread's master-bus limiter gain-reduction readout
+    // into the bridge so every outgoing `engine.state_changed`
+    // notification carries the live GR value for the UI meter.
+    engine.attach_master_limiter_gr(stream.master_limiter_gr.clone());
     let config = bridge::BridgeConfig::from_env();
     let server = bridge::spawn(config, engine).await?;
     info!(addr = %server.local_addr, "ws bridge ready");
