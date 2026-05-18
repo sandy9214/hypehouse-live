@@ -37,6 +37,7 @@
 
 pub mod auth;
 pub mod error;
+pub mod library_proxy;
 pub mod rpc;
 pub mod ws_server;
 
@@ -46,8 +47,9 @@ pub use error::{
     INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
 };
 pub use rpc::{
-    audio_alert_notification, dispatch, dispatch_auth_hello, dispatch_with_auth, method,
-    state_changed_notification, AuthState, BridgeMetrics, BridgeNotice, EngineHandle, RpcId,
-    RpcNotification, RpcRequest, RpcResponse, JSONRPC_VERSION,
+    audio_alert_notification, dispatch, dispatch_auth_hello, dispatch_with_auth,
+    dispatch_with_auth_async, method, state_changed_notification, AuthState, BridgeMetrics,
+    BridgeNotice, EngineHandle, RpcId, RpcNotification, RpcRequest, RpcResponse, JSONRPC_VERSION,
+    LIBRARY_PREFIX,
 };
 pub use ws_server::{spawn, BridgeConfig, BridgeServer, DEFAULT_PORT};

@@ -514,6 +514,35 @@ state was at the last event", not "where the audio is now". The
 master mix audio (`master.wav`) is not replayed through this RPC; the
 UI can offer the file path for direct playback.
 
+## `library.*` namespace — engine-bridge proxy to copilot
+
+All `library.*` JSON-RPC methods (`list_tracks`, `add_track`,
+`search_tracks`, `add_track_from_directory`, `set_hot_cues`,
+`get_waveform`) are received by the **engine bridge** on
+`ws://127.0.0.1:8765` and forwarded over HTTP to the copilot service.
+The UI therefore holds only **one** WebSocket — the engine — and never
+opens a direct connection to the copilot.
+
+Transport details:
+
+* **Default copilot endpoint** — `http://127.0.0.1:8766/rpc`.
+* **Override** — `HYPEHOUSE_COPILOT_URL` environment variable on the
+  engine process. Set to the empty string to hard-disable the proxy
+  (every `library.*` call then returns `-32000` with
+  `data: "copilot proxy disabled"`).
+* **Timeout** — 5 seconds per call. A hung copilot surfaces as
+  `-32000 engine offline` with `data` carrying a `(timeout)` marker.
+* **Auth** — the engine's WS auth gate (`auth.hello` for browser
+  clients) is enforced **before** any library proxy hop, so an
+  unauthenticated UI cannot trigger outbound HTTP traffic.
+* **Error mapping** — JSON-RPC errors returned by the copilot are
+  passed through verbatim (the original `code` / `message` / `data`).
+  Network-layer failures collapse to `-32000 engine offline`.
+
+The copilot's `LibraryRpcHandler` keeps its own native dispatch surface
+(see `copilot/library_rpc.py`) for direct integrations — the proxy is
+an additional entry point, not a replacement.
+
 ### `library.list_tracks` (co-pilot)
 
 Paginated dump of the co-pilot's SQLite track catalog. Exposed by

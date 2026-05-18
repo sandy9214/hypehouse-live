@@ -54,7 +54,7 @@ use tracing::{debug, info, warn};
 use super::auth::AuthConfig;
 use super::error::RpcError;
 use super::rpc::{
-    audio_alert_notification, dispatch_with_auth, state_changed_notification, AuthState,
+    audio_alert_notification, dispatch_with_auth_async, state_changed_notification, AuthState,
     BridgeNotice, EngineHandle, RpcRequest, RpcResponse,
 };
 
@@ -374,7 +374,7 @@ async fn handle_client(
         match msg {
             Message::Text(text) => {
                 let (resp, new_state) =
-                    handle_request_frame(&engine, &auth, auth_state, text.as_ref());
+                    handle_request_frame(&engine, &auth, auth_state, text.as_ref()).await;
                 auth_state = new_state;
                 let frame = serde_json::to_string(&resp).unwrap_or_else(|e| {
                     // Encoding our own response shouldn't fail; fall back
@@ -444,7 +444,7 @@ impl Drop for ConnGuard {
 /// every other method is a no-op on it. Parse + invalid-request errors
 /// surface as JSON-RPC errors rather than as transport-level failures
 /// (and never promote auth).
-fn handle_request_frame(
+async fn handle_request_frame(
     engine: &EngineHandle,
     auth: &AuthConfig,
     state: AuthState,
@@ -474,7 +474,7 @@ fn handle_request_frame(
             );
         }
     };
-    dispatch_with_auth(engine, auth, state, req)
+    dispatch_with_auth_async(engine, auth, state, req).await
 }
 
 #[cfg(test)]

@@ -36,6 +36,11 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.27"
 futures-util = "0.3"
 
+# HTTP client — used by the bridge to proxy `library.*` JSON-RPC calls
+# to the copilot service's HTTP endpoint. `rustls-tls` avoids a native
+# OpenSSL dependency on the build/CI matrix.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
 # Ring buffer for the event log + lock-free SPSC queue for the audio thread.
 ringbuf = "0.4"
 crossbeam = "0.8"
@@ -58,6 +63,10 @@ proptest = "1"
 # Asserts no heap allocation happens within a gated scope — used to prove
 # the audio-thread hot path is alloc-free per ADR-004.
 assert_no_alloc = "1"
+# Tiny mock HTTP server for the library-proxy tests — lets us stand up
+# the copilot HTTP RPC endpoint in-process without depending on the
+# real copilot service.
+wiremock = "0.6"
 
 [[bench]]
 name = "translator"
