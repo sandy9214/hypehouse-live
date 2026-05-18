@@ -793,8 +793,11 @@ mod tests {
                 worst = dt;
             }
         }
+        // Debug 15ms is generous for shared CI runners (macOS in particular
+        // spikes well past 3ms under build contention). Release stays tight
+        // at 500µs — that's the production budget on a quiet box.
         let budget = if cfg!(debug_assertions) {
-            std::time::Duration::from_millis(3)
+            std::time::Duration::from_millis(15)
         } else {
             std::time::Duration::from_micros(500)
         };
