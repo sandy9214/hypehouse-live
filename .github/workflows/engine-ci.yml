@@ -1,0 +1,76 @@
+name: engine-ci
+
+# Rust audio engine — sub-5ms latency, no_alloc audio thread.
+# Matrix across the 3 supported desktop hosts. Runs only when engine/ changes.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'engine/**'
+      - '.github/workflows/engine-ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'engine/**'
+      - '.github/workflows/engine-ci.yml'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+  # rust-version in engine/Cargo.toml = 1.83
+  RUST_TOOLCHAIN: "1.83"
+
+jobs:
+  check:
+    name: ${{ matrix.os }} / rust ${{ matrix.rust }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: ["1.83"]
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+
+      - name: Install Linux audio/MIDI dev libs
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+          key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('engine/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.rust }}-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-targets
+
+      - name: cargo build --release (ubuntu only — release-binary smoke)
+        if: runner.os == 'Linux'
+        run: cargo build --release

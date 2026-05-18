@@ -1,0 +1,50 @@
+name: "Post-mortem"
+description: Write up an incident — what happened, why, and what we learned
+labels: ["type:post-mortem"]
+body:
+  - type: input
+    id: date
+    attributes:
+      label: Incident date
+      placeholder: "2026-05-17"
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: What was lost? Live-set time, audience, data, audio quality, reputation?
+    validations:
+      required: true
+  - type: textarea
+    id: timeline
+    attributes:
+      label: Timeline
+      placeholder: |
+        - 21:00 ET: ...
+        - 21:30 ET: ...
+    validations:
+      required: true
+  - type: textarea
+    id: root-cause
+    attributes:
+      label: Root cause
+    validations:
+      required: true
+  - type: textarea
+    id: action-items
+    attributes:
+      label: Action items
+      description: Concrete follow-ups. Each one should become its own issue.
+      placeholder: |
+        - [ ] Add test that catches X
+        - [ ] Tighten validation in Y (file new issue)
+        - [ ] Update ADR-N
+    validations:
+      required: true
+  - type: textarea
+    id: lessons
+    attributes:
+      label: Lessons (saved to memory)
+    validations:
+      required: true

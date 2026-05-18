@@ -1,0 +1,44 @@
+name: codeql
+
+# CodeQL security scan for JavaScript/TypeScript (ui/) and Python (copilot/).
+# Rust support is in CodeQL preview as of 2026-05; revisit when GA.
+# TODO: enable when CodeQL Rust is GA — add `rust` to the language matrix.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly Monday 09:00 ET catch-up against newly-discovered CVEs.
+    - cron: '0 13 * * 1'
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript, python]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
