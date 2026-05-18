@@ -82,5 +82,18 @@ Landed in PR `engine-event-log-persistence`. The append-only log is now durable:
 - **Buffering**: `BufWriter` flushes every `FLUSH_EVERY_N=100` events plus a final flush on `Drop` and on graceful shutdown. Worst-case tail loss on hard crash = <100 events ≈ <10s of live activity.
 - **Disable**: `HYPEHOUSE_EVENT_LOG_DISABLED=1` skips writes entirely. Used by CI + ephemeral runs.
 - **Replay primitive**: `persistence::replay::EventReplay` streams events back; `replay_state(&events)` re-folds into `EngineState`. Used by tests today; restart-recovery flow will compose it in a follow-up PR.
-- **Retention**: not yet implemented. Tracked as a follow-up issue ("Event log pruning + retention policy").
+- **Retention**: implemented in `engine/src/persistence/retention.rs` (closes #41). At engine boot — **after** `EventLog::new` so the current session directory has a fresh mtime and is never a deletion candidate — the engine sweeps the persistence root and deletes session directories that satisfy BOTH conditions:
+  - directory mtime is older than `now - max_days` (default 30), AND
+  - the directory is not among the most-recent `min_sessions_to_keep` (default 50).
+
+  The "keep N regardless of age" floor exists so a long-idle laptop (e.g. user comes back from a 6-month break) doesn't wipe its entire history on first boot. Knobs:
+
+  | Env var | Default | Effect |
+  |---|---|---|
+  | `HYPEHOUSE_LOG_MAX_DAYS` | `30` | Cutoff age. Sessions older than this become deletion candidates. |
+  | `HYPEHOUSE_LOG_MIN_KEEP` | `50` | Floor — always keep at least this many most-recent sessions. |
+  | `HYPEHOUSE_LOG_RETENTION_DISABLED` | unset | Set to `1` to skip the sweep entirely (used by ephemeral runs + CI). |
+
+  Sweep failures (permission denied on one directory, IO errors mid-walk) are downgraded to `warn!` rather than failing boot — the live engine starts even if the cleanup couldn't run. The summary (`deleted`, `retained`, `bytes_freed`) is emitted as a single `info!` line on completion.
+
 - **Snapshot**: the bincode snapshot + offset-pointer recovery flow described above remains a future PR; JSONL replay is the v0.1 primitive.
