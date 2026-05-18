@@ -14,6 +14,7 @@
 import { useEffect, useMemo } from "react";
 import { Deck } from "./Deck";
 import { Crossfader } from "./Crossfader";
+import { Library } from "./Library";
 import { JsonRpcWS } from "../ws/client";
 import { applyNotification, useEngineState } from "../store/engine";
 
@@ -89,11 +90,12 @@ export const DeckRow = (): JSX.Element => {
         background: "#000",
       }}
     >
-      <div style={{ display: "flex", flex: 1 }}>
+      <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
         <Deck deck={state.decks[0]} side="left" client={client} />
         <Deck deck={state.decks[1]} side="right" client={client} />
       </div>
       <Crossfader client={client} value={state.crossfader} />
+      <Library client={client} />
     </div>
   );
 };

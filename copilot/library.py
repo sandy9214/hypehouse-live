@@ -304,6 +304,141 @@ class TrackLibrary:
         ).fetchone()
         return self._row_to_ref(r) if r else None
 
+    def count_tracks(self) -> int:
+        """Total row count — used by paginated ``list_tracks`` for the UI."""
+        r = self._conn.execute("SELECT COUNT(*) AS n FROM tracks").fetchone()
+        return int(r["n"]) if r else 0
+
+    def list_tracks(
+        self, *, limit: int = 100, offset: int = 0
+    ) -> list[TrackRef]:
+        """Paginated catalog dump — ordered by track_id for stable scroll.
+
+        ``limit`` clamped to 1..1000; ``offset`` clamped to >=0. Both
+        clamps are silent because the UI library panel uses a fixed
+        page size and out-of-range offsets are an honest empty result
+        (last page reached) rather than an error.
+        """
+        limit = max(1, min(int(limit), 1000))
+        offset = max(0, int(offset))
+        rows = self._conn.execute(
+            "SELECT * FROM tracks ORDER BY track_id LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        return [self._row_to_ref(r) for r in rows]
+
+    def search_tracks(
+        self,
+        query: str,
+        *,
+        limit: int = 100,
+    ) -> list[TrackRef]:
+        """Substring + key + BPM-range search over the catalog.
+
+        Supports three shorthand syntaxes layered on top of the
+        default substring match:
+
+        * ``key:8B`` — exact Camelot key match (case-insensitive).
+        * ``bpm:120-130`` — inclusive BPM range filter.
+        * everything else — case-insensitive substring matched against
+          the ``track_id`` and ``path`` columns (which include the
+          filename and so cover title / artist for filename-tagged
+          libraries — v0.1's only labeling source).
+
+        Multiple tokens AND together. Empty query returns the first
+        ``limit`` rows of the library (same as ``list_tracks``).
+        """
+        tokens = (query or "").strip().split()
+        if not tokens:
+            return self.list_tracks(limit=limit, offset=0)
+
+        clauses: list[str] = []
+        params: list[object] = []
+        for tok in tokens:
+            tok_lc = tok.lower()
+            if tok_lc.startswith("key:"):
+                clauses.append("LOWER(camelot_key) = ?")
+                params.append(tok_lc[4:])
+            elif tok_lc.startswith("bpm:") and "-" in tok_lc[4:]:
+                lo_s, hi_s = tok_lc[4:].split("-", 1)
+                try:
+                    lo = float(lo_s)
+                    hi = float(hi_s)
+                except ValueError:
+                    # Malformed range — degrade to substring on the raw token.
+                    clauses.append(
+                        "(LOWER(track_id) LIKE ? OR LOWER(path) LIKE ?)"
+                    )
+                    like = f"%{tok_lc}%"
+                    params.extend([like, like])
+                    continue
+                clauses.append("bpm BETWEEN ? AND ?")
+                params.extend([lo, hi])
+            else:
+                clauses.append(
+                    "(LOWER(track_id) LIKE ? OR LOWER(path) LIKE ?)"
+                )
+                like = f"%{tok_lc}%"
+                params.extend([like, like])
+
+        where = " AND ".join(clauses)
+        sql = (
+            "SELECT * FROM tracks "
+            f"WHERE {where} "
+            "ORDER BY track_id LIMIT ?"
+        )
+        params.append(max(1, min(int(limit), 1000)))
+        rows = self._conn.execute(sql, params).fetchall()
+        return [self._row_to_ref(r) for r in rows]
+
+    def add_tracks_from_directory(
+        self,
+        directory: str | Path,
+        *,
+        exts: tuple[str, ...] = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg"),
+        quick: bool = True,
+    ) -> list[TrackRef]:
+        """Recursively scan ``directory`` and analyze every supported file.
+
+        Used by the UI's "library is empty" empty-state — operator runs
+        ``python -m copilot.library scan /path/to/music`` (or the
+        ``library.add_track_from_directory`` RPC) once and the panel
+        populates. Files already in the library (matched by
+        ``track_id == Path.stem``) are skipped to keep the scan
+        idempotent.
+
+        ``quick=True`` (the default here) tells the analyzer to skip
+        the slow madmom downbeat pass — the library panel only needs
+        BPM / key / duration to render rows; downbeats can be filled
+        in lazily on first DeckLoad.
+        """
+        directory_p = Path(directory).expanduser()
+        if not directory_p.exists() or not directory_p.is_dir():
+            raise NotADirectoryError(f"not a directory: {directory_p}")
+
+        # Snapshot existing IDs so the scan is idempotent (re-running
+        # over the same dir doesn't re-analyze every file).
+        existing = {
+            row["track_id"]
+            for row in self._conn.execute("SELECT track_id FROM tracks")
+        }
+
+        added: list[TrackRef] = []
+        for path in sorted(directory_p.rglob("*")):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in exts:
+                continue
+            if path.stem in existing:
+                continue
+            try:
+                ref = self.add_track_from_path(path, quick=quick)
+            except Exception:  # noqa: BLE001 — analyzer is best-effort
+                # One bad file shouldn't abort the whole scan; skip and continue.
+                continue
+            added.append(ref)
+        return added
+
     def pick_compatible_for(
         self,
         playing_bpm: float,
@@ -346,6 +481,9 @@ class TrackLibrary:
         candidates.sort(key=lambda x: x[0])
         return [c[1] for c in candidates[:top_k]]
 
+    def __repr__(self) -> str:  # pragma: no cover — debugging only
+        return f"TrackLibrary(db_path={self._db_path!r})"
+
     @staticmethod
     def _row_to_ref(r: sqlite3.Row) -> TrackRef:
         # New columns are NOT NULL DEFAULT so they're always present, but
@@ -380,3 +518,47 @@ class TrackLibrary:
             ),
             downbeats_ms=downbeats_ms,
         )
+
+
+def _cli(argv: list[str] | None = None) -> int:
+    """Tiny argparse shim — ``python -m copilot.library add <dir>``.
+
+    Surfaced by the UI's library empty-state. Keeps the heavy analyzer
+    import lazy via :meth:`TrackLibrary.add_tracks_from_directory`.
+    """
+    import argparse
+    import os
+    import sys
+
+    p = argparse.ArgumentParser(prog="python -m copilot.library")
+    p.add_argument(
+        "--db",
+        default=os.environ.get(
+            "HYPEHOUSE_LIBRARY_DB", str(Path("~/.hypehouse-live/library.db"))
+        ),
+        help="SQLite library path (default ~/.hypehouse-live/library.db).",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+    add = sub.add_parser("add", help="recursively analyze a directory of audio")
+    add.add_argument("path", help="directory to scan")
+    add.add_argument(
+        "--quick",
+        action="store_true",
+        help="skip the slow downbeat pass (UI-only metadata still works)",
+    )
+    args = p.parse_args(argv if argv is not None else sys.argv[1:])
+
+    lib = TrackLibrary(args.db)
+    try:
+        if args.cmd == "add":
+            added = lib.add_tracks_from_directory(args.path, quick=args.quick)
+            print(f"added {len(added)} new track(s) to {args.db}")
+            return 0
+        return 2  # unreachable — argparse enforces required=True
+    finally:
+        lib.close()
+
+
+if __name__ == "__main__":  # pragma: no cover — CLI entry point
+    import sys
+    sys.exit(_cli())

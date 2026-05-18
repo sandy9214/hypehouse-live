@@ -6,9 +6,10 @@
 // Sub-rows (transport buttons, knob row, hot-cue grid) live in
 // DeckControls.tsx; this file owns the layout + RPC-emit wiring.
 
-import type { CSSProperties, JSX } from "react";
+import type { CSSProperties, DragEvent as ReactDragEvent, JSX } from "react";
 import type { JsonRpcWS } from "../ws/client";
 import type { Deck as DeckState } from "../store/engine";
+import type { LibraryTrack } from "../store/library";
 import { Waveform } from "./Waveform";
 import {
   fmtMs,
@@ -103,18 +104,58 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
         : { CopilotEngage: { deck: deck.id } },
     );
 
+  // Native HTML5 drop target for a library row drag-source (see
+  // TrackRow.tsx). The dataTransfer payload is a serialized
+  // LibraryTrack — we parse, then submit a DeckLoad event with the
+  // analyzed BPM / anchor / downbeats so the engine can mix without
+  // re-asking the library.
+  const onDragOver = (e: ReactDragEvent<HTMLElement>): void => {
+    if (e.dataTransfer.types.includes("application/x-hypehouse-track")) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+    }
+  };
+  const onDrop = (e: ReactDragEvent<HTMLElement>): void => {
+    const raw = e.dataTransfer.getData("application/x-hypehouse-track");
+    if (!raw) return;
+    e.preventDefault();
+    let track: LibraryTrack;
+    try {
+      track = JSON.parse(raw) as LibraryTrack;
+    } catch {
+      return; // malformed payload — silently ignore
+    }
+    submit(client, {
+      DeckLoad: {
+        deck: deck.id,
+        track: { id: track.id, path: track.path },
+        bpm: track.bpm,
+        beat_grid_anchor_ms: track.beat_grid_anchor_ms,
+        downbeats_ms: track.downbeats_ms,
+      },
+    });
+  };
+
   return (
     <section
       aria-label={`Deck ${deck.id}`}
       data-testid={`deck-${deck.id}`}
       style={sectionStyle(side)}
+      onDragOver={onDragOver}
+      onDrop={onDrop}
     >
       <header style={headerStyle}>
         <h2 style={{ margin: 0, fontSize: 18 }}>Deck {deck.id}</h2>
         <span aria-label="play-state">{deck.playing ? "PLAY" : "PAUSE"}</span>
       </header>
 
-      <div aria-label="track-title">{deck.track_title ?? "—"}</div>
+      <div aria-label="track-title">
+        {deck.track_title ?? (
+          <span data-testid={`deck-${deck.id}-empty-hint`} style={{ opacity: 0.6 }}>
+            Pick a track from the library ↓ (or drop one here)
+          </span>
+        )}
+      </div>
 
       <Waveform />
 

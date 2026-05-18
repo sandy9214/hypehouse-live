@@ -28,6 +28,7 @@ from pydantic import ValidationError
 from .decisions import NextTrackPlan, next_track_decision, transition_plan
 from .engine_client import EngineClient
 from .library import TrackLibrary
+from .library_rpc import LibraryRpcHandler
 from .proposer import Proposal, TransitionProposer
 from .schemas import (
     DeckId,
@@ -95,6 +96,16 @@ class CoPilotService:
         # when not injected so unit tests that only exercise
         # handle_notification() don't pay the cost.
         self._proposer: TransitionProposer | None = proposer
+
+        # Library RPC handler — exposes ``library.*`` methods to whatever
+        # transport wires them up (UI WS server, future engine proxy).
+        # Owned by the service so it shares the library handle + lifetime.
+        self._library_rpc = LibraryRpcHandler(library)
+
+    @property
+    def library_rpc(self) -> LibraryRpcHandler:
+        """Public accessor — transport wiring asks for this to dispatch."""
+        return self._library_rpc
 
     # ----- public surface for tests + callers -----
 
