@@ -103,3 +103,20 @@ in a follow-up.
 * Master BPM update flow → Gate currently uses the BPM passed at
   `FxBank::new()`. Live BPM change requires a small audio command
   (covered separately by ADR-007 clock-sync).
+
+## Addendum (2026-05-18) — Gate now reads live BPM
+
+The Gate effect no longer caches `master_bpm` on the struct. Each
+`process()` call reads `SharedClock::master_bpm()` (single
+`AtomicU32` load with `Relaxed` ordering, no heap, no lock).
+
+This means `EventKind::SetMasterBpm` — which the engine main loop
+already forwards to the `SharedClock` side-channel — takes effect
+at the next audio-buffer boundary (≤ ~10.7 ms at 1024-frame
+buffers, 48 kHz) without any explicit effect-param command plumbing.
+No new audio commands were added; the existing clock side-channel
+from ADR-007 is the propagation path.
+
+The `Gate::new(clock, sample_rate, master_bpm)` signature is kept
+for backwards compatibility, but the `master_bpm` parameter is no
+longer read — the `SharedClock` holds the canonical value.
