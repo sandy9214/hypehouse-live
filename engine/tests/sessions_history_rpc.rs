@@ -86,6 +86,7 @@ fn list_sessions_then_replay_session_round_trip() {
                 beat_grid_anchor_ms: 0,
                 downbeats_ms: vec![0, 1846, 3692],
                 hot_cues: [None; 8],
+                track_gain_db: 0.0,
             },
         },
         Event {

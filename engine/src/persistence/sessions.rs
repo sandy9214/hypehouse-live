@@ -515,6 +515,7 @@ mod tests {
                     beat_grid_anchor_ms: 0,
                     downbeats_ms: vec![0, 1875, 3750],
                     hot_cues: [None; 8],
+                    track_gain_db: 0.0,
                 },
             ),
             ev(3, EventKind::DeckPlay { deck: DeckId::A }),

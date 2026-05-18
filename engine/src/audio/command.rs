@@ -114,9 +114,17 @@ pub enum AudioCommandKind {
     /// Streaming decode handle is now ready; bind it to this deck so
     /// the audio thread can pull frames from it via
     /// `DecodeService::read`.
+    ///
+    /// `track_gain_db` is the loudness-leveler per-deck dB gain
+    /// sourced from the copilot library row (schema v7); the audio
+    /// thread converts it to a linear multiplier via
+    /// `10^(db / 20.0)` once at apply-time and multiplies the deck
+    /// slice in `render`. `0.0` is the wire-compat default and
+    /// produces the pre-loudness-PR behaviour (passthrough).
     DeckLoad {
         deck: DeckId,
         handle: DecodeHandle,
+        track_gain_db: f32,
     },
     /// Stem-aware deck load — 4 stem handles (vocals/drums/bass/other)
     /// bundled into a single `StemHandle`. The audio thread pulls

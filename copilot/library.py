@@ -65,7 +65,9 @@ if TYPE_CHECKING:  # pragma: no cover — type-only import to break cycle.
 # the in-memory shape + wire projection.
 # Migrations dispatch on the gap between this constant and the value
 # recorded in the ``schema_version`` table.
-TRACK_SCHEMA_VERSION = 6
+TRACK_SCHEMA_VERSION = 7
+
+LOUDNESS_TARGET_LUFS = -14.0
 
 # Per-track stem-status enum values. Persisted as plain strings (not a
 # SQL enum) so older readers can still introspect the column. The
@@ -129,6 +131,14 @@ class TrackRef:
     hot_cues: list[int | None] = field(
         default_factory=lambda: [None] * HOT_CUE_SLOTS
     )
+    # Loudness leveler fields (schema v7). NULL for tracks that
+    # pre-date v7 or were added via the test ``add_track`` path
+    # without a loudness measurement. ``lufs`` = raw ITU-R BS.1770
+    # integrated loudness; ``track_gain_db`` = pre-computed gain to
+    # land at :data:`LOUDNESS_TARGET_LUFS` (-14). Engine reads None
+    # as 0 dB (passthrough).
+    lufs: float | None = None
+    track_gain_db: float | None = None
 
 
 # Hard compatibility gates. Tracks outside these can sometimes mix but the
@@ -291,6 +301,25 @@ class TrackLibrary:
             self._conn.execute(
                 "ALTER TABLE tracks ADD COLUMN stems_status TEXT"
             )
+        if "lufs" not in cols:
+            # v7 migration — integrated loudness (ITU-R BS.1770).
+            # NULLABLE: older rows that pre-date the loudness pass
+            # don't get retro-analyzed on first open (would force a
+            # librosa cold-start tax + a re-decode of every file in
+            # the catalog). The engine reads NULL as "no measurement",
+            # which it translates to 0 dB gain — i.e. unchanged from
+            # the pre-loudness-PR behaviour.
+            self._conn.execute(
+                "ALTER TABLE tracks ADD COLUMN lufs REAL"
+            )
+        if "track_gain_db" not in cols:
+            # v7 migration — pre-computed engine-side gain to land at
+            # the -14 LUFS streaming reference. Stored alongside the
+            # raw ``lufs`` so the DeckLoad payload is a single REAL
+            # column read; same NULL semantics as ``lufs``.
+            self._conn.execute(
+                "ALTER TABLE tracks ADD COLUMN track_gain_db REAL"
+            )
         # v6 migration — user preset snapshots. Lives in its own table
         # rather than as columns on ``tracks`` because presets aren't
         # per-track. ``name`` is UNIQUE so the UI's "save current" flow
@@ -341,12 +370,16 @@ class TrackLibrary:
     # --- write path (ingestion / tests) -----------------------------------
 
     def add_track(self, track: TrackRef) -> None:
+        # v7: ``lufs`` + ``track_gain_db`` are NULL-safe. A caller that
+        # doesn't measure loudness (every existing test fixture) just
+        # inserts NULL into both, which the engine reads as
+        # passthrough.
         self._conn.execute(
             "INSERT OR REPLACE INTO tracks "
             "(track_id, path, bpm, camelot_key, energy, duration_s, "
             " beat_grid_anchor_ms, beat_period_ms, downbeats_json, "
-            " hot_cues_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " hot_cues_json, lufs, track_gain_db) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 track.track_id,
                 track.path,
@@ -358,6 +391,12 @@ class TrackLibrary:
                 float(track.beat_period_ms),
                 json.dumps([int(d) for d in track.downbeats_ms]),
                 _hot_cues_to_json(track.hot_cues),
+                None if track.lufs is None else float(track.lufs),
+                (
+                    None
+                    if track.track_gain_db is None
+                    else float(track.track_gain_db)
+                ),
             ),
         )
         self._conn.commit()
@@ -436,6 +475,23 @@ class TrackLibrary:
         downbeats_s = list(analysis.downbeats or [])
         downbeats_ms = [int(round(float(t) * 1000.0)) for t in downbeats_s]
 
+        # Loudness pass (schema v7). Wrapped broad: a decode failure
+        # here is best-effort metadata, not load-bearing for the
+        # mashup gates. On failure both columns stay NULL and the
+        # engine treats the deck as 0 dB gain — same as pre-PR. Lazy
+        # import so a caller that never ingests audio doesn't pay
+        # for pyloudnorm + librosa cold-starts.
+        lufs_val: float | None = None
+        gain_val: float | None = None
+        try:
+            from .loudness import compute_lufs, gain_db_for_target
+
+            measured = compute_lufs(path_obj)
+            lufs_val = float(measured)
+            gain_val = float(gain_db_for_target(measured))
+        except Exception:  # noqa: BLE001 — loudness is best-effort.
+            pass
+
         ref = TrackRef(
             track_id=track_id or path_obj.stem,
             path=str(path_obj),
@@ -446,6 +502,8 @@ class TrackLibrary:
             beat_grid_anchor_ms=beat_grid_anchor_ms,
             beat_period_ms=beat_period_ms,
             downbeats_ms=downbeats_ms,
+            lufs=lufs_val,
+            track_gain_db=gain_val,
         )
         self.add_track(ref)
         # Compute + persist visual peak-pairs for the UI's waveform
@@ -921,6 +979,9 @@ class TrackLibrary:
         hot_cues = _hot_cues_from_json(hot_cues_raw)
         bpm = float(r["bpm"])
         beat_period_default = 60_000.0 / bpm if bpm > 0 else 500.0
+        # v7 loudness columns — NULL-safe.
+        lufs_raw = r["lufs"] if "lufs" in keys else None
+        gain_raw = r["track_gain_db"] if "track_gain_db" in keys else None
         return TrackRef(
             track_id=r["track_id"],
             path=r["path"],
@@ -940,6 +1001,8 @@ class TrackLibrary:
             ),
             downbeats_ms=downbeats_ms,
             hot_cues=hot_cues,
+            lufs=None if lufs_raw is None else float(lufs_raw),
+            track_gain_db=None if gain_raw is None else float(gain_raw),
         )
 
 

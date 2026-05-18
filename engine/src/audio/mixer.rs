@@ -84,6 +84,17 @@ struct DeckHot {
     /// `[1, 1, 1, 1]` = all stems audible = ~ full mix. Updated by
     /// `AudioCommandKind::SetStemGain`.
     stem_gains: [f32; 4],
+    /// Per-track loudness-leveler **linear** gain. Pre-computed
+    /// from the copilot's `track_gain_db` (= 10^(db/20)) on the
+    /// control thread inside `AudioCommandKind::DeckLoad`'s
+    /// apply-branch so the audio render loop multiplies a raw
+    /// linear value instead of paying for `f32::powf` on every
+    /// render pass. `1.0` = passthrough (the default; matches the
+    /// pre-loudness-PR behaviour and the documented "no
+    /// measurement" state). Reset to 1.0 on `DeckUnload` /
+    /// `DeckLoadStems` so a stale gain from a previous track can't
+    /// linger onto a new load.
+    track_gain_linear: f32,
 }
 
 impl DeckHot {
@@ -97,8 +108,39 @@ impl DeckHot {
             loaded: DecodeHandle::NONE,
             stem_handle: StemHandle::NONE,
             stem_gains: [1.0; 4],
+            track_gain_linear: 1.0,
         }
     }
+}
+
+/// Convert a loudness-leveler dB gain to a linear multiplier.
+///
+/// Pure-fn, `const`-friendly arithmetic (modulo the unstable
+/// `const f32::powf`). Hard-clamped to a sane envelope so a
+/// pathological copilot payload can't push the per-sample multiply
+/// into denormal-collapse or +inf territory:
+///
+/// * Non-finite inputs (NaN / ±inf) → `1.0` (passthrough). The
+///   reducer already guards against this on `EventKind::DeckLoad`
+///   but the audio side double-checks because the audio-thread
+///   ring is a separate trust boundary (a buggy translator could
+///   shovel garbage in).
+/// * `[-60, +24]` dB cap matches the deck-safe envelope used by
+///   the copilot side (`copilot.loudness.MAX_GAIN_DB` /
+///   `MIN_GAIN_DB` are tighter, at `[-20, +14]`). The looser
+///   limits here just make sure we never go off the rails even
+///   if the copilot ships a value outside its own clamp.
+#[inline]
+fn track_gain_db_to_linear(db: f32) -> f32 {
+    if !db.is_finite() {
+        return 1.0;
+    }
+    let clamped = db.clamp(-60.0, 24.0);
+    // 10^(db/20) — the standard dB → linear conversion. Powf is
+    // ~10ns on x86_64; called once per `DeckLoad` (i.e. once per
+    // track switch, not per sample), so it's well off the audio
+    // hot path.
+    10.0f32.powf(clamped / 20.0)
 }
 
 /// Audio-thread mixing state. Lives behind the cpal callback. Never
@@ -280,13 +322,22 @@ impl AudioMixer {
             AudioCommandKind::LoopArm { .. } | AudioCommandKind::LoopDisarm { .. } => {
                 // v0.1: loops require buffer playback; no-op.
             }
-            AudioCommandKind::DeckLoad { deck, handle } => {
+            AudioCommandKind::DeckLoad {
+                deck,
+                handle,
+                track_gain_db,
+            } => {
                 let d = self.deck_mut(deck);
                 d.loaded = handle;
                 // Switching back to full-mix mode clears any prior
                 // stem-handle (mutually exclusive playback paths).
                 d.stem_handle = StemHandle::NONE;
                 d.stem_gains = [1.0; 4];
+                // Loudness-leveler — convert dB → linear once, here,
+                // so the per-sample render loop just multiplies. See
+                // `track_gain_db_to_linear` for the clamps + NaN
+                // guard.
+                d.track_gain_linear = track_gain_db_to_linear(track_gain_db);
             }
             AudioCommandKind::DeckLoadStems { deck, stems } => {
                 // Stem-mode load — clear the full-mix handle so the
@@ -299,6 +350,13 @@ impl AudioMixer {
                 d.loaded = DecodeHandle::NONE;
                 d.stem_handle = stems;
                 d.stem_gains = [1.0; 4];
+                // Stem loads don't carry a per-track gain today (the
+                // copilot's stem-separation path doesn't re-measure
+                // loudness on the separated WAVs — they sum to the
+                // original mix, modulo demucs residual). Reset to
+                // passthrough so a stale gain from a prior DeckLoad
+                // doesn't linger.
+                d.track_gain_linear = 1.0;
             }
             AudioCommandKind::SetStemGain { deck, stem, gain } => {
                 // Defensive: clamp gain and silent-ignore an
@@ -313,6 +371,10 @@ impl AudioMixer {
                 d.stem_handle = StemHandle::NONE;
                 d.stem_gains = [1.0; 4];
                 d.playing = false;
+                // Reset per-track loudness gain to passthrough so a
+                // stale value can't multiply the oscillator fallback
+                // path on the next DeckPlay-without-DeckLoad.
+                d.track_gain_linear = 1.0;
             }
             AudioCommandKind::ArmHandoff { deck, until_frame } => {
                 self.deck_mut(deck).handoff_until_frame = until_frame;
@@ -435,8 +497,14 @@ impl AudioMixer {
                     a_slice[i * 2 + 1] = s;
                 }
             } else {
-                // Apply per-deck gain to the pulled samples in place.
-                let g = self.deck_a.gain;
+                // Apply per-deck gain (= EQ-collapsed level) AND the
+                // loudness-leveler per-track gain in a single
+                // pre-multiplied scalar so the per-sample loop is
+                // one MAC. Folding the two scalars here keeps the
+                // audio-thread budget identical to the pre-loudness
+                // path (one f32 multiply per sample); ADR-004's
+                // no-alloc + bounded-work invariant is preserved.
+                let g = self.deck_a.gain * self.deck_a.track_gain_linear;
                 for s in a_slice[..a_end].iter_mut() {
                     *s *= g;
                 }
@@ -448,7 +516,7 @@ impl AudioMixer {
                     b_slice[i * 2 + 1] = s;
                 }
             } else {
-                let g = self.deck_b.gain;
+                let g = self.deck_b.gain * self.deck_b.track_gain_linear;
                 for s in b_slice[..(chunk * 2)].iter_mut() {
                     *s *= g;
                 }
@@ -571,6 +639,16 @@ impl AudioMixer {
         match id {
             DeckId::A => self.pitch_tempo_a.pitch_semitones(),
             DeckId::B => self.pitch_tempo_b.pitch_semitones(),
+        }
+    }
+
+    /// Read accessor for tests — current loudness-leveler linear
+    /// gain on a deck (= 10^(track_gain_db / 20)). `1.0` means
+    /// passthrough; values > 1.0 are boosts, < 1.0 are cuts.
+    pub fn track_gain_linear(&self, id: DeckId) -> f32 {
+        match id {
+            DeckId::A => self.deck_a.track_gain_linear,
+            DeckId::B => self.deck_b.track_gain_linear,
         }
     }
 
@@ -1413,5 +1491,161 @@ mod tests {
                 m.render(&mut buf);
             });
         }
+    }
+
+    // ----- loudness leveler (track_gain_db) ----------------------
+
+    #[test]
+    fn deck_load_applies_track_gain_db_as_linear_multiplier() {
+        // dB → linear conversion happens on apply, not on render —
+        // verify the mixer caches the right scalar for a representative
+        // set of values across the deck-safe envelope. `+6 dB` ≈ 2x
+        // (the canonical "double the loudness" rule of thumb); `0 dB`
+        // = passthrough; `-6 dB` ≈ 0.501 (halve).
+        let mut m = AudioMixer::new(48_000);
+
+        m.apply(cmd(AudioCommandKind::DeckLoad {
+            deck: DeckId::A,
+            handle: DecodeHandle::NONE,
+            track_gain_db: 6.0,
+        }));
+        // 10^(6/20) ≈ 1.9953
+        let g_a = m.track_gain_linear(DeckId::A);
+        assert!(
+            (g_a - 1.9953).abs() < 1e-3,
+            "+6 dB should be ~1.9953 linear, got {g_a}"
+        );
+
+        m.apply(cmd(AudioCommandKind::DeckLoad {
+            deck: DeckId::B,
+            handle: DecodeHandle::NONE,
+            track_gain_db: -6.0,
+        }));
+        // 10^(-6/20) ≈ 0.5012
+        let g_b = m.track_gain_linear(DeckId::B);
+        assert!(
+            (g_b - 0.5012).abs() < 1e-3,
+            "-6 dB should be ~0.5012 linear, got {g_b}"
+        );
+
+        // 0 dB = passthrough — most common case (track at target /
+        // no measurement yet).
+        m.apply(cmd(AudioCommandKind::DeckLoad {
+            deck: DeckId::A,
+            handle: DecodeHandle::NONE,
+            track_gain_db: 0.0,
+        }));
+        assert!((m.track_gain_linear(DeckId::A) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn deck_load_track_gain_db_non_finite_clamps_to_passthrough() {
+        // Audio-thread defensive guard: a NaN payload (despite the
+        // reducer's filter) must not propagate into a NaN multiply
+        // on every sample. `track_gain_db_to_linear` maps non-finite
+        // → 1.0 (passthrough).
+        let mut m = AudioMixer::new(48_000);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            m.apply(cmd(AudioCommandKind::DeckLoad {
+                deck: DeckId::A,
+                handle: DecodeHandle::NONE,
+                track_gain_db: bad,
+            }));
+            let g = m.track_gain_linear(DeckId::A);
+            assert!(
+                g.is_finite() && (g - 1.0).abs() < f32::EPSILON,
+                "non-finite payload {bad} must produce passthrough gain, got {g}"
+            );
+        }
+    }
+
+    #[test]
+    fn deck_load_track_gain_db_clamps_extreme_values() {
+        // Defensive: a value outside the [-60, +24] dB envelope is
+        // hard-clamped before the powf call so a buggy copilot
+        // payload can't push the per-sample multiply into denormal
+        // collapse (+inf for huge +db) or zero-out the deck unhelpfully.
+        let mut m = AudioMixer::new(48_000);
+        m.apply(cmd(AudioCommandKind::DeckLoad {
+            deck: DeckId::A,
+            handle: DecodeHandle::NONE,
+            track_gain_db: 200.0, // absurdly hot
+        }));
+        let g_hi = m.track_gain_linear(DeckId::A);
+        // +24 dB cap → 10^(24/20) ≈ 15.85
+        assert!(
+            (g_hi - 15.85).abs() < 0.05,
+            "+200 dB should clamp at +24 dB envelope (~15.85 linear), got {g_hi}"
+        );
+
+        m.apply(cmd(AudioCommandKind::DeckLoad {
+            deck: DeckId::B,
+            handle: DecodeHandle::NONE,
+            track_gain_db: -200.0,
+        }));
+        let g_lo = m.track_gain_linear(DeckId::B);
+        // -60 dB cap → 10^(-60/20) = 0.001
+        assert!(
+            (g_lo - 0.001).abs() < 1e-4,
+            "-200 dB should clamp at -60 dB envelope (~0.001 linear), got {g_lo}"
+        );
+    }
+
+    #[test]
+    fn deck_unload_resets_track_gain_linear() {
+        // A stale gain from a previous DeckLoad must not linger
+        // into the next track. DeckUnload is the documented
+        // "deck-clear" event; gain resets to passthrough.
+        let mut m = AudioMixer::new(48_000);
+        m.apply(cmd(AudioCommandKind::DeckLoad {
+            deck: DeckId::A,
+            handle: DecodeHandle::NONE,
+            track_gain_db: 9.0,
+        }));
+        assert!(m.track_gain_linear(DeckId::A) > 2.0); // 10^(9/20) ≈ 2.82
+        m.apply(cmd(AudioCommandKind::DeckUnload { deck: DeckId::A }));
+        assert!((m.track_gain_linear(DeckId::A) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn deck_load_stems_resets_track_gain_linear() {
+        // Stem-mode loads don't carry a per-track gain today (the
+        // copilot doesn't re-measure loudness on the separated WAVs).
+        // A prior DeckLoad's gain must not carry over.
+        let mut m = AudioMixer::new(48_000);
+        m.apply(cmd(AudioCommandKind::DeckLoad {
+            deck: DeckId::A,
+            handle: DecodeHandle::NONE,
+            track_gain_db: -3.0,
+        }));
+        m.apply(cmd(AudioCommandKind::DeckLoadStems {
+            deck: DeckId::A,
+            stems: StemHandle::NONE,
+        }));
+        assert!((m.track_gain_linear(DeckId::A) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn render_with_track_gain_remains_alloc_free() {
+        // ADR-004 invariant: the gain multiply is one MAC per sample.
+        // Adding the loudness leveler must not introduce any
+        // allocation on the render hot path.
+        let mut m = AudioMixer::new(48_000);
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::A }));
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::B }));
+        m.apply(cmd(AudioCommandKind::DeckLoad {
+            deck: DeckId::A,
+            handle: DecodeHandle::NONE,
+            track_gain_db: 9.0,
+        }));
+        m.apply(cmd(AudioCommandKind::DeckLoad {
+            deck: DeckId::B,
+            handle: DecodeHandle::NONE,
+            track_gain_db: -6.0,
+        }));
+        let mut buf = [0.0; 1024];
+        assert_no_alloc::assert_no_alloc(|| {
+            m.render(&mut buf);
+        });
     }
 }
