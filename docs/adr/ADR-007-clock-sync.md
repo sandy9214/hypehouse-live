@@ -1,6 +1,6 @@
 # ADR-007 — External clock sync (Ableton Link, MIDI clock)
 
-**Status**: Accepted 2026-05-17 — scope: v0.1 = MIDI clock OUT only (**implemented** — see `engine/src/midi/clock_out.rs`); v0.2+ = Ableton Link; v0.3 = MIDI clock IN (**implemented** — see `engine/src/midi/clock_in.rs`).
+**Status**: Accepted 2026-05-17 — scope: v0.1 = MIDI clock OUT only (**implemented** — see `engine/src/midi/clock_out.rs`); v0.2 = Ableton Link (**scaffolded** — `PeerClock` trait + `LinkStub` default + `LinkReal` placeholder behind `ableton-link` Cargo feature; real `rust-link` binding deferred to v0.2.x under ADR-009 LGPL sign-off); v0.3 = MIDI clock IN (**implemented** — see `engine/src/midi/clock_in.rs`).
 **Decider**: Sandeep Gorai
 **Trigger**: Council review flagged this as a long-term refactor risk if punted (Cohere).
 
@@ -85,4 +85,21 @@ The MIDI clock IN module landed against `main` with the following shape:
 
 ## What v0.2+ unlocks
 
-Full Link support via `rust-link` crate (community Rust binding to Ableton's Link C++ SDK). Requires Cargo feature `link` + accepting the Link license. UI gains a "Link" toggle + peer count badge.
+Full Link support via `rust-link` crate (community Rust binding to Ableton's Link C++ SDK). Requires Cargo feature `ableton-link` + accepting the Link license. UI gains a "Link" toggle + peer count badge.
+
+### v0.2 implementation notes (PR `engine-ableton-link-scaffold`)
+
+**This PR ships the SCAFFOLD only.** The real Ableton Link binding is deferred to a v0.2.x follow-up PR because the C++ Link SDK is LGPL v3 (see ADR-009) and the `rust-link` binding pulls heavy build deps (`bindgen`, a C++ compiler in CI, license acceptance). Landing the trait abstraction first lets us write the rest of the engine + UI against `PeerClock` today without blocking on the licensing decision.
+
+* **Module**: [`engine/src/clock_sync/`](../../engine/src/clock_sync/mod.rs) — separate from the `midi` module because Link is a peer-to-peer LAN protocol, not a MIDI transport.
+* **Trait**: `PeerClock: Send + Sync` with four methods — `current_tempo() -> f32`, `set_local_tempo(bpm)`, `peer_count() -> usize`, `beat_offset_seconds() -> f64`. The trait lets call sites stay backend-agnostic; the `ableton-link` feature only flips the constructor in `main.rs`.
+* **Stub**: [`engine/src/clock_sync/link_stub.rs`](../../engine/src/clock_sync/link_stub.rs) — `LinkStub` is the default backend. Returns 120 BPM, 0 peers, 0.0 offset; `set_local_tempo` logs at info and discards. Constructing one logs a one-time warning ("Ableton Link stub: feature not yet wired; v0.2.x follow-up") guarded by a `std::sync::Once` so a hot path that builds many stubs doesn't spam the log.
+* **Real (placeholder)**: [`engine/src/clock_sync/link_real.rs`](../../engine/src/clock_sync/link_real.rs) — `LinkReal` compiles only when the `ableton-link` Cargo feature is on. Every method `unimplemented!()`s so an accidental `cargo build --features ableton-link` produces a loud runtime panic rather than silent mis-sync. The v0.2.x follow-up replaces this file with the real `rust-link` calls.
+* **Wiring in `main.rs`**: `build_peer_clock()` returns `Arc<dyn PeerClock>`. Default = `LinkStub`. When `cfg!(feature = "ableton-link")` AND env `ABLETON_LINK_ENABLED=1`, returns the placeholder `LinkReal` (which then panics on first call). Boot logs `"PeerClock backend = stub | real"`. The handle is kept alive for the duration of `main` but not yet fanned into the audio thread — that's part of the v0.2.x wiring.
+* **Tests**: 7 unit tests in `link_stub.rs` covering default tempo = 120, no-op `set_local_tempo` for NaN/Infinity/negative inputs, `peer_count` = 0, `beat_offset_seconds` = 0.0, `Send + Sync` bound, `Copy`-friendly trait-object usage.
+* **Deferred to v0.2.x follow-up**:
+  - Real `rust-link` crate dependency in `Cargo.toml` (currently the `ableton-link` feature is an empty placeholder — no transitive deps).
+  - LGPL sign-off per ADR-009.
+  - Replacing `LinkReal`'s `unimplemented!()` with `rust_link::Link::new` + a peer-event listener thread.
+  - Bidirectional cross-update between `SharedClock::master_bpm` and `PeerClock::current_tempo` (with a configurable master-role toggle to prevent oscillation).
+  - UI badge for peer count + Link toggle (Tauri command + WS notification).
