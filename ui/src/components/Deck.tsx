@@ -14,6 +14,7 @@ import { extrapolatedPosition, setDeckDuration } from "../store/engine";
 import type { LibraryTrack } from "../store/library";
 import { useAutoMix } from "../store/autoMix";
 import { AutoMixButton } from "./AutoMixButton";
+import { CueCountdown } from "./CueCountdown";
 import { Waveform } from "./Waveform";
 import {
   fmtMs,
@@ -395,6 +396,13 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
             : "Stems"}
         </button>
       </div>
+
+      <CueCountdown
+        deck={deck.id}
+        downbeatsMs={downbeatsMs}
+        beatPeriodMs={beatPeriodMs}
+        positionProvider={positionProvider}
+      />
 
       <Waveform
         peaks={peaks}
