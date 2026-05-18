@@ -21,6 +21,7 @@ use hypehouse_engine::audio::{
     EngineClock, SharedClock, SymphoniaDecodeService,
 };
 use hypehouse_engine::bridge::{self, EngineHandle};
+use hypehouse_engine::persistence::{new_session_id, EventLog};
 use hypehouse_engine::state::{EngineState, Event, EventKind};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -74,6 +75,36 @@ async fn main() -> Result<()> {
     // the control-thread loop.
     let (event_tx, event_rx) = channel::unbounded::<Event>();
 
+    // Persistent event log (ADR-003). One session id per process boot;
+    // the log file lives under XDG_DATA_HOME (or the
+    // HYPEHOUSE_EVENT_LOG_DIR override). Disabling is supported via
+    // HYPEHOUSE_EVENT_LOG_DISABLED=1 — useful for ephemeral runs and
+    // the CI matrix where the filesystem isn't durable.
+    let session_id = new_session_id();
+    let event_log = match EventLog::new(&session_id) {
+        Ok(log) => {
+            info!(
+                session_id = %session_id,
+                path = ?log.path(),
+                disabled = log.is_disabled(),
+                "event log opened"
+            );
+            Some(log)
+        }
+        Err(e) => {
+            // Persistence failure is non-fatal — the live engine
+            // continues without an audit trail. We warn loudly so
+            // operators notice and fix the underlying cause (perms,
+            // disk full).
+            warn!(
+                error = %e,
+                session_id = %session_id,
+                "event log open failed — continuing without persistence"
+            );
+            None
+        }
+    };
+
     // Control-thread loop runs on a dedicated OS thread so it doesn't
     // block the async runtime.
     let sample_rate = stream.sample_rate;
@@ -87,6 +118,7 @@ async fn main() -> Result<()> {
             sample_rate,
             decode_for_control,
             shared_clock_for_control,
+            event_log,
         )
     });
 
@@ -118,6 +150,13 @@ async fn main() -> Result<()> {
 
 /// Control-thread loop: pull events, fold state, emit audio commands.
 /// Blocks on the event channel; exits when the channel is closed.
+///
+/// Also appends every received event to the persistent log (ADR-003)
+/// before emitting commands. Append happens **after** the reducer
+/// applies — if the apply panicked we'd skip persistence, which is
+/// fine: a panic is a bug, not a state change. Persistence errors are
+/// downgraded to a warn so a transient disk hiccup never kills the
+/// live set.
 fn control_loop(
     event_rx: Receiver<Event>,
     mut producer: AudioProducer,
@@ -125,6 +164,7 @@ fn control_loop(
     sample_rate: u32,
     decode: Arc<dyn DecodeService>,
     shared_clock: SharedClock,
+    mut event_log: Option<EventLog>,
 ) {
     let mut state = EngineState::default();
 
@@ -139,6 +179,14 @@ fn control_loop(
             shared_clock.set_master_bpm(*bpm);
         }
 
+        // Persist BEFORE emitting commands so a downstream panic
+        // (e.g. translator bug) can be reproduced from the log.
+        if let Some(log) = event_log.as_mut() {
+            if let Err(e) = log.append(&ev) {
+                warn!(error = %e, event_id = ev.id, "event log: append failed");
+            }
+        }
+
         let now_frame = clock.frame();
         let cmds = event_to_commands(&state, &next, &ev, now_frame, sample_rate, decode.as_ref());
         for cmd in cmds.into_iter() {
@@ -150,6 +198,15 @@ fn control_loop(
             }
         }
         state = next;
+    }
+
+    // Flush tail on graceful shutdown (channel closed = bridge gone).
+    // Drop would do this too, but doing it explicitly surfaces errors
+    // in the log rather than swallowing them.
+    if let Some(mut log) = event_log.take() {
+        if let Err(e) = log.flush() {
+            warn!(error = %e, "event log: shutdown flush failed");
+        }
     }
     info!("control loop: event channel closed — shutting down");
 }

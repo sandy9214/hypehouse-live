@@ -12,6 +12,7 @@
 pub mod audio;
 pub mod bridge;
 pub mod midi;
+pub mod persistence;
 pub mod state;
 
 pub use state::{Deck, DeckId, EngineState, Event, EventKind, EventSource};
