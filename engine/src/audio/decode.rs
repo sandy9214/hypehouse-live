@@ -1580,11 +1580,32 @@ pub(crate) mod tests {
         assert!(got.kind.message().contains("bitstream corruption"));
     }
 
-    // Windows: catch_unwind + sidechannel send timing flakes on shared
-    // GitHub-hosted runners. Test verifies same path on Linux + macOS.
-    #[cfg_attr(target_os = "windows", ignore)]
+    /// Skip catch_unwind+sidechannel tests on Windows when running on a
+    /// shared GitHub-hosted CI runner. Under that scheduler the crossbeam
+    /// channel `Sender::send` race vs `JoinHandle::join` can drop the
+    /// failure event before the receiver wakes (observed on PR #98/#100).
+    /// On any other runner — local Windows dev box, self-hosted GH
+    /// runner, Linux + macOS — the tests execute normally.
+    ///
+    /// Set `HYPEHOUSE_SHARED_CI_RUNNER=1` on the runner to suppress;
+    /// unset / `0` runs the tests. Tracked by issue #110.
+    fn windows_shared_ci_runner() -> bool {
+        cfg!(target_os = "windows")
+            && std::env::var("HYPEHOUSE_SHARED_CI_RUNNER").ok().as_deref() == Some("1")
+    }
+
+    // Windows shared CI: catch_unwind + sidechannel send timing flakes on
+    // GitHub-hosted runners (#110). Local Windows + self-hosted runners
+    // still execute. Linux + macOS always execute.
     #[test]
     fn panicking_test_decoder_thread_surfaces_decoder_thread_panic() {
+        if windows_shared_ci_runner() {
+            eprintln!(
+                "skipping panicking_test_decoder_thread_surfaces_decoder_thread_panic on \
+                 Windows shared CI runner (HYPEHOUSE_SHARED_CI_RUNNER=1); see #110"
+            );
+            return;
+        }
         let svc = SymphoniaDecodeService::new();
         let rx = svc
             .take_mid_stream_failure_receiver()
@@ -1609,9 +1630,15 @@ pub(crate) mod tests {
         join.join().expect("test decoder thread joined");
     }
 
-    #[cfg_attr(target_os = "windows", ignore)]
     #[test]
     fn audio_thread_continues_silence_pad_after_decoder_panic() {
+        if windows_shared_ci_runner() {
+            eprintln!(
+                "skipping audio_thread_continues_silence_pad_after_decoder_panic on \
+                 Windows shared CI runner (HYPEHOUSE_SHARED_CI_RUNNER=1); see #110"
+            );
+            return;
+        }
         // The whole point of catch_unwind on the decoder thread is
         // that the audio thread keeps running — `read()` must still
         // return cleanly (silence) after the decoder panics and

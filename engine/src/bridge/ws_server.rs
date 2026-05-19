@@ -906,10 +906,8 @@ mod tests {
         // Batch the sends, then drain responses. We keep both halves
         // interleaved to avoid filling the tokio mpsc on the server.
         let mut accepted_before_deny = 0u32;
-        let mut next_id: i64 = 100_000;
-        for _ in 0..max_frames {
+        for (next_id, _) in (100_000_i64..).zip(0..max_frames) {
             let id = next_id;
-            next_id += 1;
             let body = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "engine.submit_event",
