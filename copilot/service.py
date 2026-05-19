@@ -32,6 +32,8 @@ from .http_server import JsonRpcHttpServer, build_default_server
 from .library import TrackLibrary
 from .library_rpc import LibraryRpcHandler
 from .library_rpc import RpcError as LibraryRpcError
+from .playlist import PlaylistQueue
+from .playlist_rpc import PlaylistRpcHandler
 from .preset_rpc import PresetRpcHandler
 from .proposer import Proposal, TransitionProposer
 from .schemas import (
@@ -111,6 +113,14 @@ class CoPilotService:
         # preset save and a track read both hit the same DB file.
         self._preset_rpc = PresetRpcHandler(library)
 
+        # Playlist queue (DJ-curated next-track order). Single per-set
+        # singleton shared by the auto-mix controller (consumer) and
+        # the playlist RPC handler (mutator). One sqlite table, one
+        # source of truth — no notification plumbing needed because
+        # both sides re-read the queue on every interaction.
+        self._playlist = PlaylistQueue(library)
+        self._playlist_rpc = PlaylistRpcHandler(self._playlist)
+
         # Auto-Mix controller — lazy-init in the proposer property below
         # so unit tests that don't exercise auto-mix avoid the cost.
         # Owned by the service so its lifetime tracks the engine WS loop.
@@ -133,6 +143,16 @@ class CoPilotService:
     def preset_rpc(self) -> PresetRpcHandler:
         """Public accessor for the ``presets.*`` handler."""
         return self._preset_rpc
+
+    @property
+    def playlist_rpc(self) -> PlaylistRpcHandler:
+        """Public accessor for the ``playlist.*`` handler."""
+        return self._playlist_rpc
+
+    @property
+    def playlist(self) -> PlaylistQueue:
+        """Public accessor for the DJ playlist queue (auto-mix consumer)."""
+        return self._playlist
 
     # ----- public surface for tests + callers -----
 
@@ -336,6 +356,7 @@ class CoPilotService:
                 self.proposer,
                 _placeholder_submit,
                 state_changed=self._dispatch_auto_mix_change,
+                playlist=self._playlist,
             )
         return self._auto_mix
 
@@ -532,11 +553,13 @@ class CoPilotService:
             server = JsonRpcHttpServer(host=host, port=port)
             server.register_handler(self._library_rpc)
             server.register_handler(self._preset_rpc)
+            server.register_handler(self._playlist_rpc)
             server.register_handler(_CopilotRpcAdapter(self))
             return server
         server = build_default_server(
             self._library_rpc, preset_rpc=self._preset_rpc, port=port
         )
+        server.register_handler(self._playlist_rpc)
         server.register_handler(_CopilotRpcAdapter(self))
         return server
 

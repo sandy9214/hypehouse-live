@@ -24,6 +24,7 @@ import type { LibraryTrack } from "../store/library";
 import { noteLoadedTrack } from "../store/hotCuePersist";
 import { fetchWaveform } from "../store/waveform";
 import { Waveform } from "./Waveform";
+import { enqueueTrack } from "../store/playlist";
 
 export interface TrackRowProps {
   track: LibraryTrack;
@@ -55,9 +56,18 @@ export const __resetTrackRowHoverCache = (): void => { lastHoverAt.clear(); };
 
 const rowWrapStyle: CSSProperties = { borderBottom: "1px solid #222" };
 const rowStyle: CSSProperties = {
-  display: "grid", gridTemplateColumns: "2fr 1fr 64px 56px 72px 96px",
-  alignItems: "center", gap: 8, padding: "4px 8px",
-  color: "#ddd", fontFamily: "monospace", fontSize: 12,
+  display: "grid",
+  // 7-column grid; trailing column widened to fit the deck-load
+  // buttons (→ A / → B) plus the "→ Queue" enqueue button added in
+  // the playlist-queue PR. Keep in sync with the matching
+  // ``columnsRowStyle`` header in `Library.tsx`.
+  gridTemplateColumns: "2fr 1fr 64px 56px 72px 156px",
+  alignItems: "center",
+  gap: 8,
+  padding: "4px 8px",
+  color: "#ddd",
+  fontFamily: "monospace",
+  fontSize: 12,
 };
 const previewStyle: CSSProperties = { padding: "2px 8px 4px 8px", background: "#080808" };
 const cellStyle: CSSProperties = {
@@ -220,6 +230,17 @@ export const TrackRow = ({
             onClick={(): void => handleLoad("B")}
           >
             → B
+          </button>
+          <button
+            type="button"
+            aria-label={`Enqueue ${track.id} to playlist`}
+            data-testid={`enqueue-${track.id}`}
+            style={btnStyle}
+            onClick={(): void => {
+              void enqueueTrack(client, track.id);
+            }}
+          >
+            → Queue
           </button>
         </span>
       </div>

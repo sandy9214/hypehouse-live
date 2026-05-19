@@ -138,11 +138,13 @@ def test_schema_version_is_current():
     Bumped from v4 → v5 in the stem-separation scaffold PR (adds the
     ``stems_dir`` + ``stems_status`` columns). v5 → v6 in the
     preset-snapshots PR (adds the ``presets`` table — separate table,
-    not a column on ``tracks``). Pinning to a literal here rather than
-    a >= comparison so a future regression that *lowers* the version
-    fails loudly.
+    not a column on ``tracks``). v7 added the loudness leveler columns
+    (``lufs`` + ``track_gain_db``). v8 added the ``playlist_queue``
+    table (DJ-curated next-track order; see ``copilot/playlist.py``).
+    Pinning to a literal here rather than a >= comparison so a future
+    regression that *lowers* the version fails loudly.
     """
-    assert TRACK_SCHEMA_VERSION == 7
+    assert TRACK_SCHEMA_VERSION == 8
     assert HOT_CUE_SLOTS == 8
 
 
