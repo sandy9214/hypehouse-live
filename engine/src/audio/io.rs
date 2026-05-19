@@ -68,6 +68,102 @@ pub struct AudioStreamHandle {
     pub perf: PerfMetrics,
 }
 
+/// How `pick_output_device` resolved the requested device. Logged at
+/// startup + returned to callers (UI list endpoint, future RPC).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputDeviceSelection {
+    /// No substring was passed; the host's default device was used.
+    Default,
+    /// A substring matched a non-default device (e.g. BlackHole 2ch).
+    Matched,
+    /// A substring was passed but no device name contained it; fell
+    /// back to the host default so the engine still starts. The caller
+    /// (UI/CLI) is responsible for surfacing this to the operator.
+    Fallback,
+}
+
+/// Pure substring-match helper — separates testable selection logic from
+/// cpal device enumeration (which can crash inside macOS unit-test
+/// processes due to CoreAudio thread-context quirks).
+///
+/// `None` or empty `substring` → `None` (caller should use default device).
+/// Non-empty `substring` → index of the first name whose lowercased form
+/// contains the lowercased needle, or `None` if no match.
+pub(crate) fn match_device_by_substring<S: AsRef<str>>(
+    names: &[S],
+    substring: Option<&str>,
+) -> Option<usize> {
+    let needle = substring
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_lowercase();
+    names
+        .iter()
+        .position(|n| n.as_ref().to_lowercase().contains(&needle))
+}
+
+/// Choose an output device on `host` honouring an optional case-insensitive
+/// substring match. Returns the device + how the selection resolved.
+///
+/// Selection rules:
+/// 1. If `substring` is `None` or empty → host default device.
+/// 2. If `substring` matches the *first* device whose name contains it
+///    (case-insensitive) → that device, [`OutputDeviceSelection::Matched`].
+/// 3. If `substring` is set but no device matches → host default device,
+///    [`OutputDeviceSelection::Fallback`]. The engine still starts so a
+///    typo in the env var doesn't take audio offline.
+///
+/// Default match is intentional — for the livestream use case the user
+/// typically passes a fragment like `"BlackHole"` or `"VB-Cable"`; we
+/// don't want them to have to type the full `BlackHole 2ch (Virtual)`
+/// label.
+pub fn pick_output_device(
+    host: &cpal::Host,
+    substring: Option<&str>,
+) -> Result<(cpal::Device, OutputDeviceSelection)> {
+    let needle_trimmed = substring
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if let Some(needle) = needle_trimmed {
+        let devices: Vec<cpal::Device> = host
+            .output_devices()
+            .map_err(|e| anyhow!("cpal output_devices() failed: {e}"))?
+            .collect();
+        let names: Vec<String> = devices.iter().map(|d| d.name().unwrap_or_default()).collect();
+        if let Some(idx) = match_device_by_substring(&names, Some(needle)) {
+            let device = devices.into_iter().nth(idx).expect("idx in range");
+            return Ok((device, OutputDeviceSelection::Matched));
+        }
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| anyhow!("no default audio output device (and no match for substring '{needle}')"))?;
+        return Ok((device, OutputDeviceSelection::Fallback));
+    }
+
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| anyhow!("no default audio output device"))?;
+    Ok((device, OutputDeviceSelection::Default))
+}
+
+/// Enumerate the host's output device names. Used by the UI device-list
+/// endpoint + the CLI `--list-output-devices` flag. Defunct devices
+/// (name() fails) are skipped. Order matches cpal enumeration order;
+/// the host default is **not** flagged here — callers re-query
+/// `host.default_output_device().name()` if they need that signal.
+///
+/// Returns an empty vec if the host has no devices (e.g. inside a
+/// container without an audio sink); never errors.
+pub fn enumerate_output_devices(host: &cpal::Host) -> Vec<String> {
+    match host.output_devices() {
+        Ok(devices) => devices
+            .filter_map(|d| d.name().ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Build + start the output stream. The producer side of the SPSC ring
 /// stays with the caller (control thread); we take the consumer.
 ///
@@ -80,11 +176,19 @@ pub fn spawn_audio_thread(
     clock: SharedClock,
     decode: Arc<dyn DecodeService>,
     recorder_sink: Option<MasterRecorderSink>,
+    output_device_substring: Option<&str>,
 ) -> Result<AudioStreamHandle> {
     let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| anyhow!("no default audio output device"))?;
+    let (device, selection) = pick_output_device(&host, output_device_substring)?;
+    let device_name = device
+        .name()
+        .unwrap_or_else(|_| "<unnamed>".to_string());
+    tracing::info!(
+        target: "audio",
+        device = %device_name,
+        selection = ?selection,
+        "cpal output device selected"
+    );
 
     let supported = device
         .default_output_config()
@@ -276,6 +380,102 @@ mod tests {
     use crate::audio::ring::AudioRing;
     use crate::audio::AudioCommand;
     use crate::state::DeckId;
+
+    // Pure-function tests for the substring-match logic — exercise every
+    // branch without touching cpal / CoreAudio (which segfaults inside
+    // macOS unit-test threads on some hosts). The cpal integration is
+    // smoke-tested in the `pick_output_device_*` block below, gated
+    // `#[ignore]` so dev boxes opt in via `cargo test -- --ignored`.
+
+    #[test]
+    fn match_device_none_substring_returns_none() {
+        let names: Vec<String> = vec!["BlackHole 2ch".into(), "MacBook Speakers".into()];
+        assert_eq!(match_device_by_substring(&names, None), None);
+    }
+
+    #[test]
+    fn match_device_empty_substring_returns_none() {
+        let names: Vec<String> = vec!["BlackHole 2ch".into()];
+        assert_eq!(match_device_by_substring(&names, Some("")), None);
+        assert_eq!(match_device_by_substring(&names, Some("   ")), None);
+    }
+
+    #[test]
+    fn match_device_case_insensitive_first_match() {
+        let names: Vec<String> = vec![
+            "MacBook Pro Speakers".into(),
+            "BlackHole 2ch".into(),
+            "External Headphones".into(),
+        ];
+        assert_eq!(match_device_by_substring(&names, Some("blackhole")), Some(1));
+        assert_eq!(match_device_by_substring(&names, Some("BLACK")), Some(1));
+        assert_eq!(match_device_by_substring(&names, Some("MacBook")), Some(0));
+    }
+
+    #[test]
+    fn match_device_no_match_returns_none() {
+        let names: Vec<String> = vec!["MacBook Speakers".into(), "AirPods".into()];
+        assert_eq!(
+            match_device_by_substring(&names, Some("XX_NONEXISTENT_DEVICE_XX")),
+            None
+        );
+    }
+
+    #[test]
+    fn match_device_handles_empty_list() {
+        let names: Vec<String> = Vec::new();
+        assert_eq!(match_device_by_substring(&names, Some("anything")), None);
+        assert_eq!(match_device_by_substring(&names, None), None);
+    }
+
+    #[test]
+    fn match_device_returns_first_of_multiple_matches() {
+        let names: Vec<String> = vec![
+            "BlackHole 2ch".into(),
+            "BlackHole 16ch".into(),
+            "BlackHole 64ch".into(),
+        ];
+        assert_eq!(match_device_by_substring(&names, Some("blackhole")), Some(0));
+    }
+
+    // The following 3 tests hit live cpal enumeration. CoreAudio is not
+    // reliably safe to call from a cargo unit-test thread on some macOS
+    // hosts (observed SIGSEGV on enumerate). Gated `#[ignore]` so they're
+    // available for manual verification but don't break the matrix. The
+    // pure-function tests above cover the selection logic itself.
+
+    #[test]
+    #[ignore = "cpal enumeration segfaults in macOS unit-test threads; run via --ignored on dev box"]
+    fn pick_output_device_returns_default_for_none_substring() {
+        let host = cpal::default_host();
+        if host.default_output_device().is_none() {
+            return;
+        }
+        let (_dev, sel) = pick_output_device(&host, None).expect("pick");
+        assert_eq!(sel, OutputDeviceSelection::Default);
+    }
+
+    #[test]
+    #[ignore = "cpal enumeration segfaults in macOS unit-test threads; run via --ignored on dev box"]
+    fn pick_output_device_fallback_on_no_match() {
+        let host = cpal::default_host();
+        if host.default_output_device().is_none() {
+            return;
+        }
+        let (_dev, sel) =
+            pick_output_device(&host, Some("XX_NONEXISTENT_DEVICE_XX_42")).expect("pick");
+        assert_eq!(sel, OutputDeviceSelection::Fallback);
+    }
+
+    #[test]
+    #[ignore = "cpal enumeration segfaults in macOS unit-test threads; run via --ignored on dev box"]
+    fn enumerate_output_devices_returns_vec_without_error() {
+        let host = cpal::default_host();
+        let names = enumerate_output_devices(&host);
+        for n in &names {
+            assert!(!n.is_empty());
+        }
+    }
 
     // We can't actually open a real audio device in CI, but we can
     // unit-test the alloc-free + correctness contract on the mixer +

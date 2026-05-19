@@ -118,6 +118,21 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Optional output-device override for the livestream / virtual-loopback
+    // use case (issue #111). Setting `HYPEHOUSE_OUTPUT_DEVICE` to a fragment
+    // of a cpal device name (e.g. `BlackHole`, `VB-Cable`, `pipewire-loopback`)
+    // routes the engine's master mix into a virtual sink so OBS / Twitch can
+    // capture lossless audio without screen-share loopback. Empty string =
+    // ignore. Bad fragment = log warn + fall back to host default.
+    let output_device_env = std::env::var("HYPEHOUSE_OUTPUT_DEVICE").ok();
+    let output_device_arg = output_device_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(name) = output_device_arg {
+        info!(substring = %name, "honouring HYPEHOUSE_OUTPUT_DEVICE override");
+    }
+
     // Spawn the audio thread (cpal stream). Holds the stream alive
     // for the duration of `main`. The mixer carries an Arc clone of
     // the decode service so cpal's callback can pull stereo frames.
@@ -126,6 +141,7 @@ async fn main() -> Result<()> {
         clock.shared.clone(),
         Arc::clone(&decode_service),
         recorder_sink,
+        output_device_arg,
     )?;
     info!(
         sample_rate = stream.sample_rate,
