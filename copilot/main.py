@@ -18,6 +18,7 @@ import signal
 import sys
 from pathlib import Path
 
+from .cloud_sync import SyncDaemon
 from .cloud_sync.bootstrap import (
     bootstrap_pull,
     bootstrap_push,
@@ -115,8 +116,13 @@ async def _run(args: argparse.Namespace) -> int:
     bootstrap_pull(sync_client, library=library, logger=log)
     # Drain any locally-queued upserts back to the cloud. Best-effort
     # — on a transport error remaining ids stay queued for the next
-    # restart / sync tick. (Periodic background sync lands in slice 6.)
+    # tick.
     bootstrap_push(sync_client, library, logger=log)
+    # Spin up the background sync daemon — pull + push every
+    # HYPEHOUSE_SYNC_TICK_SECONDS (default 60). Daemon thread, dies
+    # with the process; explicit .stop() in the finally block.
+    sync_daemon = SyncDaemon.from_env(sync_client, args.library_db, logger=log)
+    sync_daemon.start()
     service = CoPilotService(
         library,
         engine_ws_url=args.engine_ws,
@@ -164,6 +170,7 @@ async def _run(args: argparse.Namespace) -> int:
                 return 1
         return 0
     finally:
+        sync_daemon.stop()
         library.close()
 
 
