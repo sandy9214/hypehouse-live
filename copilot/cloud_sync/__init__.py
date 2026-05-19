@@ -58,11 +58,13 @@ from .client import (
     SyncClient,
     SyncError,
 )
+from .daemon import DEFAULT_TICK_SECONDS, SyncDaemon
 from .supabase import SupabaseSyncClient
 from .syncer import ConflictOutcome, LibrarySyncer, PullResult, PushResult
 
 __all__ = [
     "ConflictOutcome",
+    "DEFAULT_TICK_SECONDS",
     "InMemorySyncClient",
     "LibrarySyncer",
     "PullResult",
@@ -70,5 +72,6 @@ __all__ = [
     "RemoteTrack",
     "SupabaseSyncClient",
     "SyncClient",
+    "SyncDaemon",
     "SyncError",
 ]
