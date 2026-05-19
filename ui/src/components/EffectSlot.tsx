@@ -10,7 +10,7 @@
 // The engine reducer is the source of truth — we read `effects[slot]`
 // from props for display and never store local control state.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, JSX, ChangeEvent } from "react";
 import type { JsonRpcWS } from "../ws/client";
 import type { DeckId, EffectSlotState } from "../store/engine";
@@ -117,12 +117,32 @@ const countdownStyle: CSSProperties = {
 const ONE_SHOT_BEAT_PRESETS: ReadonlyArray<number> = [1, 4, 8, 16];
 
 /**
- * Live wall-clock micros. `Date.now() * 1000` is close enough — the
- * engine's `ts_micros` is also `SystemTime::now()` based, not the
- * audio clock, so the two share an origin. ±1ms drift is acceptable
- * for a UI countdown.
+ * Anchored monotonic clock — pairs `performance.now()` (monotonic,
+ * sub-ms) with a `Date.now()` epoch so the rAF tick stays smooth +
+ * jump-free while the displayed value is still in the same scale as
+ * the engine's wall-clock `ts_micros`. See issue #130.
  */
-const wallClockMicros = (): number => Date.now() * 1000;
+interface ClockAnchor {
+  perfMs: number;
+  dateMs: number;
+}
+
+const hasPerf = typeof performance !== "undefined" && typeof performance.now === "function";
+
+const sampleAnchor = (): ClockAnchor => ({
+  perfMs: hasPerf ? performance.now() : 0,
+  dateMs: Date.now(),
+});
+
+/**
+ * Compute current wall-clock micros from the anchor without taking a
+ * fresh `Date.now()` reading — the perf clock is monotonic so this
+ * absorbs NTP jumps + manual time-set within one re-anchor window.
+ */
+const wallClockMicrosFromAnchor = (anchor: ClockAnchor): number => {
+  const elapsed = hasPerf ? performance.now() - anchor.perfMs : 0;
+  return (anchor.dateMs + elapsed) * 1000;
+};
 
 const submit = (
   client: JsonRpcWS,
@@ -163,20 +183,34 @@ export const EffectSlot = ({
   const onOneShot = (beats: number): void =>
     submit(client, { EffectOneShot: { deck, slot, beats } });
 
-  // Live wall-clock countdown for an in-flight one-shot. Re-render at
-  // 60 fps via a tiny rAF tick — cheap (one tick per active slot only;
-  // unset → effect short-circuits before the ref is even installed).
+  // Live countdown for an in-flight one-shot. Uses an anchored
+  // `performance.now()` so the rAF tick is monotonic + sub-ms.
+  // The anchor itself re-syncs every 500 ms from `Date.now()` so a
+  // long-running tab eventually picks up any NTP correction.
   const oneShot = state.one_shot ?? null;
-  const [nowUs, setNowUs] = useState(wallClockMicros);
+  const anchorRef = useRef<ClockAnchor>(sampleAnchor());
+  const [nowUs, setNowUs] = useState((): number =>
+    wallClockMicrosFromAnchor(anchorRef.current),
+  );
   useEffect((): (() => void) | void => {
     if (!oneShot) return;
+    // Fresh anchor on each new one-shot — the start of a fresh
+    // engagement is the right moment to align with the engine's
+    // wall clock.
+    anchorRef.current = sampleAnchor();
     let raf = 0;
+    const resyncTimer = setInterval((): void => {
+      anchorRef.current = sampleAnchor();
+    }, 500);
     const tick = (): void => {
-      setNowUs(wallClockMicros());
+      setNowUs(wallClockMicrosFromAnchor(anchorRef.current));
       raf = requestAnimationFrame(tick);
     };
     tick();
-    return (): void => cancelAnimationFrame(raf);
+    return (): void => {
+      cancelAnimationFrame(raf);
+      clearInterval(resyncTimer);
+    };
   }, [oneShot]);
   const remainingMs = oneShot
     ? Math.max(0, Math.round((oneShot.ends_at_micros - nowUs) / 1000))
