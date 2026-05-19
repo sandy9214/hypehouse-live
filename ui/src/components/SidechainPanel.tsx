@@ -20,6 +20,12 @@ import { Button } from "./Button";
 export interface SidechainPanelProps {
   readonly client: JsonRpcWS;
   readonly state?: SidechainConfig | null;
+  /**
+   * Live gain reduction (dB) from the engine's audio-thread side-channel
+   * atomic, exposed via `engine.state_changed.sidechain_gain_reduction_db`.
+   * `<= 0` while ducking; `0` when bypassed. Drives the vertical meter.
+   */
+  readonly grDb?: number;
 }
 
 const containerStyle: CSSProperties = {
@@ -59,6 +65,42 @@ const triggerBtnStyle: CSSProperties = {
   fontSize: 11,
 };
 
+/** Visual ceiling for the GR meter. Compressor reduction past -24 dB
+ *  is far outside normal DJ ducking depth — clamp the bar so the
+ *  common 0..-12 dB range fills the meter usefully. */
+const METER_MIN_DB = -24;
+const METER_HEIGHT = 60;
+
+const meterContainerStyle: CSSProperties = {
+  position: "relative",
+  width: 14,
+  height: METER_HEIGHT,
+  background: "#181818",
+  border: "1px solid #2a2a2a",
+  borderRadius: 2,
+  overflow: "hidden",
+  alignSelf: "flex-end",
+};
+
+const meterScaleStyle: CSSProperties = {
+  fontSize: 9,
+  color: "#666",
+  display: "flex",
+  flexDirection: "column",
+  justifyContent: "space-between",
+  height: METER_HEIGHT,
+  marginLeft: 4,
+  alignSelf: "flex-end",
+};
+
+const meterLabelStyle: CSSProperties = {
+  fontSize: 9,
+  color: "#888",
+  letterSpacing: 0.5,
+  marginRight: 4,
+  alignSelf: "flex-end",
+};
+
 const submit = (
   client: JsonRpcWS,
   payload: Record<string, unknown>,
@@ -69,8 +111,17 @@ const submit = (
 export const SidechainPanel = ({
   client,
   state,
+  grDb,
 }: SidechainPanelProps): JSX.Element => {
   const cfg = state ?? DEFAULT_SIDECHAIN;
+  // Clamp GR into [METER_MIN_DB, 0] then map to a 0..1 bar fraction.
+  // `grDb` undefined / NaN → empty meter.
+  const grClamped =
+    typeof grDb === "number" && Number.isFinite(grDb)
+      ? Math.max(METER_MIN_DB, Math.min(0, grDb))
+      : 0;
+  const meterFraction = Math.min(1, -grClamped / -METER_MIN_DB);
+  const meterFillPx = Math.round(meterFraction * METER_HEIGHT);
 
   const onToggle = (): void =>
     submit(client, {
@@ -144,6 +195,30 @@ export const SidechainPanel = ({
       </div>
 
       <div style={knobRowStyle}>
+        <span style={meterLabelStyle}>GR</span>
+        <div
+          style={meterContainerStyle}
+          data-testid="sidechain-gr-meter"
+          aria-label="Sidechain gain reduction"
+          title={`${grClamped.toFixed(1)} dB`}
+        >
+          <div
+            data-testid="sidechain-gr-meter-fill"
+            style={{
+              position: "absolute",
+              left: 0,
+              right: 0,
+              top: 0,
+              height: meterFillPx,
+              background: "linear-gradient(180deg, #e0a800, #b34700)",
+            }}
+          />
+        </div>
+        <div style={meterScaleStyle}>
+          <span>0</span>
+          <span>-12</span>
+          <span>-24</span>
+        </div>
         <Knob
           label="Thr"
           min={-60}

@@ -93,7 +93,11 @@ export const App = (): JSX.Element => {
         <OutputDevicePicker client={client} />
       </aside>
       <aside aria-label="Sidechain compressor" style={{ padding: "0.5rem 0" }}>
-        <SidechainPanel client={client} state={engineState.sidechain ?? null} />
+        <SidechainPanel
+          client={client}
+          state={engineState.sidechain ?? null}
+          grDb={engineState.sidechain_gain_reduction_db}
+        />
       </aside>
       <Toaster />
       {showWizard && (

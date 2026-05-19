@@ -110,4 +110,53 @@ describe("SidechainPanel", () => {
       screen.getByTestId("sidechain-trigger-B").getAttribute("aria-pressed"),
     ).toBe("true");
   });
+
+  it("GR meter empty when grDb is 0 or undefined", () => {
+    const { rerender } = render(
+      <SidechainPanel client={makeClient().client} state={defaultState} />,
+    );
+    const fill = screen.getByTestId("sidechain-gr-meter-fill") as HTMLDivElement;
+    expect(fill.style.height).toBe("0px");
+    rerender(
+      <SidechainPanel client={makeClient().client} state={defaultState} grDb={0} />,
+    );
+    expect(fill.style.height).toBe("0px");
+  });
+
+  it("GR meter fills proportional to dB reduction", () => {
+    render(
+      <SidechainPanel
+        client={makeClient().client}
+        state={defaultState}
+        grDb={-12}
+      />,
+    );
+    const fill = screen.getByTestId("sidechain-gr-meter-fill") as HTMLDivElement;
+    // METER_HEIGHT=60, METER_MIN_DB=-24 → -12 is half → 30 px
+    expect(fill.style.height).toBe("30px");
+  });
+
+  it("GR meter clamps reduction past -24 dB to full", () => {
+    render(
+      <SidechainPanel
+        client={makeClient().client}
+        state={defaultState}
+        grDb={-48}
+      />,
+    );
+    const fill = screen.getByTestId("sidechain-gr-meter-fill") as HTMLDivElement;
+    expect(fill.style.height).toBe("60px");
+  });
+
+  it("GR meter ignores positive / non-finite values", () => {
+    render(
+      <SidechainPanel
+        client={makeClient().client}
+        state={defaultState}
+        grDb={Number.NaN}
+      />,
+    );
+    const fill = screen.getByTestId("sidechain-gr-meter-fill") as HTMLDivElement;
+    expect(fill.style.height).toBe("0px");
+  });
 });
