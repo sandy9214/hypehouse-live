@@ -169,6 +169,57 @@ describe("WebMIDIListener", () => {
     expect(warn).toHaveBeenCalled();
   });
 
+  it("applyMapping hot-swaps the binding index without restarting access", async () => {
+    const rpc = makeRpc(true);
+    const listener = new WebMIDIListener(rpc);
+    const access = makeFakeAccess([]);
+    Object.defineProperty(globalThis, "navigator", {
+      value: { requestMIDIAccess: vi.fn().mockResolvedValue(access) },
+      configurable: true,
+    });
+    await listener.start("ddj200");
+
+    // Built-in ddj200 maps ch0 note 0x0B → Deck A play_pause.
+    listener.onMessage(msg(0x90, 0x0b, 100));
+    expect(rpc.calls).toHaveLength(1);
+    expect(rpc.calls[0]![1]).toEqual({ DeckPlay: { deck: "A" } });
+
+    // Swap to a custom mapping that puts the same note on Deck B.
+    const swap = listener.applyMapping({
+      id: "custom",
+      bindings: [
+        { noteOn: { channel: 0, note: 0x0b }, action: "play_pause", deck: "B" },
+      ],
+    });
+    expect(swap.ok).toBe(true);
+    expect(listener.currentMapping?.id).toBe("custom");
+
+    listener.onMessage(msg(0x90, 0x0b, 100));
+    expect(rpc.calls).toHaveLength(2);
+    expect(rpc.calls[1]![1]).toEqual({ DeckPlay: { deck: "B" } });
+  });
+
+  it("applyMapping rejects invalid blobs and preserves the prior mapping", async () => {
+    const rpc = makeRpc(true);
+    const listener = new WebMIDIListener(rpc);
+    const access = makeFakeAccess([]);
+    Object.defineProperty(globalThis, "navigator", {
+      value: { requestMIDIAccess: vi.fn().mockResolvedValue(access) },
+      configurable: true,
+    });
+    await listener.start("ddj200");
+
+    const before = listener.currentMapping;
+    const result = listener.applyMapping({ id: "bad", bindings: [{ action: "boom" }] });
+    expect(result.ok).toBe(false);
+    expect(listener.currentMapping).toBe(before);
+
+    // Original mapping still routes events correctly.
+    listener.onMessage(msg(0x90, 0x0b, 100));
+    expect(rpc.calls).toHaveLength(1);
+    expect(rpc.calls[0]![1]).toEqual({ DeckPlay: { deck: "A" } });
+  });
+
   it("flushes buffered events once WS opens", async () => {
     // RPC starts closed, then flips open before flush().
     let open = false;
