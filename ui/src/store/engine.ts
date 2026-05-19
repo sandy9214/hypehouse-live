@@ -226,6 +226,14 @@ export interface EngineState {
    */
   master_limiter_gain_reduction_db: number;
   /**
+   * Live sidechain compressor gain reduction in dB at the moment the
+   * last `engine.state_changed` notification was published. Same
+   * side-channel atomic pattern as `master_limiter_gain_reduction_db`.
+   * `0` when sidechain is bypassed; `<= 0` while ducking. Drives the
+   * SidechainPanel meter (#119 follow-up).
+   */
+  sidechain_gain_reduction_db: number;
+  /**
    * Active tempo source at the moment the last `engine.state_changed`
    * notification was published. Like `master_limiter_gain_reduction_db`
    * this is a live audio-thread measurement (sourced from the engine's
@@ -282,6 +290,7 @@ const emptyEngineState = (): EngineState => ({
   master_limiter_enabled: true,
   master_limiter_threshold_db: DEFAULT_MASTER_LIMITER_THRESHOLD_DB,
   master_limiter_gain_reduction_db: 0,
+  sidechain_gain_reduction_db: 0,
   clock_source: "internal",
   sidechain: DEFAULT_SIDECHAIN,
 });
@@ -393,6 +402,9 @@ interface StateChangedPayload {
   state?: Partial<EngineState>;
   last_event_id?: number;
   master_limiter_gain_reduction_db?: number;
+  /** Sidechain compressor GR mirror — same audio-thread atomic
+   * envelope as `master_limiter_gain_reduction_db`. #119. */
+  sidechain_gain_reduction_db?: number;
   /** Sibling field — see `ClockSource` jsdoc. Engine emits the
    * kebab-case label; `normaliseClockSource` defends the mirror
    * against unknown variants. */
@@ -438,6 +450,11 @@ const mergeState = (
     typeof payload.master_limiter_gain_reduction_db === "number"
       ? payload.master_limiter_gain_reduction_db
       : prev.master_limiter_gain_reduction_db;
+  // Same envelope path for the sidechain compressor GR — #119 follow-up.
+  const sc_gr =
+    typeof payload.sidechain_gain_reduction_db === "number"
+      ? payload.sidechain_gain_reduction_db
+      : prev.sidechain_gain_reduction_db;
   // `clock_source` also rides on the envelope. Omitted = stick with
   // previous value so older engines (pre-this-PR) don't reset the
   // badge on every push.
@@ -464,6 +481,7 @@ const mergeState = (
     master_limiter_threshold_db:
       patch.master_limiter_threshold_db ?? prev.master_limiter_threshold_db,
     master_limiter_gain_reduction_db: gr,
+    sidechain_gain_reduction_db: sc_gr,
     clock_source: source,
   };
 };
