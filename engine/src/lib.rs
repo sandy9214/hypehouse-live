@@ -14,6 +14,7 @@ pub mod audio;
 pub mod bridge;
 pub mod clock_sync;
 pub mod midi;
+pub mod oneshot_sweeper;
 pub mod persistence;
 pub mod recording;
 pub mod state;

@@ -310,6 +310,13 @@ async fn main() -> Result<()> {
         info!("decode-failure drain task skipped (service exposes no sidechannel)");
     }
 
+    // One-shot auto-disengage sweeper (issue #118 final). Holds the
+    // handle alive for the lifetime of `main` so the daemon thread
+    // joins on graceful shutdown. Polls the engine snapshot at
+    // ~50 Hz; idle when no one-shots are in flight.
+    let _oneshot_sweeper = hypehouse_engine::oneshot_sweeper::spawn_oneshot_sweeper(engine.clone());
+    info!("one-shot auto-disengage sweeper started");
+
     let config = bridge::BridgeConfig::from_env();
     let server = bridge::spawn(config, engine).await?;
     info!(addr = %server.local_addr, "ws bridge ready");

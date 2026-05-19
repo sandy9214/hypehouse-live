@@ -437,6 +437,28 @@ impl EngineHandle {
         self.inner.event_sink.is_some()
     }
 
+    /// Stamp a fresh `Event` from `kind` + `source` using the engine's
+    /// monotonic id counter + wall clock. Helper for control-thread
+    /// daemons (one-shot auto-disengage sweeper, retention pruner) that
+    /// need to inject synthetic events into the event stream while
+    /// keeping the log monotonic.
+    pub fn stamp_event(&self, kind: EventKind, source: EventSource) -> Event {
+        let id = self
+            .inner
+            .next_event_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let ts_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        Event {
+            id,
+            ts_micros,
+            source,
+            kind,
+        }
+    }
+
     /// Forward `event` onto the control-loop channel without blocking.
     /// Returns:
     /// * `Ok(())` on accept,

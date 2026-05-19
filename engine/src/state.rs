@@ -79,8 +79,17 @@ pub enum CrossfaderCurve {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum EventSource {
     Ui,
-    Midi { device: String, mapping: String },
+    Midi {
+        device: String,
+        mapping: String,
+    },
     Copilot,
+    /// Engine-internal synthetic event — emitted by control-thread
+    /// daemons (one-shot auto-disengage sweeper, retention pruner,
+    /// future timers). Distinguished from `Ui` / `Copilot` so log
+    /// readers + audit tooling can filter machine-generated events
+    /// out of "user history" views. See #118.
+    Internal,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
