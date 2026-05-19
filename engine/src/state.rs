@@ -348,6 +348,27 @@ pub enum EventKind {
         deck: DeckId,
         slot: u8,
     },
+    /// ADR-006 — momentary effect activation ("beat-FX one-shot",
+    /// industry-standard pattern: push button → effect engages for N
+    /// beats → auto-disengages).
+    ///
+    /// Reducer steps: (1) snapshot `was_enabled = enabled`; (2) force
+    /// `enabled = true`; (3) compute `ends_at_micros =
+    /// event.ts_micros + beats * beat_period_ms * 1000` from this
+    /// deck's `beat_period_ms` (500 ms fallback when no grid);
+    /// (4) store `(was_enabled, ends_at_micros)` on the slot.
+    ///
+    /// The auto-disengage itself is scheduled by the control loop /
+    /// audio path in a follow-up PR; this slice ships the schema +
+    /// reducer state so the UI can render the countdown without
+    /// waiting on audio plumbing. `beats` is clamped to `1..=64` —
+    /// any out-of-range value is treated as `1` (defensive default
+    /// for hostile / typo input).
+    EffectOneShot {
+        deck: DeckId,
+        slot: u8,
+        beats: u8,
+    },
     CopilotEngage {
         deck: DeckId,
     },
@@ -526,6 +547,35 @@ pub struct EffectSlot {
     /// deserialize cleanly via `#[serde(default)]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lfo: Option<crate::audio::effects::LfoConfig>,
+    /// Beat-FX one-shot scheduled disengage. `Some({ ends_at_micros,
+    /// was_enabled })` while a momentary activation is in flight (set
+    /// by `EventKind::EffectOneShot`).
+    ///
+    /// Cleared when (a) the audio thread / control loop reaches
+    /// `ends_at_micros` — follow-up PR; currently a UI-only countdown;
+    /// or (b) any subsequent `EffectEnable`, `EffectAssign`, or
+    /// `EffectClear` on the same slot supersedes the one-shot.
+    ///
+    /// Wire-compat: `#[serde(default)]` so old snapshots without this
+    /// field deserialize cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub one_shot: Option<OneShotState>,
+}
+
+/// Active beat-FX one-shot — scheduled auto-disengage of an effect
+/// slot. See [`EventKind::EffectOneShot`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct OneShotState {
+    /// Wall-clock micros (since UNIX epoch, same scale as `Event.ts_micros`)
+    /// at which the slot should auto-disengage. Computed in the reducer
+    /// as `event.ts_micros + beats * beat_period_ms * 1000`. Compared
+    /// by the control loop / audio path against the engine's monotonic
+    /// micros counter in a follow-up PR.
+    pub ends_at_micros: i64,
+    /// What `enabled` was BEFORE the one-shot engaged. Restored when
+    /// the one-shot ends. Lets a one-shot leave a previously-off slot
+    /// off after firing.
+    pub was_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -751,6 +801,11 @@ impl EngineState {
                         // something different. Clear it; UI re-attaches
                         // via a fresh `EffectLfoSet` event.
                         lfo: None,
+                        // A pending one-shot was scheduled against the
+                        // *old* effect; clearing it avoids the
+                        // (was_enabled=false, slot just got reassigned)
+                        // resurrection edge case when the timer fires.
+                        one_shot: None,
                     };
                 }
             }
@@ -785,6 +840,10 @@ impl EngineState {
             } => {
                 if let Some(s) = next.deck_mut(*id).effects.get_mut(*slot as usize) {
                     s.enabled = *enabled;
+                    // Explicit enable/disable supersedes any in-flight
+                    // one-shot — clear the scheduled disengage so the
+                    // user's choice persists past the original end time.
+                    s.one_shot = None;
                 }
             }
             EventKind::EffectSwapSlots {
@@ -830,6 +889,42 @@ impl EngineState {
             EventKind::EffectLfoClear { deck: id, slot } => {
                 if let Some(s) = next.deck_mut(*id).effects.get_mut(*slot as usize) {
                     s.lfo = None;
+                }
+            }
+            EventKind::EffectOneShot {
+                deck: id,
+                slot,
+                beats,
+            } => {
+                let d = next.deck_mut(*id);
+                let beat_period_ms = d.beat_period_ms;
+                // Clamp to a sane range — 0 / very large beats would be
+                // either degenerate or wedge the slot in "permanently
+                // engaged" for tens of seconds. 1..=64 covers every
+                // industry-standard preset (1 / 2 / 4 / 8 / 16 / 32 / 64).
+                let beats_clamped = (*beats).clamp(1, 64) as i64;
+                if let Some(s) = d.effects.get_mut(*slot as usize) {
+                    if s.effect_id == 0 {
+                        // Empty slot — nothing to engage.
+                    } else {
+                        // Fall back to a fixed 500 ms duration when the
+                        // deck has no beat grid yet (track not analyzed
+                        // / unloaded). 500 ms ≈ one beat at 120 BPM —
+                        // industry-default "no-grid" preset.
+                        let per_beat_us = if beat_period_ms > 0.0 {
+                            (f64::from(beat_period_ms) * 1000.0) as i64
+                        } else {
+                            500_000
+                        };
+                        let duration_us = per_beat_us.saturating_mul(beats_clamped);
+                        let ends_at_micros = ev.ts_micros.saturating_add(duration_us);
+                        let was_enabled = s.enabled;
+                        s.enabled = true;
+                        s.one_shot = Some(OneShotState {
+                            ends_at_micros,
+                            was_enabled,
+                        });
+                    }
                 }
             }
             EventKind::DeckPlay { deck: id } => {
@@ -1857,6 +1952,273 @@ mod tests {
         assert_eq!(s.deck_b.effects[0].effect_id, 4);
         assert_eq!(s.deck_b.effects[1].effect_id, 0);
         assert_eq!(s.deck_b.effects[2].effect_id, 0);
+    }
+
+    // -------- EffectOneShot (#118 — beat-FX momentary engage) --------
+
+    fn ev_with_ts(id: u64, ts_micros: i64, kind: EventKind) -> Event {
+        Event {
+            id,
+            ts_micros,
+            source: EventSource::Ui,
+            kind,
+        }
+    }
+
+    fn assigned_state(effect_id: u32, enabled: bool, bpm: f32) -> EngineState {
+        // Seed: a DeckLoad sets beat_period_ms via bpm, then an
+        // EffectAssign primes slot 0 with the desired effect, then we
+        // override `enabled` to the test's preferred starting value.
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::DeckLoad {
+                deck: DeckId::A,
+                track: TrackRef {
+                    id: "t".to_string(),
+                    path: "/tmp/t.mp3".to_string(),
+                },
+                bpm,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![],
+                hot_cues: default_hot_cues(),
+                track_gain_db: 0.0,
+            },
+        ));
+        let s = s.apply(&ev(
+            2,
+            EventKind::EffectAssign {
+                deck: DeckId::A,
+                slot: 0,
+                effect_id,
+            },
+        ));
+        let mut s = s.apply(&ev(
+            3,
+            EventKind::EffectEnable {
+                deck: DeckId::A,
+                slot: 0,
+                enabled,
+            },
+        ));
+        // Re-clear the implicit one_shot left by the assign path (none
+        // was set, but keep it explicit for readability).
+        s.deck_a.effects[0].one_shot = None;
+        s
+    }
+
+    #[test]
+    fn effect_one_shot_engages_and_schedules_disengage() {
+        // BPM 120 → beat_period_ms = 500. 4 beats = 2000 ms = 2_000_000 us.
+        let s = assigned_state(1, false, 120.0);
+        assert!(!s.deck_a.effects[0].enabled);
+        let s = s.apply(&ev_with_ts(
+            10,
+            1_000_000,
+            EventKind::EffectOneShot {
+                deck: DeckId::A,
+                slot: 0,
+                beats: 4,
+            },
+        ));
+        let slot = &s.deck_a.effects[0];
+        assert!(slot.enabled, "one-shot must engage the slot");
+        let os = slot.one_shot.expect("one_shot must be set");
+        assert!(!os.was_enabled);
+        assert_eq!(os.ends_at_micros, 1_000_000 + 4 * 500_000);
+    }
+
+    #[test]
+    fn effect_one_shot_preserves_previously_enabled_flag() {
+        let s = assigned_state(1, true, 120.0);
+        let s = s.apply(&ev_with_ts(
+            10,
+            2_000_000,
+            EventKind::EffectOneShot {
+                deck: DeckId::A,
+                slot: 0,
+                beats: 2,
+            },
+        ));
+        let os = s.deck_a.effects[0].one_shot.expect("one_shot set");
+        assert!(os.was_enabled, "must remember slot was already enabled");
+        assert!(s.deck_a.effects[0].enabled);
+    }
+
+    #[test]
+    fn effect_one_shot_clamps_beats_to_64() {
+        let s = assigned_state(1, false, 120.0);
+        let s = s.apply(&ev_with_ts(
+            10,
+            0,
+            EventKind::EffectOneShot {
+                deck: DeckId::A,
+                slot: 0,
+                beats: 200,
+            },
+        ));
+        let os = s.deck_a.effects[0].one_shot.unwrap();
+        // 64 beats × 500 ms = 32 s = 32_000_000 us.
+        assert_eq!(os.ends_at_micros, 32_000_000);
+    }
+
+    #[test]
+    fn effect_one_shot_clamps_zero_beats_to_one() {
+        let s = assigned_state(1, false, 120.0);
+        let s = s.apply(&ev_with_ts(
+            10,
+            0,
+            EventKind::EffectOneShot {
+                deck: DeckId::A,
+                slot: 0,
+                beats: 0,
+            },
+        ));
+        let os = s.deck_a.effects[0].one_shot.unwrap();
+        assert_eq!(os.ends_at_micros, 500_000); // 1 beat at 120 BPM
+    }
+
+    #[test]
+    fn effect_one_shot_on_empty_slot_is_noop() {
+        let s = EngineState::default();
+        // No effect assigned (effect_id == 0 on slot 0).
+        let s = s.apply(&ev_with_ts(
+            5,
+            0,
+            EventKind::EffectOneShot {
+                deck: DeckId::A,
+                slot: 0,
+                beats: 4,
+            },
+        ));
+        assert!(s.deck_a.effects[0].one_shot.is_none());
+        assert!(!s.deck_a.effects[0].enabled);
+    }
+
+    #[test]
+    fn effect_one_shot_no_beat_grid_falls_back_to_500ms_per_beat() {
+        // Skip DeckLoad — leave beat_period_ms at 0. EffectAssign still
+        // primes the slot.
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::EffectAssign {
+                deck: DeckId::A,
+                slot: 0,
+                effect_id: 1,
+            },
+        ));
+        assert_eq!(s.deck_a.beat_period_ms, 0.0);
+        let s = s.apply(&ev_with_ts(
+            2,
+            0,
+            EventKind::EffectOneShot {
+                deck: DeckId::A,
+                slot: 0,
+                beats: 2,
+            },
+        ));
+        let os = s.deck_a.effects[0].one_shot.unwrap();
+        // 2 beats × 500 ms fallback = 1_000_000 us.
+        assert_eq!(os.ends_at_micros, 1_000_000);
+    }
+
+    #[test]
+    fn effect_enable_supersedes_in_flight_one_shot() {
+        // After a one-shot is set, an explicit EffectEnable must clear
+        // the scheduled disengage so the user's choice wins.
+        let s = assigned_state(1, false, 120.0);
+        let s = s.apply(&ev_with_ts(
+            10,
+            0,
+            EventKind::EffectOneShot {
+                deck: DeckId::A,
+                slot: 0,
+                beats: 4,
+            },
+        ));
+        assert!(s.deck_a.effects[0].one_shot.is_some());
+        let s = s.apply(&ev(
+            11,
+            EventKind::EffectEnable {
+                deck: DeckId::A,
+                slot: 0,
+                enabled: false,
+            },
+        ));
+        assert!(s.deck_a.effects[0].one_shot.is_none());
+        assert!(!s.deck_a.effects[0].enabled);
+    }
+
+    #[test]
+    fn effect_assign_clears_pending_one_shot_on_replaced_slot() {
+        let s = assigned_state(1, true, 120.0);
+        let s = s.apply(&ev_with_ts(
+            10,
+            0,
+            EventKind::EffectOneShot {
+                deck: DeckId::A,
+                slot: 0,
+                beats: 4,
+            },
+        ));
+        assert!(s.deck_a.effects[0].one_shot.is_some());
+        // Re-assigning a fresh effect to the same slot wipes one_shot
+        // so the future-disengage doesn't fire against an unrelated
+        // effect's prior-state snapshot.
+        let s = s.apply(&ev(
+            11,
+            EventKind::EffectAssign {
+                deck: DeckId::A,
+                slot: 0,
+                effect_id: 3,
+            },
+        ));
+        assert!(s.deck_a.effects[0].one_shot.is_none());
+    }
+
+    #[test]
+    fn effect_one_shot_serde_roundtrip_includes_new_fields() {
+        // Wire-compat: ensure the new `OneShotState` field round-trips
+        // through serde_json + an older snapshot (without the field)
+        // still deserializes.
+        let s = assigned_state(1, false, 120.0);
+        let s = s.apply(&ev_with_ts(
+            10,
+            1_000_000,
+            EventKind::EffectOneShot {
+                deck: DeckId::A,
+                slot: 0,
+                beats: 4,
+            },
+        ));
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(json.contains("one_shot"));
+        assert!(json.contains("ends_at_micros"));
+        let s2: EngineState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            s2.deck_a.effects[0].one_shot.unwrap().ends_at_micros,
+            1_000_000 + 4 * 500_000
+        );
+
+        // Older snapshot (synthetic) without `one_shot` field deserialises
+        // cleanly via `#[serde(default)]`.
+        let mut older = serde_json::to_value(EngineState::default()).expect("serialize default");
+        // Strip the field if present (default state.effects[].one_shot is None which
+        // skip_serializing_if drops anyway — but be explicit).
+        if let Some(effects) = older
+            .get_mut("deck_a")
+            .and_then(|d| d.get_mut("effects"))
+            .and_then(|e| e.as_array_mut())
+        {
+            for slot in effects.iter_mut() {
+                if let Some(obj) = slot.as_object_mut() {
+                    obj.remove("one_shot");
+                }
+            }
+        }
+        let _restored: EngineState =
+            serde_json::from_value(older).expect("older snapshot without one_shot");
     }
 
     #[test]
