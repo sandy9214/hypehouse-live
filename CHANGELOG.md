@@ -7,15 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- Output device selection via `HYPEHOUSE_OUTPUT_DEVICE` env var — software-only
-  livestream support via virtual loopback devices (BlackHole / VB-Cable /
-  pipewire-loopback). Engine routes master mix into a virtual sink so
-  OBS / Twitch can capture lossless audio without screen-share loopback (#113).
+### Added — Engine (Rust)
+- **Sidechain compressor** — engine schema + DSP module + audio-path
+  integration. Reducer-clamped params (threshold / ratio / attack /
+  release / makeup), envelope follower + hard-knee ducker in the
+  mixer's pre-crossfade path. Realtime-safe per ADR-004 — coefficients
+  computed once per render block (#135 / #137 / #138).
+- **Beat-FX one-shot** — `EffectOneShot { deck, slot, beats }` event +
+  `OneShotState` (was_enabled, ends_at_micros, beat_period_ms_at_dispatch).
+  Auto-disengage sweeper daemon polls snapshot at ~50 Hz and emits
+  synthetic `EffectEnable` events tagged `EventSource::Internal`.
+  Frozen beat_period_ms makes the schedule robust to mid-flight grid
+  retunes (#127 / #131 / #132).
+- **Output device selection** — `HYPEHOUSE_OUTPUT_DEVICE` env var routes
+  master mix into a virtual sink (BlackHole / VB-Cable /
+  pipewire-loopback) for software-only OBS/Twitch livestream capture
+  without screen-share loopback. `engine.list_output_devices` WS RPC
+  enumerates available devices for the UI picker (#113 / #115).
+- `EventSource::Internal` variant — distinguishes control-thread daemon
+  events from user / copilot inputs (#132).
+- `EngineHandle::stamp_event(kind, source) -> Event` helper for
+  control-thread daemons that inject synthetic events (#132).
 
-### Tests
-- Widened Windows + macOS shared-CI-runner test tolerances for two flaky
-  catch_unwind tests + the const-time bearer-compare timing smoke check (#109).
+### Added — UI (TypeScript)
+- **Sidechain compressor settings panel** — toggle + trigger-deck switch
+  + 5 param knobs (threshold / ratio / attack / release / makeup), wires
+  to the new engine events (#136).
+- **Hot-cue markers on the waveform** — 8 color-coded Rekordbox-palette
+  buttons overlaid on the scrolling waveform. Tap → jump, right-click →
+  clear, drag (>4 px) → re-set position. ESC cancels in-flight drag
+  (#122 / #134).
+- **Output device picker** — settings dropdown listing engine-reported
+  cpal devices; persists substring to localStorage. Shows
+  "Restart engine to apply" hint when selection differs from active
+  device (#121).
+- **Beat-FX one-shot trigger row** — 1 / 4 / 8 / 16 beat preset buttons
+  inside every assigned effect slot. Click emits `EffectOneShot`; live
+  countdown ticks ms-remaining from `OneShotState.ends_at_micros`
+  (#129).
+- Anchored `performance.now()` countdown clock — monotonic sub-ms tick
+  in the one-shot countdown, re-anchored every 500 ms against
+  `Date.now()` so NTP corrections eventually surface without per-frame
+  drift (#133).
+
+### Changed
+- `WAVEFORM_DEFAULT_WIDTH` / `WAVEFORM_DEFAULT_HEIGHT` exported from
+  `Waveform.tsx` so overlay components (HotCueMarkers) share geometry
+  constants without duplicated magic numbers (#126).
+- `HotCueMarkers` — `activeSlots` memoised so the scroll-mode rAF skips
+  6-7 of 8 iterations when most slots empty. Marker border color
+  extracted to exported `HOTCUE_MARKER_BORDER` for future design-token
+  swap (#139).
+- `EffectEnable` / `EffectAssign` reducer arms clear any in-flight
+  `one_shot` on the affected slot — explicit user toggle supersedes
+  scheduled disengage (#127).
+
+### Tests / CI
+- Env-gated Windows shared-CI test ignores (closes #110): catch_unwind +
+  sidechannel tests skip when `HYPEHOUSE_SHARED_CI_RUNNER=1` is set by
+  the engine-ci workflow. Local Windows dev + self-hosted runners still
+  execute (#116).
+- Drain-via-loop fix for three sibling FP-accumulation flakes in
+  `bridge::ratelimit::tests` — `tokens -= 1.0` × BURST_CAPACITY can
+  leave the bucket slightly above 0 on some FP runtimes (#116 / #127 /
+  #138).
+- Cooperative env-override skip in `burst_allows_capacity_then_denies`
+  to absorb parallel-test races on `RATE_LIMIT_DISABLED_ENV` (#138).
+- Extract Vitest 4 + jsdom 29 localStorage polyfill to a shared
+  `ui/src/test-utils/localStoragePolyfill.ts` helper — removes
+  duplication across 4 test files (#125).
+- Widened Win + macOS shared-CI-runner test tolerances for two flaky
+  catch_unwind tests + const-time bearer-compare timing smoke check
+  (#109).
 
 ## [0.1.0] — 2026-05-19
 
