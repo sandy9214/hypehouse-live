@@ -121,23 +121,24 @@ pub fn pick_output_device(
     host: &cpal::Host,
     substring: Option<&str>,
 ) -> Result<(cpal::Device, OutputDeviceSelection)> {
-    let needle_trimmed = substring
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let needle_trimmed = substring.map(str::trim).filter(|s| !s.is_empty());
 
     if let Some(needle) = needle_trimmed {
         let devices: Vec<cpal::Device> = host
             .output_devices()
             .map_err(|e| anyhow!("cpal output_devices() failed: {e}"))?
             .collect();
-        let names: Vec<String> = devices.iter().map(|d| d.name().unwrap_or_default()).collect();
+        let names: Vec<String> = devices
+            .iter()
+            .map(|d| d.name().unwrap_or_default())
+            .collect();
         if let Some(idx) = match_device_by_substring(&names, Some(needle)) {
             let device = devices.into_iter().nth(idx).expect("idx in range");
             return Ok((device, OutputDeviceSelection::Matched));
         }
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| anyhow!("no default audio output device (and no match for substring '{needle}')"))?;
+        let device = host.default_output_device().ok_or_else(|| {
+            anyhow!("no default audio output device (and no match for substring '{needle}')")
+        })?;
         return Ok((device, OutputDeviceSelection::Fallback));
     }
 
@@ -157,9 +158,7 @@ pub fn pick_output_device(
 /// container without an audio sink); never errors.
 pub fn enumerate_output_devices(host: &cpal::Host) -> Vec<String> {
     match host.output_devices() {
-        Ok(devices) => devices
-            .filter_map(|d| d.name().ok())
-            .collect(),
+        Ok(devices) => devices.filter_map(|d| d.name().ok()).collect(),
         Err(_) => Vec::new(),
     }
 }
@@ -180,9 +179,7 @@ pub fn spawn_audio_thread(
 ) -> Result<AudioStreamHandle> {
     let host = cpal::default_host();
     let (device, selection) = pick_output_device(&host, output_device_substring)?;
-    let device_name = device
-        .name()
-        .unwrap_or_else(|_| "<unnamed>".to_string());
+    let device_name = device.name().unwrap_or_else(|_| "<unnamed>".to_string());
     tracing::info!(
         target: "audio",
         device = %device_name,
@@ -407,7 +404,10 @@ mod tests {
             "BlackHole 2ch".into(),
             "External Headphones".into(),
         ];
-        assert_eq!(match_device_by_substring(&names, Some("blackhole")), Some(1));
+        assert_eq!(
+            match_device_by_substring(&names, Some("blackhole")),
+            Some(1)
+        );
         assert_eq!(match_device_by_substring(&names, Some("BLACK")), Some(1));
         assert_eq!(match_device_by_substring(&names, Some("MacBook")), Some(0));
     }
@@ -435,7 +435,10 @@ mod tests {
             "BlackHole 16ch".into(),
             "BlackHole 64ch".into(),
         ];
-        assert_eq!(match_device_by_substring(&names, Some("blackhole")), Some(0));
+        assert_eq!(
+            match_device_by_substring(&names, Some("blackhole")),
+            Some(0)
+        );
     }
 
     // The following 3 tests hit live cpal enumeration. CoreAudio is not
