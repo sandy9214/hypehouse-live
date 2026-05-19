@@ -307,6 +307,7 @@ async fn handle_client(
                     state,
                     last_event_id,
                     master_limiter_gain_reduction_db,
+                    sidechain_gain_reduction_db,
                     clock_source,
                     perf,
                 }) => {
@@ -314,6 +315,7 @@ async fn handle_client(
                         state.as_ref(),
                         last_event_id,
                         master_limiter_gain_reduction_db,
+                        sidechain_gain_reduction_db,
                         clock_source,
                         perf,
                     );

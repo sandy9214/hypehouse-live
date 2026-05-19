@@ -864,9 +864,28 @@ in-process call that mutates state — audio thread, MIDI listener, etc.).
 {
   "jsonrpc": "2.0",
   "method": "engine.state_changed",
-  "params": { "state": <EngineState>, "last_event_id": 17 }
+  "params": {
+    "state": <EngineState>,
+    "last_event_id": 17,
+    "master_limiter_gain_reduction_db": -0.5,
+    "sidechain_gain_reduction_db": -3.2,
+    "clock_source": "internal",
+    "perf": { "cpu_percent": 12.4, "render_p99_us": 480, "underrun_count": 0 }
+  }
 }
 ```
+
+Live audio-thread side-channel fields (NOT part of the event-sourced
+reducer — sampled from atomics at notification time):
+
+* `master_limiter_gain_reduction_db` — current GR on the master-bus
+  soft-clip limiter. `≤ 0`. Drives the UI master limiter meter.
+* `sidechain_gain_reduction_db` — current GR on the sidechain
+  compressor (#119). `≤ 0` when ducking, `0` when bypassed. Drives
+  the UI ducking meter.
+* `clock_source` — `"internal" | "midi_in" | "ableton_link"`. UI
+  BPM-lock badge keys off this.
+* `perf` — CPU%, render p99 latency, underrun count. UI perf dashboard.
 
 ### `engine.audio_alert`
 

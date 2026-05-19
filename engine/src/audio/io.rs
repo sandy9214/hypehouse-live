@@ -60,6 +60,11 @@ pub struct AudioStreamHandle {
     /// `state_changed` notification to stamp the live GR onto the
     /// payload so the UI meter can render it without polling.
     pub master_limiter_gr: Arc<AtomicI16>,
+    /// Cloneable handle on the sidechain compressor's gain-reduction
+    /// readout. Same read pattern as `master_limiter_gr` — bridge
+    /// thread samples per `state_changed` to drive the UI ducking
+    /// meter (#119 follow-up).
+    pub sidechain_gr: Arc<AtomicI16>,
     /// Audio-thread performance counters (CPU%, render p99, underruns).
     /// The audio callback writes into the shared atomics on every
     /// render via [`PerfMetrics::record_render_ns`]; the bridge thread
@@ -205,6 +210,9 @@ pub fn spawn_audio_thread(
     // populate the `master_limiter_gain_reduction_db` field of every
     // `engine.state_changed` notification (UI meter).
     let master_limiter_gr = mixer.master_limiter_gain_reduction_atomic();
+    // Same pattern for the sidechain compressor's GR readout — grab
+    // the Arc clone before the mixer moves into the cpal callback.
+    let sidechain_gr = mixer.sidechain_gain_reduction_atomic();
 
     // Live perf metrics — one set of atomics shared between the audio
     // callback (writer) and the bridge thread (reader). The cpal config
@@ -262,6 +270,7 @@ pub fn spawn_audio_thread(
         sample_rate,
         channels,
         master_limiter_gr,
+        sidechain_gr,
         perf,
     })
 }
