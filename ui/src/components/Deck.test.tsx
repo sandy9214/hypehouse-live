@@ -36,6 +36,8 @@ const baseDeck = (): DeckState => ({
   hot_cues: [null, null, null, null, null, null, null, null],
   loop_in_ms: null,
   loop_out_ms: null,
+  loop_active: false,
+  beat_period_ms: 0,
   copilot_enabled: false,
   effects: [emptySlot(), emptySlot(), emptySlot()],
   stem_gains: [1, 1, 1, 1],

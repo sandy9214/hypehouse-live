@@ -272,6 +272,27 @@ pub fn event_to_commands_with_errors(
                 kind: AudioCommandKind::LoopDisarm { deck: *deck },
             });
         }
+        EventKind::SetLoopBars { deck, .. } => {
+            // Bar-aware auto-loop. Read the post-reducer loop bounds so
+            // the audio thread + state log agree on the exact in/out
+            // window (including any beat-grid snap the reducer applied).
+            // The reducer no-ops on beat-gridless decks, so a missing
+            // `loop_in_ms` / `loop_out_ms` here just means there's
+            // nothing to arm on the audio side.
+            let d = next.deck_ref(*deck);
+            if d.loop_active {
+                if let (Some(in_ms), Some(out_ms)) = (d.loop_in_ms, d.loop_out_ms) {
+                    out.push(AudioCommand {
+                        at_frame: now_frame,
+                        kind: AudioCommandKind::LoopArm {
+                            deck: *deck,
+                            in_frame: ms_to_frames(in_ms, sample_rate),
+                            out_frame: ms_to_frames(out_ms, sample_rate),
+                        },
+                    });
+                }
+            }
+        }
         EventKind::DeckLoad {
             deck,
             track,

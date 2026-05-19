@@ -100,6 +100,24 @@ export interface Deck {
   hot_cues: ReadonlyArray<number | null>; // length 8
   loop_in_ms: number | null;
   loop_out_ms: number | null;
+  /**
+   * `true` once both `loop_in_ms` and `loop_out_ms` are set + the audio
+   * thread has armed the loop. Mirror of `Deck::loop_active` in
+   * `engine/src/state.rs`. The bar-preset row uses this to highlight
+   * the currently-active preset. Defaults to `false` so a fresh deck
+   * renders with no preset highlighted.
+   */
+  loop_active: boolean;
+  /**
+   * Milliseconds per beat — mirror of `Deck::beat_period_ms`. Used by
+   * the bar-preset row to derive **which** preset (1/2/4/8/16) matches
+   * the current `loop_out_ms - loop_in_ms` length so the active button
+   * can highlight without a separate echo-back from the engine.
+   * `0` when no track is loaded (engine serializes `Deck::beat_period_ms`
+   * as `f32`; a fresh deck has `0.0`). Consumers should treat any
+   * non-positive value as "no beat grid yet".
+   */
+  beat_period_ms: number;
   copilot_enabled: boolean;
   /** Per-deck effects chain (ADR-006). Length 3. */
   effects: readonly [EffectSlotState, EffectSlotState, EffectSlotState];
@@ -186,6 +204,8 @@ const emptyDeck = (id: DeckId): Deck => ({
   hot_cues: [null, null, null, null, null, null, null, null],
   loop_in_ms: null,
   loop_out_ms: null,
+  loop_active: false,
+  beat_period_ms: 0,
   copilot_enabled: false,
   effects: [emptyEffectSlot(), emptyEffectSlot(), emptyEffectSlot()],
   stem_gains: [1, 1, 1, 1],
