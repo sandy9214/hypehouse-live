@@ -18,6 +18,9 @@
 //!   event_log / health still work.
 //! * `-32002` `AUTH_REJECTED` — bearer-token auth missing/wrong (rare;
 //!   handshake usually rejects with HTTP 401 before this code is emitted).
+//! * `-32003` `RATE_LIMITED` — per-client token bucket exhausted on
+//!   `engine.submit_event`. The error `data` field carries
+//!   `{ retry_after_ms: u64 }` so the client can back off.
 
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +36,11 @@ pub const ENGINE_OFFLINE: i32 = -32000;
 pub const ENGINE_SINK_UNWIRED: i32 = -32001;
 /// Application-defined: bearer-token auth missing or wrong.
 pub const AUTH_REJECTED: i32 = -32002;
+/// Application-defined: per-client token bucket on
+/// `engine.submit_event` is exhausted. The `data` field carries
+/// `{ retry_after_ms: u64 }` indicating how long until the next token
+/// regenerates. See `bridge::ratelimit`.
+pub const RATE_LIMITED: i32 = -32003;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct RpcError {
@@ -75,6 +83,17 @@ impl RpcError {
         Self::new(AUTH_REJECTED, "Authentication rejected").with_data(detail.into())
     }
 
+    /// Build a `-32003 RATE_LIMITED` error with the structured
+    /// `{ retry_after_ms }` data payload. Returned when the per-client
+    /// token bucket on `engine.submit_event` is exhausted.
+    pub fn rate_limited(retry_after_ms: u64) -> Self {
+        Self {
+            code: RATE_LIMITED,
+            message: "Rate limited".into(),
+            data: Some(serde_json::json!({ "retry_after_ms": retry_after_ms })),
+        }
+    }
+
     /// Build a `-32000 engine offline` error. Returned when the bridge
     /// could not forward an event onto the control-loop channel (full or
     /// disconnected). Callers may retry after backoff.
@@ -114,6 +133,23 @@ mod tests {
         assert_eq!(ENGINE_OFFLINE, -32000);
         assert_eq!(ENGINE_SINK_UNWIRED, -32001);
         assert_eq!(AUTH_REJECTED, -32002);
+        assert_eq!(RATE_LIMITED, -32003);
+    }
+
+    #[test]
+    fn rate_limited_carries_structured_retry_after_ms() {
+        let e = RpcError::rate_limited(42);
+        assert_eq!(e.code, RATE_LIMITED);
+        assert_eq!(e.message, "Rate limited");
+        let data = e.data.clone().expect("rate_limited carries data");
+        assert_eq!(
+            data.get("retry_after_ms").and_then(|v| v.as_u64()),
+            Some(42),
+            "retry_after_ms field must serialize as a u64 number"
+        );
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("-32003"));
+        assert!(s.contains("retry_after_ms"));
     }
 
     #[test]

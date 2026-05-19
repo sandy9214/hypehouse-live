@@ -130,6 +130,22 @@ async fn ws_submit_event_returns_engine_offline_when_channel_full() {
     // Bounded channel of capacity 1024 — the 1025th submit must trip
     // `-32000 engine offline`. We never drain the receiver so back-pressure
     // is forced.
+    //
+    // The per-client rate limiter (`HYPEHOUSE_RATE_LIMIT_DISABLED`) is
+    // off-path for this test: we're validating the bounded-channel
+    // back-pressure contract, not the limiter. Flip the env override
+    // ON so 1 100 frames flow through without the limiter intercepting.
+    // The bridge reads the env at connection setup (RateLimiter::new()).
+    let prev_rl = std::env::var("HYPEHOUSE_RATE_LIMIT_DISABLED").ok();
+    std::env::set_var("HYPEHOUSE_RATE_LIMIT_DISABLED", "1");
+    // Inner body in a closure so we can always restore the env var,
+    // even if the test panics. `catch_unwind` would force `UnwindSafe`
+    // on a complex async future; do it the explicit-cleanup way.
+    let restore = |prev: Option<String>| match prev {
+        Some(v) => std::env::set_var("HYPEHOUSE_RATE_LIMIT_DISABLED", v),
+        None => std::env::remove_var("HYPEHOUSE_RATE_LIMIT_DISABLED"),
+    };
+
     let (tx, _rx) = channel::bounded::<Event>(1024);
     let engine = EngineHandle::with_event_sink(tx);
     let cfg = BridgeConfig {
@@ -164,6 +180,7 @@ async fn ws_submit_event_returns_engine_offline_when_channel_full() {
             if err.get("code").and_then(|c| c.as_i64()) == Some(-32000) {
                 engine_offline += 1;
             } else {
+                restore(prev_rl.clone());
                 panic!("unexpected error response at id={i}: {err:?}");
             }
         } else {
@@ -181,4 +198,5 @@ async fn ws_submit_event_returns_engine_offline_when_channel_full() {
 
     ws.close(None).await.ok();
     server.shutdown().await.expect("shutdown clean");
+    restore(prev_rl);
 }
