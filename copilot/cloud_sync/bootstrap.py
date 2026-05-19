@@ -66,22 +66,44 @@ def build_sync_client_from_env(
 def bootstrap_pull(
     client: SyncClient,
     *,
+    library: object | None = None,
     logger: Optional[logging.Logger] = None,
     since_micros: int = 0,
 ) -> PullResult:
     """Run one pull and log a per-outcome summary.
 
-    Read-only against the local library — `apply_remote` is a no-op
-    stub today. Slice 4 wires the actual library merge once
-    `TrackLibrary` learns `updated_at_micros`. We still pull so the
-    operator sees the cloud row count in the startup log and can
-    confirm the wire is alive.
+    `library` is an optional `TrackLibrary` (typed as `object` here to
+    avoid the import cycle; the actual contract is the two methods
+    `local_updated_at_micros(track_id) -> int | None` and
+    `upsert_from_remote(**row)`). When provided the syncer's
+    `apply_remote` writes real local rows; when `None` the syncer runs
+    in pull-only-log mode (slice 3 behaviour) so existing tests stay
+    unchanged.
     """
     log = logger or logging.getLogger("copilot.cloud_sync.bootstrap")
+    if library is None:
+        local_updated_at = lambda _id: None  # noqa: E731
+        apply_remote = lambda _row: None  # noqa: E731
+    else:
+        def local_updated_at(track_id: str) -> int | None:
+            return library.local_updated_at_micros(track_id)  # type: ignore[attr-defined]
+
+        def apply_remote(row) -> None:  # type: ignore[no-untyped-def]
+            library.upsert_from_remote(  # type: ignore[attr-defined]
+                track_id=row.track_id,
+                path=row.path,
+                bpm=row.bpm,
+                camelot_key=row.camelot_key,
+                energy=row.energy,
+                duration_s=row.duration_s,
+                hot_cues=row.hot_cues_as_options(),
+                updated_at_micros=row.updated_at_micros,
+            )
+
     syncer = LibrarySyncer(
         client,
-        local_updated_at=lambda _id: None,  # forces every row into LOCAL_INSERTED
-        apply_remote=lambda _row: None,  # no-op until library learns updated_at_micros
+        local_updated_at=local_updated_at,
+        apply_remote=apply_remote,
     )
     result = syncer.pull(since_micros=since_micros)
     if result.transport_error is not None:

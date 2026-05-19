@@ -108,7 +108,7 @@ async def _run(args: argparse.Namespace) -> int:
     # transport errors are absorbed by bootstrap_pull and logged at
     # WARN level so a flaky cloud never blocks the engine.
     sync_client = build_sync_client_from_env(logger=log)
-    bootstrap_pull(sync_client, logger=log)
+    bootstrap_pull(sync_client, library=library, logger=log)
     service = CoPilotService(
         library,
         engine_ws_url=args.engine_ws,
