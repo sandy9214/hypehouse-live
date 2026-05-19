@@ -16,6 +16,7 @@ import { useAutoMix } from "../store/autoMix";
 import { AutoMixButton } from "./AutoMixButton";
 import { CueCountdown } from "./CueCountdown";
 import { Waveform } from "./Waveform";
+import { HotCueMarkers } from "./HotCueMarkers";
 import {
   fmtMs,
   formatEffectiveBpm,
@@ -405,16 +406,29 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
         positionProvider={positionProvider}
       />
 
-      <Waveform
-        peaks={peaks}
-        positionMs={deck.position_ms}
-        durationMs={durationMs}
-        mode="scroll"
-        beatGridAnchorMs={beatAnchorMs}
-        beatPeriodMs={beatPeriodMs}
-        downbeatsMs={downbeatsMs}
-        positionProvider={positionProvider}
-      />
+      <div style={{ position: "relative", display: "inline-block" }}>
+        <Waveform
+          peaks={peaks}
+          positionMs={deck.position_ms}
+          durationMs={durationMs}
+          mode="scroll"
+          beatGridAnchorMs={beatAnchorMs}
+          beatPeriodMs={beatPeriodMs}
+          downbeatsMs={downbeatsMs}
+          positionProvider={positionProvider}
+        />
+        <HotCueMarkers
+          hotCues={deck.hot_cues}
+          durationMs={durationMs}
+          width={480}
+          height={96}
+          mode="scroll"
+          positionMs={deck.position_ms}
+          positionProvider={positionProvider}
+          deck={deck.id}
+          client={client}
+        />
+      </div>
 
       <TransportRow
         deck={deck}
