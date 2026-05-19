@@ -39,6 +39,7 @@ pub mod auth;
 pub mod decode_drain;
 pub mod error;
 pub mod library_proxy;
+pub mod ratelimit;
 pub mod rpc;
 pub mod ws_server;
 
@@ -49,8 +50,9 @@ pub use decode_drain::{
 };
 pub use error::{
     RpcError, AUTH_REJECTED, ENGINE_OFFLINE, ENGINE_SINK_UNWIRED, INTERNAL_ERROR, INVALID_PARAMS,
-    INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
+    INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR, RATE_LIMITED,
 };
+pub use ratelimit::{Decision as RateLimitDecision, RateLimiter};
 pub use rpc::{
     audio_alert_notification, decode_error_notification, dispatch, dispatch_auth_hello,
     dispatch_with_auth, dispatch_with_auth_async, method, state_changed_notification, AuthState,

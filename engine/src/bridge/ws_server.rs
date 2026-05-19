@@ -53,8 +53,9 @@ use tracing::{debug, info, warn};
 
 use super::auth::AuthConfig;
 use super::error::RpcError;
+use super::ratelimit::{Decision as RateLimitDecision, RateLimiter};
 use super::rpc::{
-    audio_alert_notification, decode_error_notification, dispatch_with_auth_async,
+    audio_alert_notification, decode_error_notification, dispatch_with_auth_async, method,
     state_changed_notification, AuthState, BridgeNotice, EngineHandle, RpcRequest, RpcResponse,
 };
 
@@ -370,7 +371,15 @@ async fn handle_client(
     // dispatch call. While the connection is `PendingAuth` we also wrap
     // the per-frame read in a 5-second timeout: a silent browser tab
     // that never sends `auth.hello` gets closed with WS code 1008.
+    //
+    // `rate_limiter` is a per-connection token bucket guarding
+    // `engine.submit_event` (200 events/sec sustained, 1000 burst). A
+    // malicious/buggy UI that spams submit_event 10 000/sec is capped
+    // so legitimate MIDI/UI events still reach the bounded control-
+    // loop channel. The env override `HYPEHOUSE_RATE_LIMIT_DISABLED=1`
+    // turns the gate into a no-op for dev/test.
     let mut auth_state = initial_state;
+    let mut rate_limiter = RateLimiter::new();
     loop {
         let next = if auth_state == AuthState::PendingAuth {
             match tokio::time::timeout(PENDING_AUTH_TIMEOUT, ws_stream.next()).await {
@@ -399,8 +408,14 @@ async fn handle_client(
         };
         match msg {
             Message::Text(text) => {
-                let (resp, new_state) =
-                    handle_request_frame(&engine, &auth, auth_state, text.as_ref()).await;
+                let (resp, new_state) = handle_request_frame(
+                    &engine,
+                    &auth,
+                    auth_state,
+                    &mut rate_limiter,
+                    text.as_ref(),
+                )
+                .await;
                 auth_state = new_state;
                 let frame = serde_json::to_string(&resp).unwrap_or_else(|e| {
                     // Encoding our own response shouldn't fail; fall back
@@ -463,17 +478,28 @@ impl Drop for ConnGuard {
     }
 }
 
-/// Decode a single frame and dispatch with the in-band auth gate.
+/// Decode a single frame and dispatch with the in-band auth gate +
+/// per-connection rate limiter.
 ///
 /// Returns the response envelope **and** the new `AuthState` for the
 /// connection — `auth.hello` is the only method that can mutate state,
 /// every other method is a no-op on it. Parse + invalid-request errors
 /// surface as JSON-RPC errors rather than as transport-level failures
 /// (and never promote auth).
+///
+/// Rate-limit gate: when the decoded method is `engine.submit_event`
+/// AND the connection is already `Authed`, one token is consumed from
+/// the per-connection bucket. Exhaustion returns `-32003 RATE_LIMITED`
+/// with a `{ retry_after_ms }` data payload and short-circuits before
+/// the request hits the dispatcher. Other methods (`auth.hello`,
+/// `engine.snapshot`, etc.) bypass the limiter. The token is consumed
+/// BEFORE dispatch so a flood can't drain the control-loop channel
+/// even transiently.
 async fn handle_request_frame(
     engine: &EngineHandle,
     auth: &AuthConfig,
     state: AuthState,
+    rate_limiter: &mut RateLimiter,
     text: &str,
 ) -> (RpcResponse, AuthState) {
     let req: RpcRequest = match serde_json::from_str(text) {
@@ -500,6 +526,14 @@ async fn handle_request_frame(
             );
         }
     };
+    if state == AuthState::Authed && req.method == method::SUBMIT_EVENT {
+        if let RateLimitDecision::Deny { retry_after_ms } = rate_limiter.try_acquire() {
+            return (
+                RpcResponse::err(req.id, RpcError::rate_limited(retry_after_ms)),
+                state,
+            );
+        }
+    }
     dispatch_with_auth_async(engine, auth, state, req).await
 }
 
@@ -758,6 +792,358 @@ mod tests {
                 if v.get("method").and_then(|x| x.as_str()) == Some("engine.state_changed") {
                     break;
                 }
+            }
+        }
+
+        ws_a.close(None).await.ok();
+        ws_b.close(None).await.ok();
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rate_limit_burst_then_denies_with_retry_after_ms() {
+        // Flood `engine.submit_event` faster than the 200/sec refill
+        // and verify the per-connection token bucket eventually emits
+        // `-32003 RATE_LIMITED` with a structured `retry_after_ms`.
+        // Burst is 1 000; we send 2 500 frames so even with refill
+        // during the back-to-back send loop (~1 token every 5 ms of
+        // wall-clock slop on a slow CI host) the bucket cannot help
+        // but drain.
+        //
+        // Wire a sink we drain immediately so the control-loop channel
+        // never becomes the bottleneck — the limiter is the only thing
+        // we want rejecting frames. The drained sink also keeps the
+        // engine in "real" submit_event mode (not the `-32001` path).
+        let (event_tx, event_rx) = crossbeam::channel::unbounded::<crate::state::Event>();
+        std::thread::spawn(move || while event_rx.recv().is_ok() {});
+        let engine = EngineHandle::with_event_sink(event_tx);
+        let server = spawn(
+            cfg_with(ephemeral_loopback(), AuthConfig::default()),
+            engine.clone(),
+        )
+        .await
+        .unwrap();
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(server.local_addr).await)
+            .await
+            .unwrap();
+
+        let mk_submit = |id: i64| {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "engine.submit_event",
+                "params": { "kind": { "DeckPlay": { "deck": "A" } } },
+                "id": id,
+            })
+            .to_string()
+        };
+
+        const FLOOD: i64 = 2_500;
+        for id in 0..FLOOD {
+            ws.send(Message::Text(mk_submit(id).into())).await.unwrap();
+        }
+
+        let mut accepted = 0u32;
+        let mut denied = 0u32;
+        let mut first_denied_retry_after: Option<u64> = None;
+        let mut seen = 0u32;
+        // Each `submit_event` produces exactly one response frame (plus
+        // optionally a state_changed broadcast we filter out below).
+        while seen < FLOOD as u32 {
+            let msg = ws.next().await.unwrap().unwrap();
+            let Message::Text(t) = msg else { continue };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v.get("id").and_then(|x| x.as_i64()).is_none() {
+                continue; // state_changed notification — skip
+            }
+            seen += 1;
+            if let Some(code) = v["error"]["code"].as_i64() {
+                assert_eq!(code, -32003, "non-rate-limit error: {v}");
+                if first_denied_retry_after.is_none() {
+                    first_denied_retry_after = v["error"]["data"]["retry_after_ms"].as_u64();
+                }
+                denied += 1;
+            } else {
+                assert_eq!(v["result"]["accepted"], serde_json::Value::Bool(true));
+                accepted += 1;
+            }
+        }
+
+        // Burst capacity is 1 000, so accepted must be ≥ 1 000 (and
+        // can legitimately exceed it because refill kicks in during
+        // the send loop). Denied must be > 0 — otherwise the limiter
+        // didn't trigger at all.
+        assert!(
+            accepted >= 1_000,
+            "burst should accept at least the full capacity (1 000), got {accepted}",
+        );
+        assert!(
+            denied > 0,
+            "flooding {FLOOD} events must trigger ≥1 RATE_LIMITED, got 0",
+        );
+        let retry = first_denied_retry_after.expect("denied frame must carry retry_after_ms");
+        assert!(retry >= 1, "retry_after_ms must be ≥ 1, got {retry}");
+        assert!(
+            retry <= 5_000,
+            "retry_after_ms suspiciously large: {retry} (expected ≤ 5 000 ms)",
+        );
+
+        ws.close(None).await.ok();
+        server.shutdown().await.unwrap();
+    }
+
+    /// Test helper — flood a WS connection with `engine.submit_event`
+    /// frames until the server returns at least one `-32003
+    /// RATE_LIMITED`. Returns the count of accepted frames before the
+    /// first deny. Fails the test if `max_frames` is exhausted without
+    /// triggering the limiter (defensive — keeps the test bounded).
+    async fn flood_until_rate_limited(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        max_frames: u32,
+    ) -> u32 {
+        // Batch the sends, then drain responses. We keep both halves
+        // interleaved to avoid filling the tokio mpsc on the server.
+        let mut accepted_before_deny = 0u32;
+        let mut next_id: i64 = 100_000;
+        for _ in 0..max_frames {
+            let id = next_id;
+            next_id += 1;
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "engine.submit_event",
+                "params": { "kind": { "DeckPlay": { "deck": "A" } } },
+                "id": id,
+            })
+            .to_string();
+            ws.send(Message::Text(body.into())).await.unwrap();
+            loop {
+                let msg = ws.next().await.unwrap().unwrap();
+                let Message::Text(t) = msg else { continue };
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v.get("id").and_then(|x| x.as_i64()) != Some(id) {
+                    continue; // state_changed or older response
+                }
+                if v["error"]["code"].as_i64() == Some(-32003) {
+                    return accepted_before_deny;
+                }
+                assert!(
+                    v.get("error").is_none(),
+                    "unexpected non-rate-limit error: {v}"
+                );
+                accepted_before_deny += 1;
+                break;
+            }
+        }
+        panic!("limiter never tripped after {max_frames} frames (accepted {accepted_before_deny})");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_regenerates_after_short_wait() {
+        // Drain the bucket via the helper, then wait long enough for
+        // many tokens to refill (250 ms at 200/sec = ~50 tokens) and
+        // verify a fresh submit_event succeeds.
+        let (event_tx, event_rx) = crossbeam::channel::unbounded::<crate::state::Event>();
+        std::thread::spawn(move || while event_rx.recv().is_ok() {});
+        let engine = EngineHandle::with_event_sink(event_tx);
+        let server = spawn(
+            cfg_with(ephemeral_loopback(), AuthConfig::default()),
+            engine.clone(),
+        )
+        .await
+        .unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(server.local_addr).await)
+            .await
+            .unwrap();
+
+        // Drain the bucket — we don't care about the exact accepted
+        // count, only that the limiter eventually denied.
+        let _ = flood_until_rate_limited(&mut ws, 3_000).await;
+
+        // Sleep 250 ms — at 200/sec that's ~50 tokens regenerated,
+        // well above any single-token-timing flake.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        ws.send(Message::Text(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "engine.submit_event",
+                "params": { "kind": { "DeckPlay": { "deck": "A" } } },
+                "id": 3_000,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let msg = ws.next().await.unwrap().unwrap();
+            let Message::Text(t) = msg else { continue };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v.get("id").and_then(|x| x.as_i64()) == Some(3_000) {
+                assert!(
+                    v.get("error").is_none(),
+                    "post-wait submit unexpectedly denied: {v}",
+                );
+                assert_eq!(v["result"]["accepted"], serde_json::Value::Bool(true));
+                break;
+            }
+        }
+
+        ws.close(None).await.ok();
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rate_limit_does_not_apply_to_other_rpc_methods() {
+        // Even with the bucket fully drained, `engine.snapshot`,
+        // `engine.health`, and `engine.list_sessions` must continue to
+        // succeed. We only rate-limit `engine.submit_event`.
+        let (event_tx, event_rx) = crossbeam::channel::unbounded::<crate::state::Event>();
+        std::thread::spawn(move || while event_rx.recv().is_ok() {});
+        let engine = EngineHandle::with_event_sink(event_tx);
+        let server = spawn(
+            cfg_with(ephemeral_loopback(), AuthConfig::default()),
+            engine.clone(),
+        )
+        .await
+        .unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(server.local_addr).await)
+            .await
+            .unwrap();
+
+        // Drain the bucket so the bridge starts denying submit_event.
+        let _ = flood_until_rate_limited(&mut ws, 3_000).await;
+
+        // engine.snapshot — must succeed even when bucket is empty.
+        ws.send(Message::Text(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "engine.snapshot",
+                "id": 6_001,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let msg = ws.next().await.unwrap().unwrap();
+            let Message::Text(t) = msg else { continue };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v.get("id").and_then(|x| x.as_i64()) == Some(6_001) {
+                assert!(v.get("error").is_none(), "snapshot wrongly rate-limited");
+                assert!(v["result"].is_object());
+                break;
+            }
+        }
+
+        // engine.health — must also succeed.
+        ws.send(Message::Text(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "engine.health",
+                "id": 6_002,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let msg = ws.next().await.unwrap().unwrap();
+            let Message::Text(t) = msg else { continue };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v.get("id").and_then(|x| x.as_i64()) == Some(6_002) {
+                assert!(v.get("error").is_none(), "health wrongly rate-limited");
+                break;
+            }
+        }
+
+        // engine.list_sessions — also unaffected.
+        ws.send(Message::Text(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "engine.list_sessions",
+                "id": 6_003,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let msg = ws.next().await.unwrap().unwrap();
+            let Message::Text(t) = msg else { continue };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v.get("id").and_then(|x| x.as_i64()) == Some(6_003) {
+                // The session list may legitimately fail with an
+                // internal error in CI sandboxes without a writable
+                // sessions dir — but it must NOT be `-32003`.
+                let code = v["error"]["code"].as_i64();
+                assert_ne!(
+                    code,
+                    Some(-32003),
+                    "list_sessions wrongly rate-limited: {v}"
+                );
+                break;
+            }
+        }
+
+        ws.close(None).await.ok();
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rate_limit_per_connection_isolated_between_clients() {
+        // The limiter is per-connection: client A draining its bucket
+        // must NOT affect client B's quota.
+        let (event_tx, event_rx) = crossbeam::channel::unbounded::<crate::state::Event>();
+        std::thread::spawn(move || while event_rx.recv().is_ok() {});
+        let engine = EngineHandle::with_event_sink(event_tx);
+        let server = spawn(
+            cfg_with(ephemeral_loopback(), AuthConfig::default()),
+            engine.clone(),
+        )
+        .await
+        .unwrap();
+
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(ws_url(server.local_addr).await)
+            .await
+            .unwrap();
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(ws_url(server.local_addr).await)
+            .await
+            .unwrap();
+
+        // Drain client A (the helper flushes responses inline so the
+        // server's mpsc never backs up).
+        let _ = flood_until_rate_limited(&mut ws_a, 3_000).await;
+
+        // Client B's bucket is still full — its first submit_event
+        // must succeed.
+        ws_b.send(Message::Text(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "engine.submit_event",
+                "params": { "kind": { "DeckPlay": { "deck": "A" } } },
+                "id": 8_000,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let msg = ws_b.next().await.unwrap().unwrap();
+            let Message::Text(t) = msg else { continue };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            if v.get("id").and_then(|x| x.as_i64()) == Some(8_000) {
+                assert!(
+                    v.get("error").is_none(),
+                    "client B wrongly rate-limited by client A's flood: {v}"
+                );
+                break;
             }
         }
 

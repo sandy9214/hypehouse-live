@@ -287,6 +287,7 @@ clients observe the resulting state via the subsequent
 |----------|-----------------------|----------------------------------------------------------------------------------------------------------------------------|
 | `-32000` | `ENGINE_OFFLINE`      | Control-loop event channel is full or its receiver was dropped (control thread exited). Caller may retry after backoff.    |
 | `-32001` | `ENGINE_SINK_UNWIRED` | The serving `EngineHandle` was built without an event sink — common in unit tests using `EngineHandle::new()`. Other methods (`engine.snapshot`, `engine.event_log`, `engine.health`) still succeed. |
+| `-32003` | `RATE_LIMITED`        | Per-client token bucket exhausted. The bridge caps `engine.submit_event` at **200 events/sec sustained** with a **1 000-event burst** per WS connection — a guard against malicious / buggy UIs that would otherwise starve the bounded control-loop channel. The error `data` field carries `{ "retry_after_ms": <u64> }`; clients should back off at least that long before retrying. The bucket refills continuously at one token per 5 ms (one token = one `engine.submit_event` frame). Set `HYPEHOUSE_RATE_LIMIT_DISABLED=1` in the server's env to disable the gate for dev/test workflows. |
 
 ### `submit_event` data path
 
@@ -925,6 +926,7 @@ Application-defined codes live in `-32000..=-32099`:
 | `-32000` | `ENGINE_OFFLINE`      | The bridge could not forward an event onto the control-loop event channel (full or disconnected). Caller may retry after backoff. Emitted from `engine.submit_event`. |
 | `-32001` | `ENGINE_SINK_UNWIRED` | The serving `EngineHandle` was built without an event sink (`EngineHandle::new()` instead of `EngineHandle::with_event_sink(tx)`). Other RPCs still work.        |
 | `-32002` | `AUTH_REJECTED`       | In-protocol auth rejection. Returned when (a) a `PendingAuth` browser-mode connection calls any method other than `auth.hello`, or (b) `auth.hello` is called with an invalid token. Native clients that present a wrong `Authorization` header still get HTTP 401 at the WS handshake instead — they never reach this code path. |
+| `-32003` | `RATE_LIMITED`        | Per-client token bucket on `engine.submit_event` is exhausted. The bridge caps inbound `engine.submit_event` frames at **200 events/sec sustained** with a **1 000-event burst**, per WS connection. The bucket is consumed BEFORE dispatch so a flood cannot drain the bounded control-loop channel. The `data` field carries `{ "retry_after_ms": <u64> }` — the minimum wait before the next token regenerates. Other methods (`engine.snapshot`, `engine.health`, `auth.hello`, `library.*`, …) are NOT rate-limited. Setting `HYPEHOUSE_RATE_LIMIT_DISABLED=1` in the server's env disables the gate entirely (intended for dev/test, never production). |
 
 Error envelope:
 
