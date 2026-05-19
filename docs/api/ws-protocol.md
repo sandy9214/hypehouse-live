@@ -472,6 +472,46 @@ host's current default output device (cpal canonical name match).
 Defunct devices (cpal `name()` returns Err) are skipped. Empty array is
 valid when the host has no audio sink (e.g. headless container).
 
+### `engine.session_info`
+
+Read-only snapshot of session-static info — engine version + active
+output-device substring + feature flags. Pure: reads build-time
+`CARGO_PKG_VERSION` plus the relevant env vars at call time. Useful
+for UI "About" panels + debug toasts + diagnostic reports.
+
+**Params**: none.
+**Result**:
+
+```json
+{
+  "version": "0.1.0",
+  "output_device_substring": "BlackHole",
+  "features": {
+    "midi_clock_in":  false,
+    "midi_clock_out": false,
+    "ableton_link":   false,
+    "sentry_telemetry": false,
+    "recording_enabled": true,
+    "rate_limit_disabled": false,
+    "shared_ci_runner": false
+  }
+}
+```
+
+Field semantics:
+- `version` — `CARGO_PKG_VERSION` of the running engine.
+- `output_device_substring` — value of `HYPEHOUSE_OUTPUT_DEVICE`; empty
+  when unset (engine uses host default).
+- `features.midi_clock_in` / `.midi_clock_out` — `true` iff both the
+  matching Cargo feature is compiled in AND the corresponding device
+  env var is non-empty.
+- `features.ableton_link` — same compile-feature AND env-flag gate.
+- `features.sentry_telemetry` — `true` iff `SENTRY_DSN` is non-empty.
+- `features.recording_enabled` — `true` unless
+  `HYPEHOUSE_RECORDING_DISABLED` is set.
+- `features.rate_limit_disabled` / `features.shared_ci_runner` —
+  diagnostic exposures of the matching env vars.
+
 ### `engine.list_sessions`
 
 Enumerate persisted past sessions on disk. Read-only — never touches

@@ -158,6 +158,11 @@ pub mod method {
     /// see ADR-TBD; cpal stream rebuild is non-trivial under an active
     /// audio thread). Backed by `crate::audio::io::enumerate_output_devices`.
     pub const LIST_OUTPUT_DEVICES: &str = "engine.list_output_devices";
+    /// Read-only snapshot of session-static info — engine version,
+    /// session id, active output-device substring (from
+    /// `HYPEHOUSE_OUTPUT_DEVICE`), and feature flags derived from the
+    /// build / env. Useful for UI "About" panels + debug toasts.
+    pub const SESSION_INFO: &str = "engine.session_info";
     /// In-band bearer-token auth for browser WS clients that cannot set
     /// the `Authorization` header at upgrade. See `auth::AuthState`.
     pub const AUTH_HELLO: &str = "auth.hello";
@@ -888,6 +893,38 @@ fn param_descriptor_to_json(d: &ParamDescriptor) -> Value {
     })
 }
 
+/// Build the `engine.session_info` result body. Pure — reads
+/// build-time `CARGO_PKG_VERSION` + process env at call time. Returns
+/// a stable JSON object the UI can render directly. Reads each env
+/// var ONCE per call so a flag flip mid-session is reflected on the
+/// next request.
+fn session_info_result() -> Value {
+    let env_str = |k: &str| -> String { std::env::var(k).unwrap_or_default().trim().to_string() };
+    let env_flag = |k: &str| -> bool {
+        std::env::var(k)
+            .ok()
+            .map(|v| {
+                let t = v.trim();
+                !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
+            })
+            .unwrap_or(false)
+    };
+    let output_device = env_str("HYPEHOUSE_OUTPUT_DEVICE");
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "output_device_substring": output_device,
+        "features": {
+            "midi_clock_in":  cfg!(feature = "midi-clock-in")  && !env_str("MIDI_CLOCK_IN_DEVICE").is_empty(),
+            "midi_clock_out": cfg!(feature = "midi-clock-out") && !env_str("MIDI_CLOCK_OUT_DEVICE").is_empty(),
+            "ableton_link":   cfg!(feature = "ableton-link")   && env_flag("ABLETON_LINK_ENABLED"),
+            "sentry_telemetry": !env_str("SENTRY_DSN").is_empty(),
+            "recording_enabled": !env_flag("HYPEHOUSE_RECORDING_DISABLED"),
+            "rate_limit_disabled": env_flag("HYPEHOUSE_RATE_LIMIT_DISABLED"),
+            "shared_ci_runner": env_flag("HYPEHOUSE_SHARED_CI_RUNNER"),
+        }
+    })
+}
+
 /// Build the `engine.list_output_devices` result body from a slice of
 /// device names. Pure — separated from cpal enumeration so unit tests
 /// can drive the JSON shape without touching CoreAudio (which is unsafe
@@ -1029,6 +1066,7 @@ pub fn dispatch(engine: &EngineHandle, req: RpcRequest) -> RpcResponse {
         // Read-only — selection still requires an engine restart with
         // `HYPEHOUSE_OUTPUT_DEVICE` set; live hot-swap deferred.
         method::LIST_OUTPUT_DEVICES => RpcResponse::ok(id, list_output_devices_result()),
+        method::SESSION_INFO => RpcResponse::ok(id, session_info_result()),
         // History — read-only enumeration of past session dirs. Pure
         // disk I/O; never touches live engine state. Errors are
         // bubbled as `-32603 internal` because the caller did nothing
@@ -1931,6 +1969,60 @@ mod tests {
             assert!(d["name"].is_string());
             assert!(d["is_default"].is_boolean());
         }
+    }
+
+    // ---------------------------------------------------------------
+    // engine.session_info — version + env-derived flags + output device.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn session_info_returns_version_and_features_shape() {
+        let e = engine();
+        let req = submit(method::SESSION_INFO, Value::Null, 250);
+        let resp = dispatch(&e, req);
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let r = resp.result.expect("session_info must return a result");
+        // Version must be a non-empty string.
+        let version = r["version"].as_str().expect("version must be string");
+        assert!(!version.is_empty());
+        // output_device_substring is always a string (empty when unset).
+        assert!(r["output_device_substring"].is_string());
+        // features is an object with the documented keys; values are bool.
+        let features = r["features"].as_object().expect("features object");
+        for key in [
+            "midi_clock_in",
+            "midi_clock_out",
+            "ableton_link",
+            "sentry_telemetry",
+            "recording_enabled",
+            "rate_limit_disabled",
+            "shared_ci_runner",
+        ] {
+            let v = features.get(key).expect(key);
+            assert!(v.is_boolean(), "{key} must be boolean");
+        }
+    }
+
+    #[test]
+    fn session_info_reflects_output_device_env() {
+        let key = "HYPEHOUSE_OUTPUT_DEVICE";
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, "TestSinkXYZ");
+        let result = std::panic::catch_unwind(|| {
+            let e = engine();
+            let req = submit(method::SESSION_INFO, Value::Null, 251);
+            let resp = dispatch(&e, req);
+            let r = resp.result.unwrap();
+            assert_eq!(
+                r["output_device_substring"],
+                serde_json::json!("TestSinkXYZ")
+            );
+        });
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        result.expect("env-driven session_info");
     }
 
     #[test]
