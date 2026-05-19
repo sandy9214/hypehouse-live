@@ -577,6 +577,36 @@ pub fn event_to_commands_with_errors(
                 },
             });
         }
+        EventKind::EffectOneShot { deck, slot, .. } => {
+            // Diff-style emit: only push an `EffectEnable { enabled: true }`
+            // when the slot actually transitioned off → on. If the slot
+            // was already enabled (one-shot only rescheduled the future
+            // disengage), no audio-thread side effect is needed — the
+            // disengage will land via a follow-up control-loop sweep
+            // (separate PR — audio path doesn't yet read `OneShotState`).
+            let prev_enabled = prev
+                .deck_ref(*deck)
+                .effects
+                .get(*slot as usize)
+                .map(|s| s.enabled)
+                .unwrap_or(false);
+            let next_enabled = next
+                .deck_ref(*deck)
+                .effects
+                .get(*slot as usize)
+                .map(|s| s.enabled)
+                .unwrap_or(false);
+            if !prev_enabled && next_enabled {
+                out.push(AudioCommand {
+                    at_frame: now_frame,
+                    kind: AudioCommandKind::EffectEnable {
+                        deck: *deck,
+                        slot: *slot,
+                        enabled: true,
+                    },
+                });
+            }
+        }
         // Non-audio-relevant events — pure state, no audio command needed.
         // (`SetMasterBpm` updates the SharedClock side-channel separately;
         // see ADR-007 §v0.1 — the audio thread doesn't consume it.)
