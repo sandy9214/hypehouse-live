@@ -148,6 +148,10 @@ pub mod method {
     /// the resulting `EngineState` snapshot. Does NOT mutate live
     /// state. Backed by `crate::persistence::sessions::replay_session`.
     pub const REPLAY_SESSION: &str = "engine.replay_session";
+    /// Crowd-pleaser export — trim leading/trailing silence from a past
+    /// session's master.wav and emit chapter markers per `DeckLoad`.
+    /// Backed by `crate::recording::export::export_session`.
+    pub const EXPORT_SESSION: &str = "engine.export_session";
     /// In-band bearer-token auth for browser WS clients that cannot set
     /// the `Authorization` header at upgrade. See `auth::AuthState`.
     pub const AUTH_HELLO: &str = "auth.hello";
@@ -613,6 +617,27 @@ struct ReplaySessionParams {
     session_id: String,
 }
 
+/// Params for `engine.export_session`. `output_path` is optional — when
+/// omitted the engine writes to `~/Downloads/<session_id>.wav`, which
+/// the UI surfaces in a "Saved to …" toast.
+#[derive(Deserialize, Debug)]
+struct ExportSessionParams {
+    session_id: String,
+    #[serde(default)]
+    output_path: Option<String>,
+}
+
+/// Resolve the default output path for `engine.export_session` when the
+/// caller omits `output_path`. Prefers `$HOME/Downloads` (mac/Linux);
+/// falls back to the OS temp dir on hosts without `$HOME` set.
+fn default_export_output_path(session_id: &str) -> std::path::PathBuf {
+    let base = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|p| p.join("Downloads"))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(format!("{session_id}.wav"))
+}
+
 /// Params for `auth.hello` — the in-band bearer-token handshake.
 #[derive(Deserialize, Debug)]
 struct AuthHelloParams {
@@ -930,6 +955,44 @@ pub fn dispatch(engine: &EngineHandle, req: RpcRequest) -> RpcResponse {
                     Err(e) => RpcResponse::err(id, RpcError::internal(e.to_string())),
                 },
                 Err(e) => RpcResponse::err(id, RpcError::invalid_params(format!("{e:#}"))),
+            }
+        }
+        // Crowd-pleaser export — silence-trim + chapter sidecar. Writes
+        // a fresh WAV; never mutates the source session. Errors split:
+        // invalid id / missing source → `invalid_params`, disk write
+        // failures → `internal`.
+        method::EXPORT_SESSION => {
+            let params: ExportSessionParams = match req.params {
+                Some(v) => match serde_json::from_value(v) {
+                    Ok(p) => p,
+                    Err(e) => return RpcResponse::err(id, RpcError::invalid_params(e.to_string())),
+                },
+                None => return RpcResponse::err(id, RpcError::invalid_params("missing params")),
+            };
+            let out = params
+                .output_path
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| default_export_output_path(&params.session_id));
+            match crate::recording::export::export_session(&params.session_id, &out) {
+                Ok(summary) => match serde_json::to_value(summary) {
+                    Ok(v) => RpcResponse::ok(id, v),
+                    Err(e) => RpcResponse::err(id, RpcError::internal(e.to_string())),
+                },
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    // Classify: id / source problems → caller error;
+                    // everything else → server-side.
+                    if msg.contains("invalid session id")
+                        || msg.contains("session not found")
+                        || msg.contains("master.wav missing")
+                        || msg.contains("silent end-to-end")
+                    {
+                        RpcResponse::err(id, RpcError::invalid_params(msg))
+                    } else {
+                        RpcResponse::err(id, RpcError::internal(msg))
+                    }
+                }
             }
         }
         other => RpcResponse::err(id, RpcError::method_not_found(other)),
@@ -1970,6 +2033,153 @@ mod tests {
             );
         }
         std::env::remove_var(super::super::library_proxy::ENV_COPILOT_URL);
+    }
+
+    #[test]
+    fn export_session_rpc_writes_trimmed_wav_and_chapters_for_real_session() {
+        // End-to-end RPC test: seed a session with master.wav + a
+        // DeckLoad event, dispatch the export RPC, assert the trimmed
+        // WAV + chapters sidecar both land on disk.
+        use std::io::Write as _;
+        let _g = sessions_test_lock();
+        let root = sessions_scratch_root("rpc-export");
+        std::env::set_var(super::super::super::persistence::ENV_LOG_DIR, &root);
+
+        let sid = "20260518T010101Z-expt";
+        let dir = root.join(sid);
+        std::fs::create_dir_all(&dir).expect("dir");
+
+        // Synthesize a 14-second WAV: 3s silence + 8s tone + 3s silence.
+        let sr: u32 = 48_000;
+        let head = 3.0f32;
+        let body = 8.0f32;
+        let tail = 3.0f32;
+        let total_frames = ((head + body + tail) * sr as f32) as usize;
+        let data_bytes = (total_frames * 2 * 4) as u32;
+        let wav_path = dir.join("master.wav");
+        let mut f = std::fs::File::create(&wav_path).expect("create wav");
+        crate::recording::write_wav_header(&mut f, sr, data_bytes).expect("header");
+        let head_frames = (head * sr as f32) as usize;
+        let body_frames = (body * sr as f32) as usize;
+        let tail_frames = total_frames - head_frames - body_frames;
+        for _ in 0..head_frames {
+            f.write_all(&0.0f32.to_le_bytes()).unwrap();
+            f.write_all(&0.0f32.to_le_bytes()).unwrap();
+        }
+        for i in 0..body_frames {
+            let t = (i as f32) / sr as f32;
+            let s = 0.5 * (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+            f.write_all(&s.to_le_bytes()).unwrap();
+            f.write_all(&s.to_le_bytes()).unwrap();
+        }
+        for _ in 0..tail_frames {
+            f.write_all(&0.0f32.to_le_bytes()).unwrap();
+            f.write_all(&0.0f32.to_le_bytes()).unwrap();
+        }
+        drop(f);
+
+        // Seed an events log with a DeckLoad at t=5s (relative to session
+        // start at ts=1_000_000 micros).
+        let session_start_micros = 1_000_000i64;
+        let deck_load_micros = session_start_micros + 5_000_000;
+        let e1 = Event {
+            id: 1,
+            ts_micros: session_start_micros,
+            source: EventSource::Ui,
+            kind: EventKind::SessionStart,
+        };
+        let e2 = Event {
+            id: 2,
+            ts_micros: deck_load_micros,
+            source: EventSource::Ui,
+            kind: EventKind::DeckLoad {
+                deck: DeckId::A,
+                track: crate::state::TrackRef {
+                    id: "anthem".into(),
+                    path: "/m/anthem.mp3".into(),
+                },
+                bpm: 128.0,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![],
+                hot_cues: [None; 8],
+                track_gain_db: 0.0,
+            },
+        };
+        let mut f = std::fs::File::create(dir.join("events.jsonl")).expect("events");
+        writeln!(f, "{}", serde_json::to_string(&e1).unwrap()).unwrap();
+        writeln!(f, "{}", serde_json::to_string(&e2).unwrap()).unwrap();
+        drop(f);
+
+        // Dispatch the RPC with an explicit output_path so we don't
+        // pollute the user's real ~/Downloads.
+        let out_path = root.join("crowdpleaser.wav");
+        let e = engine();
+        let req = submit(
+            method::EXPORT_SESSION,
+            serde_json::json!({
+                "session_id": sid,
+                "output_path": out_path.to_string_lossy(),
+            }),
+            60,
+        );
+        let resp = dispatch(&e, req);
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let result = resp.result.expect("result");
+        // Summary fields the UI cares about.
+        let chapter_count = result["chapter_count"].as_u64().unwrap();
+        assert_eq!(chapter_count, 1);
+        let out_dur = result["output_duration_s"].as_f64().unwrap();
+        assert!(
+            (out_dur - 8.0).abs() < 0.3,
+            "output_duration_s {out_dur} ≠ ~8.0"
+        );
+        // Output WAV + sidecar both exist.
+        assert!(out_path.is_file(), "output wav missing");
+        let sidecar = root.join("crowdpleaser.wav.chapters.txt");
+        assert!(sidecar.is_file(), "sidecar missing");
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        assert!(text.contains("title=anthem"));
+
+        std::env::remove_var(super::super::super::persistence::ENV_LOG_DIR);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn export_session_rpc_missing_session_id_is_invalid_params() {
+        let _g = sessions_test_lock();
+        let root = sessions_scratch_root("rpc-export-missing");
+        std::env::set_var(super::super::super::persistence::ENV_LOG_DIR, &root);
+        let e = engine();
+        // No params at all.
+        let req = RpcRequest {
+            jsonrpc: JSONRPC_VERSION.into(),
+            method: method::EXPORT_SESSION.into(),
+            params: None,
+            id: Some(RpcId::Num(61)),
+        };
+        let resp = dispatch(&e, req);
+        assert_eq!(
+            resp.error.unwrap().code,
+            super::super::error::INVALID_PARAMS
+        );
+        // Wrong shape.
+        let req = submit(method::EXPORT_SESSION, serde_json::json!({}), 62);
+        let resp = dispatch(&e, req);
+        assert_eq!(
+            resp.error.unwrap().code,
+            super::super::error::INVALID_PARAMS
+        );
+        // Unknown session id.
+        let req = submit(
+            method::EXPORT_SESSION,
+            serde_json::json!({ "session_id": "20260101T000000Z-zzzz" }),
+            63,
+        );
+        let resp = dispatch(&e, req);
+        let err = resp.error.expect("err");
+        assert_eq!(err.code, super::super::error::INVALID_PARAMS);
+        std::env::remove_var(super::super::super::persistence::ENV_LOG_DIR);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

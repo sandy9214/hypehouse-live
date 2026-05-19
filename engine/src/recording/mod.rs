@@ -46,6 +46,8 @@
 //! * `HYPEHOUSE_RECORDING_DISABLED=1` — skip creating the recorder.
 //!   Used by tests + ephemeral runs.
 
+pub mod export;
+
 use anyhow::{Context, Result};
 use ringbuf::{
     traits::{Consumer, Observer, Producer, Split},

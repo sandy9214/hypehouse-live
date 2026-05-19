@@ -145,6 +145,35 @@ describe("Sessions", () => {
     );
   });
 
+  it("each row exposes an export-crowd-pleaser button bound to the session id", async (): Promise<void> => {
+    const sessions = [
+      makeSummary("20260518T013312Z-eeee", { has_recording: true }),
+      makeSummary("20260518T015555Z-ffff", {
+        has_recording: false,
+        recording_size_bytes: null,
+      }),
+    ];
+    const { client } = makeClient({
+      "engine.list_sessions": { sessions },
+    });
+    render(<Sessions client={client} />);
+    await waitFor((): void => {
+      expect(
+        screen.getByTestId(`sessions-export-btn-${sessions[0].id}`),
+      ).toBeTruthy();
+    });
+    // First row's button is enabled (recording present).
+    const enabled = screen.getByTestId(
+      `sessions-export-btn-${sessions[0].id}`,
+    ) as HTMLButtonElement;
+    expect(enabled.disabled).toBe(false);
+    // Second row's button is disabled (no recording).
+    const disabled = screen.getByTestId(
+      `sessions-export-btn-${sessions[1].id}`,
+    ) as HTMLButtonElement;
+    expect(disabled.disabled).toBe(true);
+  });
+
   it("shows a loading state during fetch and an error banner on RPC failure", async (): Promise<void> => {
     let resolveList: (value: unknown) => void = () => undefined;
     const pending = new Promise<unknown>((resolve) => {

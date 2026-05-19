@@ -364,6 +364,61 @@ export const formatDurationMicros = (
   return `${h}h ${mm.toString().padStart(2, "0")}m`;
 };
 
+/**
+ * Wire shape for `engine.export_session` results — mirrors the Rust
+ * `ExportSummary` in `engine/src/recording/export.rs`.
+ */
+export interface ExportSummary {
+  readonly input_duration_s: number;
+  readonly output_duration_s: number;
+  readonly trimmed_head_s: number;
+  readonly trimmed_tail_s: number;
+  readonly chapter_count: number;
+  readonly output_path: string;
+  readonly chapters_path: string;
+}
+
+const isExportSummary = (v: unknown): v is ExportSummary => {
+  if (!v || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  return (
+    typeof o.input_duration_s === "number" &&
+    typeof o.output_duration_s === "number" &&
+    typeof o.trimmed_head_s === "number" &&
+    typeof o.trimmed_tail_s === "number" &&
+    typeof o.chapter_count === "number" &&
+    typeof o.output_path === "string" &&
+    typeof o.chapters_path === "string"
+  );
+};
+
+/**
+ * Call `engine.export_session` for the given session id. Returns the
+ * `ExportSummary` on success or a string error message on failure
+ * (so the caller can show a toast directly without re-throwing).
+ *
+ * `outputPath` is optional; when omitted the engine writes to the
+ * platform-default downloads dir (`~/Downloads/<session_id>.wav` on
+ * macOS/Linux).
+ */
+export const exportSession = async (
+  client: JsonRpcWS,
+  sessionId: string,
+  outputPath?: string,
+): Promise<ExportSummary | { error: string }> => {
+  try {
+    const params: Record<string, string> = { session_id: sessionId };
+    if (outputPath) params.output_path = outputPath;
+    const result = await client.call<unknown>("engine.export_session", params);
+    if (isExportSummary(result)) return result;
+    return { error: "engine returned an unexpected export_session shape" };
+  } catch (err) {
+    return {
+      error: err instanceof Error && err.message ? err.message : "export failed",
+    };
+  }
+};
+
 /** Pretty-print byte counts (1.0 KB, 2.4 MB, etc.) for the recording column. */
 export const formatBytes = (bytes: number | null): string => {
   if (bytes === null || !Number.isFinite(bytes) || bytes < 0) return "—";

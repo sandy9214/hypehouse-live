@@ -104,7 +104,7 @@ pub struct ReplaySessionResult {
 /// path even when nothing has been written yet, so its missing-root
 /// behaviour is to return an empty list (the user simply has no past
 /// sessions yet).
-fn resolve_root() -> Option<PathBuf> {
+pub(crate) fn resolve_root() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var(super::ENV_LOG_DIR) {
         if !dir.trim().is_empty() {
             return Some(PathBuf::from(dir));
@@ -291,7 +291,7 @@ pub fn replay_session_in(root: &Path, session_id: &str) -> Result<ReplaySessionR
 /// (21 chars, ASCII alphanumeric + `T`/`Z`/`-`). We accept any string
 /// that doesn't introduce a path separator or a leading dot so manually
 /// minted ids stay usable while keeping the read confined.
-fn validate_session_id(session_id: &str) -> Result<()> {
+pub(crate) fn validate_session_id(session_id: &str) -> Result<()> {
     if session_id.is_empty() {
         anyhow::bail!("session id is empty");
     }
