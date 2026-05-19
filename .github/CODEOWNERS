@@ -1,0 +1,30 @@
+# hypehouse-live CODEOWNERS
+# Solo dev today; this maps modules to owners as the team grows.
+
+# Default owner — everything not matched below
+*                           @sandy9214
+
+# Engine (Rust audio)
+/engine/                    @sandy9214
+/engine/src/audio/          @sandy9214
+/engine/src/midi/           @sandy9214
+/engine/src/bridge/         @sandy9214
+/engine/src/persistence/    @sandy9214
+/engine/src/recording/      @sandy9214
+
+# UI (TypeScript + React)
+/ui/                        @sandy9214
+
+# Copilot (Python)
+/copilot/                   @sandy9214
+
+# Desktop shell (Tauri)
+/tauri/                     @sandy9214
+
+# Docs + ADRs — require owner review since architectural
+/docs/                      @sandy9214
+/docs/adr/                  @sandy9214
+
+# CI + repo infrastructure
+/.github/                   @sandy9214
+/Makefile                   @sandy9214
