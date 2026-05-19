@@ -84,6 +84,13 @@ const normaliseClockSource = (raw: unknown): ClockSource => {
 export interface OneShotState {
   ends_at_micros: number;
   was_enabled: boolean;
+  /**
+   * Beat period (ms) frozen at the moment of dispatch. UI countdowns
+   * divide remaining-ms by this value (not the deck's live
+   * `beat_period_ms`, which can mutate mid-flight on a grid retune).
+   * Issue #128. Optional for wire-compat with older snapshots.
+   */
+  beat_period_ms_at_dispatch?: number;
 }
 
 export interface EffectSlotState {
