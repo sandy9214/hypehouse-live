@@ -145,11 +145,12 @@ def test_schema_version_is_current():
     ``"local"`` vs ``"soundcloud"`` / future streaming providers;
     drives the lazy-analysis path for streaming rows). v10 added the
     ``updated_at_micros`` column + index — last-write-wins watermark
-    for cloud library sync (#102). Pinning to a literal here rather
-    than a >= comparison so a future regression that *lowers* the
-    version fails loudly.
+    for cloud library sync (#102). v11 added the ``pending_push``
+    table for the outbound cloud-sync queue (slice 5 of #102).
+    Pinning to a literal here rather than a >= comparison so a future
+    regression that *lowers* the version fails loudly.
     """
-    assert TRACK_SCHEMA_VERSION == 10
+    assert TRACK_SCHEMA_VERSION == 11
     assert HOT_CUE_SLOTS == 8
 
 

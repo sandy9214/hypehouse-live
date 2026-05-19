@@ -59,13 +59,14 @@ from .client import (
     SyncError,
 )
 from .supabase import SupabaseSyncClient
-from .syncer import ConflictOutcome, LibrarySyncer, PullResult
+from .syncer import ConflictOutcome, LibrarySyncer, PullResult, PushResult
 
 __all__ = [
     "ConflictOutcome",
     "InMemorySyncClient",
     "LibrarySyncer",
     "PullResult",
+    "PushResult",
     "RemoteTrack",
     "SupabaseSyncClient",
     "SyncClient",
