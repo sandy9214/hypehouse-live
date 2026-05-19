@@ -9,7 +9,6 @@ runs; only the upstream changes. Keeps the suite hermetic + cheap (<
 from __future__ import annotations
 
 import json
-import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
