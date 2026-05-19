@@ -26,6 +26,7 @@ pub mod clock;
 pub mod command;
 pub mod decode;
 pub mod effects;
+pub mod http_source;
 pub mod io;
 pub mod limiter;
 pub mod mixer;
