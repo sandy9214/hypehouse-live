@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-(Empty — promote items here as they land on `main`.)
+### Added — Co-pilot (Python)
+- **Cloud library sync (closes #102)** — Supabase-backed last-write-
+  wins replication of the `tracks` table. Six-slice rollout:
+  - `SyncClient` Protocol + `InMemorySyncClient` test fake (#148).
+  - `SupabaseSyncClient` PostgREST adapter (stdlib urllib, no new
+    dependency) + `migrations/001_tracks.sql` schema (#149).
+  - Env-driven `build_sync_client_from_env` + bootstrap pull on
+    copilot startup; falls back to InMemory when creds absent (#150).
+  - `TrackLibrary` schema v10: `updated_at_micros` column + index;
+    new `local_updated_at_micros` + `upsert_from_remote` methods.
+    Real bootstrap-pull library merge (#151).
+  - Schema v11: `pending_push` table; `add_track` enqueues outbound
+    upsert; `LibrarySyncer.push_pending` + `bootstrap_push` drain
+    the queue (#152).
+  - `SyncDaemon` background thread runs pull + push every
+    `HYPEHOUSE_SYNC_TICK_SECONDS` (default 60). Survives transient
+    cloud errors; idempotent start/stop. (#153)
+  - Operator wiring: set `SUPABASE_URL` + `SUPABASE_ANON_KEY` in
+    copilot env; run `copilot/cloud_sync/migrations/001_tracks.sql`
+    in the Supabase SQL editor; restart copilot.
+
+## [0.1.0] — 2026-05-19
 
 ## [0.1.0] — 2026-05-19
 
