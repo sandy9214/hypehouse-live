@@ -15,7 +15,11 @@ import type { LibraryTrack } from "../store/library";
 import { useAutoMix } from "../store/autoMix";
 import { AutoMixButton } from "./AutoMixButton";
 import { CueCountdown } from "./CueCountdown";
-import { Waveform } from "./Waveform";
+import {
+  Waveform,
+  WAVEFORM_DEFAULT_HEIGHT,
+  WAVEFORM_DEFAULT_WIDTH,
+} from "./Waveform";
 import { HotCueMarkers } from "./HotCueMarkers";
 import {
   fmtMs,
@@ -420,8 +424,8 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
         <HotCueMarkers
           hotCues={deck.hot_cues}
           durationMs={durationMs}
-          width={480}
-          height={96}
+          width={WAVEFORM_DEFAULT_WIDTH}
+          height={WAVEFORM_DEFAULT_HEIGHT}
           mode="scroll"
           positionMs={deck.position_ms}
           positionProvider={positionProvider}

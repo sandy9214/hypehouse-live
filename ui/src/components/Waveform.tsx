@@ -47,6 +47,15 @@ export const WAVEFORM_PEAK_SCROLL = "#3aa0ff";
 export const WAVEFORM_BEAT = "#5a6b80";
 export const WAVEFORM_DOWNBEAT = "#ffffff";
 export const SCROLL_HALF_WINDOW_MS = 5_000;
+
+/**
+ * Default canvas geometry. Exported so overlay components like
+ * `HotCueMarkers` can share the same width/height without duplicating
+ * the magic numbers across files (council follow-up from PR #122 →
+ * issue #123).
+ */
+export const WAVEFORM_DEFAULT_WIDTH = 480;
+export const WAVEFORM_DEFAULT_HEIGHT = 96;
 type Ctx = CanvasRenderingContext2D;
 
 const canvasStyle: CSSProperties = { display: "block", background: WAVEFORM_BG };
@@ -196,7 +205,8 @@ const labelStyle: CSSProperties = {
 };
 
 export const Waveform = ({
-  peaks, positionMs = 0, durationMs = 0, height = 96, width = 480,
+  peaks, positionMs = 0, durationMs = 0,
+  height = WAVEFORM_DEFAULT_HEIGHT, width = WAVEFORM_DEFAULT_WIDTH,
   mode = "scroll", beatGridAnchorMs = 0, beatPeriodMs = 0,
   downbeatsMs, positionProvider, compactMode = false,
 }: WaveformProps): JSX.Element => {
