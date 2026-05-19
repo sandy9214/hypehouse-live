@@ -6,6 +6,7 @@ import {
   HotCueMarkers,
   SLOT_COLORS,
   cueMarkerX,
+  msFromX,
 } from "./HotCueMarkers";
 import type { JsonRpcWS } from "../ws/client";
 
@@ -89,7 +90,7 @@ describe("HotCueMarkers", () => {
     expect(SLOT_COLORS.length).toBe(8);
   });
 
-  it("left-click dispatches engine.submit_event HotCueTrigger", () => {
+  it("tap (no drag) dispatches engine.submit_event HotCueTrigger", () => {
     const call = vi.fn().mockResolvedValue({ accepted: true });
     render(
       <HotCueMarkers
@@ -103,7 +104,8 @@ describe("HotCueMarkers", () => {
       />,
     );
     const marker = screen.getByTestId("hotcue-marker-0");
-    fireEvent.click(marker);
+    fireEvent.pointerDown(marker, { button: 0, clientX: 50, pointerId: 1 });
+    fireEvent.pointerUp(marker, { clientX: 51, pointerId: 1 });
     expect(call).toHaveBeenCalledWith("engine.submit_event", {
       HotCueTrigger: { deck: "B", slot: 0 },
     });
@@ -143,5 +145,110 @@ describe("HotCueMarkers", () => {
     );
     expect(screen.getByTestId("hotcue-marker-0").textContent).toBe("1");
     expect(screen.getByTestId("hotcue-marker-7").textContent).toBe("8");
+  });
+
+  it("drag (>4 px) commits HotCueSet with the new position_ms", () => {
+    const call = vi.fn().mockResolvedValue({ accepted: true });
+    render(
+      <HotCueMarkers
+        hotCues={[10_000, null, null, null, null, null, null, null]}
+        durationMs={100_000}
+        width={400}
+        height={96}
+        mode="full"
+        deck="A"
+        client={makeClient(call)}
+      />,
+    );
+    const marker = screen.getByTestId("hotcue-marker-0");
+    // Pretend container starts at viewport x=0 (jsdom getBoundingClientRect default).
+    fireEvent.pointerDown(marker, { button: 0, clientX: 50, pointerId: 1 });
+    fireEvent.pointerMove(marker, { clientX: 100, pointerId: 1 });
+    fireEvent.pointerUp(marker, { clientX: 200, pointerId: 1 });
+    // 200 / 400 * 100_000 = 50_000 in "full" mode.
+    expect(call).toHaveBeenCalledWith("engine.submit_event", {
+      HotCueSet: { deck: "A", slot: 0, position_ms: 50_000 },
+    });
+    // No trigger fired — drag suppressed the tap path.
+    expect(call).not.toHaveBeenCalledWith("engine.submit_event", {
+      HotCueTrigger: { deck: "A", slot: 0 },
+    });
+  });
+
+  it("ESC during drag cancels — no HotCueSet, no HotCueTrigger", () => {
+    const call = vi.fn().mockResolvedValue({ accepted: true });
+    render(
+      <HotCueMarkers
+        hotCues={[10_000, null, null, null, null, null, null, null]}
+        durationMs={100_000}
+        width={400}
+        height={96}
+        mode="full"
+        deck="A"
+        client={makeClient(call)}
+      />,
+    );
+    const marker = screen.getByTestId("hotcue-marker-0");
+    fireEvent.pointerDown(marker, { button: 0, clientX: 50, pointerId: 1 });
+    fireEvent.pointerMove(marker, { clientX: 200, pointerId: 1 });
+    fireEvent.keyDown(window, { key: "Escape" });
+    fireEvent.pointerUp(marker, { clientX: 200, pointerId: 1 });
+    expect(call).not.toHaveBeenCalledWith(
+      "engine.submit_event",
+      expect.objectContaining({
+        HotCueSet: expect.anything(),
+      }),
+    );
+  });
+
+  it("non-primary mouse button (right-click) is ignored on pointerdown", () => {
+    const call = vi.fn().mockResolvedValue({ accepted: true });
+    render(
+      <HotCueMarkers
+        hotCues={[10_000, null, null, null, null, null, null, null]}
+        durationMs={100_000}
+        width={400}
+        height={96}
+        mode="full"
+        deck="A"
+        client={makeClient(call)}
+      />,
+    );
+    const marker = screen.getByTestId("hotcue-marker-0");
+    fireEvent.pointerDown(marker, { button: 2, clientX: 50, pointerId: 1 });
+    fireEvent.pointerUp(marker, { clientX: 50, pointerId: 1 });
+    expect(call).not.toHaveBeenCalled();
+  });
+});
+
+describe("msFromX", () => {
+  it("full mode — linear within bounds", () => {
+    expect(msFromX(0, "full", 100_000, 0, 400, 5000)).toBe(0);
+    expect(msFromX(200, "full", 100_000, 0, 400, 5000)).toBe(50_000);
+    expect(msFromX(400, "full", 100_000, 0, 400, 5000)).toBe(100_000);
+  });
+
+  it("full mode — out-of-canvas clamps to [0, durationMs]", () => {
+    expect(msFromX(-50, "full", 100_000, 0, 400, 5000)).toBe(0);
+    expect(msFromX(99_999, "full", 100_000, 0, 400, 5000)).toBe(100_000);
+  });
+
+  it("scroll mode — x=width/2 returns centerMs", () => {
+    expect(msFromX(200, "scroll", 100_000, 30_000, 400, 5000)).toBe(30_000);
+  });
+
+  it("scroll mode — x at right edge returns centerMs + halfWindow", () => {
+    expect(msFromX(400, "scroll", 100_000, 30_000, 400, 5000)).toBe(35_000);
+  });
+
+  it("scroll mode — clamped to [0, durationMs]", () => {
+    // centerMs near end of track + drag past edge → clamps to durationMs
+    expect(msFromX(400, "scroll", 100_000, 99_000, 400, 5000)).toBe(100_000);
+    expect(msFromX(0, "scroll", 100_000, 1_000, 400, 5000)).toBe(0);
+  });
+
+  it("returns 0 on degenerate durationMs / width", () => {
+    expect(msFromX(100, "full", 0, 0, 400, 5000)).toBe(0);
+    expect(msFromX(100, "full", 100_000, 0, 0, 5000)).toBe(0);
   });
 });

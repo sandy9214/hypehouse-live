@@ -107,6 +107,34 @@ export const cueMarkerX = (
   return Number.isFinite(x) ? x : null;
 };
 
+/**
+ * Inverse of `cueMarkerX` — pointer x within the canvas, in pixels,
+ * back to a track ms. Clamps to `[0, durationMs]`. Used by the drag
+ * handler (#124). Exported for unit tests.
+ */
+export const msFromX = (
+  x: number,
+  mode: "full" | "scroll",
+  durationMs: number,
+  centerMs: number,
+  width: number,
+  halfWindowMs: number,
+): number => {
+  if (durationMs <= 0 || width <= 0) return 0;
+  const clampedX = Math.max(0, Math.min(width, x));
+  if (mode === "full") {
+    const ms = Math.round((clampedX / width) * durationMs);
+    return Math.max(0, Math.min(durationMs, ms));
+  }
+  // scroll: x=width/2 → centerMs; x at edges → centerMs ± halfWindowMs.
+  const dx = clampedX - width / 2;
+  const ms = Math.round(centerMs + (dx / (width / 2)) * halfWindowMs);
+  return Math.max(0, Math.min(durationMs, ms));
+};
+
+/** Drag activation threshold (pixels) — below this, treat as click. */
+const DRAG_THRESHOLD_PX = 4;
+
 export const HotCueMarkers = ({
   hotCues,
   durationMs,
@@ -184,6 +212,96 @@ export const HotCueMarkers = ({
       });
   };
 
+  const setCue = (slot: number, position_ms: number): void => {
+    void client
+      .call("engine.submit_event", {
+        HotCueSet: { deck, slot, position_ms },
+      })
+      .catch(() => {
+        /* silent — see triggerCue */
+      });
+  };
+
+  // Drag state — local to the component instance. We track the slot
+  // being dragged + start position + accumulated movement; on pointerup
+  // we either emit `HotCueSet` (drag) or `HotCueTrigger` (tap).
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const dragStateRef = useRef<{
+    slot: number;
+    startX: number;
+    centerMsAtStart: number;
+    moved: boolean;
+    cancelled: boolean;
+  } | null>(null);
+
+  const handlePointerDown =
+    (slot: number) =>
+    (ev: React.PointerEvent<HTMLButtonElement>): void => {
+      if (ev.button !== 0) return; // ignore non-primary (right-click handled separately)
+      dragStateRef.current = {
+        slot,
+        startX: ev.clientX,
+        centerMsAtStart: positionProvider ? positionProvider() : positionMs,
+        moved: false,
+        cancelled: false,
+      };
+      // Pointer capture so move/up still fire if pointer leaves the
+      // button bounds during drag.
+      (ev.target as HTMLElement).setPointerCapture?.(ev.pointerId);
+    };
+
+  const handlePointerMove = (
+    ev: React.PointerEvent<HTMLButtonElement>,
+  ): void => {
+    const drag = dragStateRef.current;
+    if (!drag || drag.cancelled) return;
+    if (Math.abs(ev.clientX - drag.startX) >= DRAG_THRESHOLD_PX) {
+      drag.moved = true;
+    }
+  };
+
+  const handlePointerUp = (
+    ev: React.PointerEvent<HTMLButtonElement>,
+  ): void => {
+    const drag = dragStateRef.current;
+    dragStateRef.current = null;
+    if (!drag) return;
+    if (drag.cancelled) return;
+    if (!drag.moved) {
+      triggerCue(drag.slot);
+      return;
+    }
+    // Drag commit — compute new position from the pointer x relative
+    // to the canvas container. Use the centerMs snapshot taken at
+    // drag start so a mid-drag rAF tick can't shift the target while
+    // the user's still moving.
+    const container = containerRef.current;
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
+    const x = ev.clientX - rect.left;
+    const ms = msFromX(
+      x,
+      mode,
+      durationMs,
+      drag.centerMsAtStart,
+      width,
+      halfWindowMs,
+    );
+    setCue(drag.slot, ms);
+  };
+
+  // ESC cancels an in-flight drag (no commit, no jump).
+  useEffect((): (() => void) | void => {
+    const onKey = (ev: KeyboardEvent): void => {
+      if (ev.key === "Escape" && dragStateRef.current) {
+        dragStateRef.current.cancelled = true;
+        dragStateRef.current = null;
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return (): void => window.removeEventListener("keydown", onKey);
+  }, []);
+
   // Static positions for "full" mode — computed at render. Scroll mode
   // gets positions imperatively via the rAF effect above.
   const fullPositions = hotCues.map((cueMs): number | null => {
@@ -193,6 +311,7 @@ export const HotCueMarkers = ({
 
   return (
     <div
+      ref={containerRef}
       style={containerStyle(width, height)}
       data-testid="hotcue-markers"
       aria-label="Hot cue markers"
@@ -223,13 +342,15 @@ export const HotCueMarkers = ({
               markerRefs.current[slot] = el;
             }}
             style={{ ...markerStyle(color, height), left: initialLeft }}
-            onClick={(): void => triggerCue(slot)}
+            onPointerDown={handlePointerDown(slot)}
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerUp}
             onContextMenu={(e): void => {
               e.preventDefault();
               clearCue(slot);
             }}
             aria-label={`Hot cue slot ${label} at ${cueMs} ms`}
-            title={titleText}
+            title={`${titleText} Drag to re-set.`}
             data-slot={slot}
             data-testid={`hotcue-marker-${slot}`}
           >
