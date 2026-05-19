@@ -242,6 +242,22 @@ pub enum AudioCommandKind {
     SetMasterLimiterThreshold {
         threshold_db: f32,
     },
+    /// Sidechain compressor config update (issue #119). Audio thread
+    /// caches the full config locally; control thread sends a fresh
+    /// snapshot on every `SetSidechainEnabled` / `SetSidechainParams`
+    /// event. `trigger_deck_is_a = true` → trigger is deck A, deck B
+    /// gets ducked; `false` → opposite. Bool used (instead of full
+    /// `DeckId` import) to keep this command `Copy + Send + 'static`
+    /// per ADR-004's POD-only rule.
+    SetSidechain {
+        enabled: bool,
+        trigger_deck_is_a: bool,
+        threshold_db: f32,
+        ratio: f32,
+        attack_ms: f32,
+        release_ms: f32,
+        makeup_gain_db: f32,
+    },
 }
 
 #[cfg(test)]
