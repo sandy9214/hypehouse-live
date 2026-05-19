@@ -18,7 +18,11 @@ import signal
 import sys
 from pathlib import Path
 
-from .cloud_sync.bootstrap import bootstrap_pull, build_sync_client_from_env
+from .cloud_sync.bootstrap import (
+    bootstrap_pull,
+    bootstrap_push,
+    build_sync_client_from_env,
+)
 from .library import TrackLibrary
 from .service import CoPilotService
 from .telemetry import init_telemetry
@@ -109,6 +113,10 @@ async def _run(args: argparse.Namespace) -> int:
     # WARN level so a flaky cloud never blocks the engine.
     sync_client = build_sync_client_from_env(logger=log)
     bootstrap_pull(sync_client, library=library, logger=log)
+    # Drain any locally-queued upserts back to the cloud. Best-effort
+    # — on a transport error remaining ids stay queued for the next
+    # restart / sync tick. (Periodic background sync lands in slice 6.)
+    bootstrap_push(sync_client, library, logger=log)
     service = CoPilotService(
         library,
         engine_ws_url=args.engine_ws,

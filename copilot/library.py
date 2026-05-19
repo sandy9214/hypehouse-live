@@ -76,7 +76,7 @@ if TYPE_CHECKING:  # pragma: no cover — type-only import to break cycle.
 # See ``copilot/streaming/__init__.py`` for the provider abstraction.
 # Migrations dispatch on the gap between this constant and the value
 # recorded in the ``schema_version`` table.
-TRACK_SCHEMA_VERSION = 10
+TRACK_SCHEMA_VERSION = 11
 
 # Source-column enum values. Persisted as plain strings (not a SQL
 # enum) so older readers introspect cleanly. ``SOURCE_LOCAL`` is the
@@ -373,6 +373,23 @@ class TrackLibrary:
                 "CREATE INDEX IF NOT EXISTS tracks_updated_at_micros_idx "
                 "ON tracks (updated_at_micros)"
             )
+        # v11 — outbound cloud-sync push queue (#102). One row per
+        # track that needs an upsert against the cloud; ``track_id``
+        # is the FK back into ``tracks``. ``queued_at_micros`` is just
+        # debug breadcrumb (the syncer drains in arbitrary order;
+        # PostgREST upsert is idempotent + last-write-wins on
+        # `updated_at_micros` so order doesn't affect correctness).
+        # Separate table rather than a column on ``tracks`` so a
+        # successful flush is a DELETE, not an UPDATE — cleaner +
+        # the index stays compact when nothing is pending.
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS pending_push (
+                track_id          TEXT PRIMARY KEY,
+                queued_at_micros  INTEGER NOT NULL
+            );
+            """
+        )
         # v6 migration — user preset snapshots. Lives in its own table
         # rather than as columns on ``tracks`` because presets aren't
         # per-track. ``name`` is UNIQUE so the UI's "save current" flow
@@ -481,6 +498,16 @@ class TrackLibrary:
                 _now_micros(),
             ),
         )
+        # v11: enqueue an outbound cloud-sync upsert on every local
+        # write. The pending row is harmless when the sync client is
+        # the in-memory fallback (the syncer's push pass becomes a
+        # no-op against a non-Supabase client; the row clears on its
+        # own).
+        self._conn.execute(
+            "INSERT OR REPLACE INTO pending_push (track_id, queued_at_micros) "
+            "VALUES (?, ?)",
+            (track.track_id, _now_micros()),
+        )
         self._conn.commit()
 
     # --- cloud library sync surface (#102) -------------------------------
@@ -497,6 +524,52 @@ class TrackLibrary:
         if row is None:
             return None
         return int(row["updated_at_micros"])
+
+    def pending_push_ids(self) -> list[str]:
+        """Track ids awaiting an outbound cloud upsert (#102)."""
+        return [
+            row["track_id"]
+            for row in self._conn.execute(
+                "SELECT track_id FROM pending_push ORDER BY queued_at_micros"
+            )
+        ]
+
+    def clear_pending_push(self, track_id: str) -> None:
+        """Mark an outbound push complete. No-op if the row isn't queued."""
+        self._conn.execute(
+            "DELETE FROM pending_push WHERE track_id = ?",
+            (track_id,),
+        )
+        self._conn.commit()
+
+    def row_for_cloud_push(
+        self, track_id: str
+    ) -> tuple[str, float, str, float, float, list[int | None], int] | None:
+        """Read the fields the cloud syncer needs to push a row.
+
+        Returns ``(path, bpm, key, energy, duration_s, hot_cues,
+        updated_at_micros)`` or ``None`` when the track was deleted
+        between enqueue + flush. Skipping ``TrackRef`` so the caller
+        doesn't have to construct the full library shape just to
+        round-trip seven fields to the wire.
+        """
+        row = self._conn.execute(
+            "SELECT path, bpm, camelot_key, energy, duration_s, "
+            "hot_cues_json, updated_at_micros "
+            "FROM tracks WHERE track_id = ?",
+            (track_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return (
+            str(row["path"]),
+            float(row["bpm"]),
+            str(row["camelot_key"]),
+            float(row["energy"]),
+            float(row["duration_s"]),
+            _hot_cues_from_json(row["hot_cues_json"]),
+            int(row["updated_at_micros"]),
+        )
 
     def upsert_from_remote(
         self,

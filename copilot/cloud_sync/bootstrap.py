@@ -20,7 +20,7 @@ from typing import Optional
 
 from .client import InMemorySyncClient, SyncClient, SyncError
 from .supabase import SupabaseSyncClient
-from .syncer import LibrarySyncer, PullResult
+from .syncer import LibrarySyncer, PullResult, PushResult
 
 
 def build_sync_client_from_env(
@@ -122,4 +122,47 @@ def bootstrap_pull(
     return result
 
 
-__all__ = ["bootstrap_pull", "build_sync_client_from_env"]
+def bootstrap_push(
+    client: SyncClient,
+    library: object,
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> PushResult:
+    """Drain the library's outbound push queue once (#102 slice 5).
+
+    Reads `library.pending_push_ids()`, asks `row_for_cloud_push()` for
+    each, calls `client.upsert_track`, then `clear_pending_push()` per
+    success. Transport error aborts the pass; remaining ids stay
+    queued for the next pass.
+    """
+    log = logger or logging.getLogger("copilot.cloud_sync.bootstrap")
+    syncer = LibrarySyncer(
+        client,
+        local_updated_at=lambda _id: None,
+        apply_remote=lambda _row: None,
+    )
+    ids = library.pending_push_ids()  # type: ignore[attr-defined]
+    if not ids:
+        log.info("cloud sync: push queue empty")
+        return PushResult(pushed_count=0, skipped_missing_count=0)
+    result = syncer.push_pending(
+        ids,
+        row_loader=library.row_for_cloud_push,  # type: ignore[attr-defined]
+        on_pushed=library.clear_pending_push,  # type: ignore[attr-defined]
+    )
+    if result.transport_error is not None:
+        log.warning(
+            "cloud sync: push transport error after %d pushed: %s",
+            result.pushed_count,
+            result.transport_error,
+        )
+    else:
+        log.info(
+            "cloud sync: push ok — pushed=%d skipped_missing=%d",
+            result.pushed_count,
+            result.skipped_missing_count,
+        )
+    return result
+
+
+__all__ = ["bootstrap_pull", "bootstrap_push", "build_sync_client_from_env"]

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 from .client import RemoteTrack, SyncClient, SyncError
 
@@ -42,6 +42,15 @@ class PullResult:
     inserted_count: int  # rows that didn't exist locally before the pull
     transport_error: str | None = None  # set when SyncClient raised.
     track_outcomes: dict[str, ConflictOutcome] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PushResult:
+    """Outcome of one outbound push pass (#102 slice 5)."""
+
+    pushed_count: int
+    skipped_missing_count: int  # row was deleted between enqueue + flush
+    transport_error: str | None = None
 
 
 # Caller plugs in two callbacks:
@@ -122,11 +131,76 @@ class LibrarySyncer:
         )
 
     def queue_local_change(self, track: RemoteTrack) -> None:
-        """Stub — slice 2 wires the outbound push queue.
+        """Legacy stub — push enqueue now happens at the library
+        layer via `TrackLibrary.add_track` (#102 slice 5).
 
-        Today this is a no-op so the rest of the codebase can be wired
-        in without breakage. Calling it logs nothing; the syncer
-        contract just promises the call returns.
+        Kept for callers that already construct a `RemoteTrack` and
+        want to push it directly; just forwards to `upsert_track`.
         """
-        # Intentional no-op (see docstring).
-        _ = track
+        try:
+            self._client.upsert_track(track)
+        except SyncError:
+            # Silent — same best-effort policy as the pull path.
+            pass
+
+    def push_pending(
+        self,
+        ids: Iterable[str],
+        row_loader: Callable[[str], Optional["PushRow"]],
+        on_pushed: Callable[[str], None],
+    ) -> "PushResult":
+        """Drain the pending-push queue.
+
+        - `ids` — pending track ids (from `library.pending_push_ids()`).
+        - `row_loader(track_id)` — return the seven-field tuple from
+          `library.row_for_cloud_push`, or `None` when the row has been
+          deleted locally since enqueue (skip that id, don't fail the
+          whole pass).
+        - `on_pushed(track_id)` — called after each successful upsert
+          so the library can clear the entry.
+
+        Transport errors abort the pass — `result.transport_error` is
+        set. We don't retry inside the syncer; the next pull-push
+        cycle on the next startup / tick re-queues automatically since
+        we only clear on success.
+        """
+        pushed = 0
+        skipped_missing = 0
+        for track_id in ids:
+            row = row_loader(track_id)
+            if row is None:
+                skipped_missing += 1
+                continue
+            path, bpm, key, energy, duration_s, hot_cues, updated_at_micros = row
+            wire = RemoteTrack.from_local(
+                track_id=track_id,
+                path=path,
+                bpm=bpm,
+                camelot_key=key,
+                energy=energy,
+                duration_s=duration_s,
+                hot_cues=hot_cues,
+                updated_at_micros=updated_at_micros,
+            )
+            try:
+                self._client.upsert_track(wire)
+            except SyncError as exc:
+                return PushResult(
+                    pushed_count=pushed,
+                    skipped_missing_count=skipped_missing,
+                    transport_error=str(exc),
+                )
+            on_pushed(track_id)
+            pushed += 1
+        return PushResult(
+            pushed_count=pushed,
+            skipped_missing_count=skipped_missing,
+            transport_error=None,
+        )
+
+
+# Local seven-tuple shape returned by `TrackLibrary.row_for_cloud_push`.
+# Spelled out as an alias here so the syncer call site documents the
+# contract without importing the library type (kept loose for the
+# in-memory test client).
+PushRow = tuple
