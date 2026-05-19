@@ -4,13 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from copilot.cloud_sync import (
     InMemorySyncClient,
     LibrarySyncer,
-    PushResult,
-    RemoteTrack,
     SyncError,
 )
 from copilot.cloud_sync.bootstrap import bootstrap_push
