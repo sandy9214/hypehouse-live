@@ -213,11 +213,10 @@ mod tests {
                 Decision::Deny { .. } => break,
             }
         }
+        let cap_u32 = BURST_CAPACITY as u32;
         assert!(
-            allows >= (BURST_CAPACITY as u32) - 1 && allows <= (BURST_CAPACITY as u32) + 1,
-            "expected ~BURST_CAPACITY ({}) allows before deny, got {}",
-            BURST_CAPACITY,
-            allows
+            allows >= cap_u32 - 1 && allows <= cap_u32 + 1,
+            "expected ~BURST_CAPACITY ({BURST_CAPACITY}) allows before deny, got {allows}",
         );
         // We just observed a Deny in the loop (or hit max_iters guard).
         // Confirm same instant still denies.
