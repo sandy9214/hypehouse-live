@@ -8,7 +8,15 @@
 #   * node + npm (for the UI)
 #   * `cargo install tauri-cli@2` once per workstation for `dev-tauri` / `build-tauri`.
 
-.PHONY: help build-engine build-ui dev-tauri build-tauri test-engine test-tauri test-ui clean
+.PHONY: help build-engine build-ui dev-tauri build-tauri test-engine test-tauri test-ui clean bake-in bake-in-tests
+
+# v0.2 bake-in defaults — 25-minute sanity run. Bump DURATION_MIN=240
+# for the four-hour soak the release checklist demands.
+DURATION_MIN ?= 25
+BAKE_OUT_DIR ?= $(CURDIR)/bake-in-out
+BAKE_COUNT   ?= 50
+BAKE_PLAYLIST ?= 30
+PYTHON       ?= python3
 
 help:
 	@echo "hypehouse-live Make targets:"
@@ -19,6 +27,9 @@ help:
 	@echo "  make test-engine    — cargo test --all-targets on engine/"
 	@echo "  make test-tauri     — cargo test --all-targets on tauri/"
 	@echo "  make test-ui        — npm run test on ui/"
+	@echo "  make bake-in        — full synthetic bake-in (default 25 min)"
+	@echo "  make bake-in DURATION_MIN=240   — full 4-hour soak"
+	@echo "  make bake-in-tests  — pytest the bake-in harness scripts only"
 	@echo "  make clean          — clean cargo + node build artifacts"
 
 build-engine:
@@ -48,3 +59,28 @@ clean:
 	cd engine && cargo clean
 	cd tauri && cargo clean
 	rm -rf ui/dist ui/node_modules
+
+# Bake-in: generate synthetic tracks → drive engine + copilot → verify.
+# The harness assumes the engine release binary exists; we depend on
+# build-engine so a fresh checkout `make bake-in` just works. Catalog +
+# session artifacts land under $(BAKE_OUT_DIR) (default ./bake-in-out)
+# so they're easy to bundle as a CI artifact.
+bake-in: build-engine
+	mkdir -p $(BAKE_OUT_DIR)
+	$(PYTHON) -m scripts.bake_in.generate_tracks \
+		--out-dir $(BAKE_OUT_DIR) \
+		--count $(BAKE_COUNT) \
+		--duration-min $(DURATION_MIN)
+	$(PYTHON) -m scripts.bake_in.run_set \
+		--out-dir $(BAKE_OUT_DIR) \
+		--manifest $(BAKE_OUT_DIR)/manifest.json \
+		--duration-min $(DURATION_MIN) \
+		--playlist-len $(BAKE_PLAYLIST)
+	$(PYTHON) -m scripts.bake_in.verify \
+		--report $(BAKE_OUT_DIR)/run_report.json \
+		--summary-out $(BAKE_OUT_DIR)/verify_summary.json
+
+# Pytest sub-target — just the harness smoke tests; doesn't build the
+# engine or run the bake itself. Fast (< 5 s) and safe to wire into CI.
+bake-in-tests:
+	$(PYTHON) -m pytest scripts/bake_in/tests -q
