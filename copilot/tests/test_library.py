@@ -143,11 +143,13 @@ def test_schema_version_is_current():
     table (DJ-curated next-track order; see ``copilot/playlist.py``).
     v9 added the ``source`` column on ``tracks`` (row provenance —
     ``"local"`` vs ``"soundcloud"`` / future streaming providers;
-    drives the lazy-analysis path for streaming rows). Pinning to a
-    literal here rather than a >= comparison so a future regression
-    that *lowers* the version fails loudly.
+    drives the lazy-analysis path for streaming rows). v10 added the
+    ``updated_at_micros`` column + index — last-write-wins watermark
+    for cloud library sync (#102). Pinning to a literal here rather
+    than a >= comparison so a future regression that *lowers* the
+    version fails loudly.
     """
-    assert TRACK_SCHEMA_VERSION == 9
+    assert TRACK_SCHEMA_VERSION == 10
     assert HOT_CUE_SLOTS == 8
 
 
