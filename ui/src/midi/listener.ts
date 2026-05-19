@@ -18,6 +18,7 @@ import {
   translate,
 } from "./translator.ts";
 import ddj200Mapping from "./mappings/ddj200.json" with { type: "json" };
+import { validateMapping } from "./MappingStore.ts";
 
 /** JSON-RPC client interface. The full client lives in another PR
  *  (`ws-bridge-and-rpc`); we depend only on the call signature. */
@@ -83,6 +84,26 @@ export class WebMIDIListener {
     for (const input of access.inputs.values()) {
       this.attachInput(input);
     }
+  }
+
+  /** Swap the active mapping live without restarting MIDIAccess. Used
+   *  by the MidiSettings panel when the user picks a new mapping or
+   *  imports a custom JSON. Re-uses the existing MIDIAccess + handlers;
+   *  only the binding index + the mapping reference flip.
+   *
+   *  Validates first — invalid blobs are rejected and the current
+   *  mapping is preserved (so a typo'd import doesn't deafen the
+   *  controller mid-set). Returns true on success. */
+  applyMapping(mapping: unknown): { ok: boolean; error?: string } {
+    const result = validateMapping(mapping);
+    if (!result.ok) return result;
+    const next = mapping as MidiMapping;
+    this.mapping = next;
+    this.index = indexBindings(next.bindings);
+    // Reset deck state so stale pitch/EQ from the previous mapping
+    // doesn't leak into the new binding semantics.
+    this.state = freshState();
+    return { ok: true };
   }
 
   /** Detach all handlers. Idempotent. */
