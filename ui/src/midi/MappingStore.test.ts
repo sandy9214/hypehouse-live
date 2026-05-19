@@ -6,26 +6,10 @@
 // regression on one path can't bypass the other.
 
 import { afterEach, describe, expect, it } from "vitest";
+import { installLocalStoragePolyfill } from "../test-utils/localStoragePolyfill";
 
-// Vitest 4 + jsdom 29 ships a non-spec localStorage (plain object, no
-// Storage prototype + missing methods). Patch in a spec-shaped polyfill
-// so the store's guarded reads/writes can round-trip. Mirrors the same
-// trick used in Onboarding.test.tsx.
-const installLocalStoragePolyfill = (): void => {
-  const store = new Map<string, string>();
-  const polyfill = {
-    getItem: (k: string): string | null =>
-      store.has(k) ? (store.get(k) as string) : null,
-    setItem: (k: string, v: string): void => { store.set(k, String(v)); },
-    removeItem: (k: string): void => { store.delete(k); },
-    clear: (): void => store.clear(),
-    key: (i: number): string | null => Array.from(store.keys())[i] ?? null,
-    get length(): number { return store.size; },
-  };
-  Object.defineProperty(window, "localStorage", {
-    configurable: true, writable: true, value: polyfill,
-  });
-};
+// Vitest 4 + jsdom 29 ships a non-spec localStorage — install the
+// shared Map-backed polyfill before any module-under-test imports run.
 installLocalStoragePolyfill();
 
 import type { MidiMapping } from "./mapping.ts";
