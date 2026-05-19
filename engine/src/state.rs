@@ -576,6 +576,19 @@ pub struct OneShotState {
     /// the one-shot ends. Lets a one-shot leave a previously-off slot
     /// off after firing.
     pub was_enabled: bool,
+    /// The beat period (ms) used to compute `ends_at_micros` at the
+    /// moment of dispatch. Frozen here so a mid-flight grid retune
+    /// (e.g. analyzer re-detects BPM after a stem load) doesn't
+    /// retroactively change the apparent "beats remaining" — UI
+    /// countdowns can divide remaining-ms by THIS value to get an
+    /// accurate beat count even after the deck's live `beat_period_ms`
+    /// has shifted. Issue #128.
+    ///
+    /// Wire-compat: `#[serde(default)]` so older snapshots (without
+    /// the field) deserialize to `0.0`. The reducer always populates
+    /// it on fresh events.
+    #[serde(default)]
+    pub beat_period_ms_at_dispatch: f32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -911,10 +924,10 @@ impl EngineState {
                         // deck has no beat grid yet (track not analyzed
                         // / unloaded). 500 ms ≈ one beat at 120 BPM —
                         // industry-default "no-grid" preset.
-                        let per_beat_us = if beat_period_ms > 0.0 {
-                            (f64::from(beat_period_ms) * 1000.0) as i64
+                        let (per_beat_us, frozen_period_ms) = if beat_period_ms > 0.0 {
+                            ((f64::from(beat_period_ms) * 1000.0) as i64, beat_period_ms)
                         } else {
-                            500_000
+                            (500_000, 500.0)
                         };
                         let duration_us = per_beat_us.saturating_mul(beats_clamped);
                         let ends_at_micros = ev.ts_micros.saturating_add(duration_us);
@@ -923,6 +936,7 @@ impl EngineState {
                         s.one_shot = Some(OneShotState {
                             ends_at_micros,
                             was_enabled,
+                            beat_period_ms_at_dispatch: frozen_period_ms,
                         });
                     }
                 }
@@ -2175,6 +2189,77 @@ mod tests {
             },
         ));
         assert!(s.deck_a.effects[0].one_shot.is_none());
+    }
+
+    #[test]
+    fn effect_one_shot_freezes_beat_period_at_dispatch() {
+        // Regression for #128. After dispatch, beat-grid retune on the
+        // deck must NOT shift `ends_at_micros` or
+        // `beat_period_ms_at_dispatch`. UI countdowns + audio-thread
+        // sweep both rely on the frozen snapshot for "beats remaining"
+        // arithmetic.
+        let s = assigned_state(1, false, 120.0); // beat_period_ms = 500
+        let s = s.apply(&ev_with_ts(
+            10,
+            1_000_000,
+            EventKind::EffectOneShot {
+                deck: DeckId::A,
+                slot: 0,
+                beats: 4,
+            },
+        ));
+        let os_before = s.deck_a.effects[0].one_shot.unwrap();
+        assert_eq!(os_before.beat_period_ms_at_dispatch, 500.0);
+        assert_eq!(os_before.ends_at_micros, 1_000_000 + 4 * 500_000);
+
+        // Mid-flight DeckLoad at a new BPM (90 → ~666 ms/beat). The
+        // deck's live `beat_period_ms` updates; the slot's
+        // `beat_period_ms_at_dispatch` snapshot must NOT.
+        let s = s.apply(&ev(
+            11,
+            EventKind::DeckLoad {
+                deck: DeckId::A,
+                track: TrackRef {
+                    id: "t2".to_string(),
+                    path: "/tmp/t2.mp3".to_string(),
+                },
+                bpm: 90.0,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![],
+                hot_cues: default_hot_cues(),
+                track_gain_db: 0.0,
+            },
+        ));
+        let live_period = s.deck_a.beat_period_ms;
+        assert!(
+            (live_period - 60_000.0 / 90.0).abs() < 0.001,
+            "deck live beat_period_ms should reflect new BPM",
+        );
+        let os_after = s.deck_a.effects[0]
+            .one_shot
+            .expect("one_shot must survive DeckLoad (effects array is not reset by DeckLoad)");
+        assert_eq!(
+            os_after.beat_period_ms_at_dispatch, 500.0,
+            "frozen dispatch period must NOT track live beat_period_ms",
+        );
+        assert_eq!(
+            os_after.ends_at_micros, os_before.ends_at_micros,
+            "frozen end time must NOT shift on DeckLoad",
+        );
+
+        // PhaseNudge also preserves one_shot untouched.
+        let s = s.apply(&ev(
+            12,
+            EventKind::PhaseNudge {
+                deck: DeckId::A,
+                delta_ms: 10,
+            },
+        ));
+        let os_after_nudge = s.deck_a.effects[0].one_shot.unwrap();
+        assert_eq!(
+            os_after, os_after_nudge,
+            "PhaseNudge must not alter one_shot",
+        );
     }
 
     #[test]
