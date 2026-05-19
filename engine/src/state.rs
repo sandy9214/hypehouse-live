@@ -304,6 +304,26 @@ pub enum EventKind {
     SetMasterBpm {
         bpm: f32,
     },
+    /// Sidechain compressor on/off (issue #119). When enabled, the
+    /// master mix ducks the non-trigger deck under the trigger deck's
+    /// kick envelope. Audio DSP lands in a follow-up PR; this slice
+    /// ships the schema so the UI can render the toggle + params.
+    SetSidechainEnabled {
+        enabled: bool,
+    },
+    /// Update sidechain compressor parameters (issue #119). All fields
+    /// optional — fields set to `None` retain the prior value (so the
+    /// UI can adjust threshold without re-sending the full set).
+    /// Reducer clamps each provided value to its valid range; non-finite
+    /// values are silently ignored.
+    SetSidechainParams {
+        trigger_deck: Option<DeckId>,
+        threshold_db: Option<f32>,
+        ratio: Option<f32>,
+        attack_ms: Option<f32>,
+        release_ms: Option<f32>,
+        makeup_gain_db: Option<f32>,
+    },
     /// Effects (ADR-006).
     EffectAssign {
         deck: DeckId,
@@ -628,6 +648,39 @@ pub struct EngineState {
     /// `audio::clamp_master_limiter_threshold_db`.
     #[serde(default = "default_master_limiter_threshold_db")]
     pub master_limiter_threshold_db: f32,
+    /// Sidechain compressor config (issue #119). DSP wiring in
+    /// follow-up PR; this slice stores config + lets UI render the
+    /// settings panel.
+    #[serde(default)]
+    pub sidechain: SidechainConfig,
+}
+
+/// Sidechain compressor parameters. Mirrors industry-standard DJ
+/// ducking — kick of trigger deck pulls non-trigger deck down by
+/// `ratio:1` past `threshold_db`, with `attack`/`release` envelope.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct SidechainConfig {
+    pub enabled: bool,
+    pub trigger_deck: DeckId,
+    pub threshold_db: f32,
+    pub ratio: f32,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+    pub makeup_gain_db: f32,
+}
+
+impl Default for SidechainConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trigger_deck: DeckId::A,
+            threshold_db: -12.0,
+            ratio: 4.0,
+            attack_ms: 5.0,
+            release_ms: 200.0,
+            makeup_gain_db: 0.0,
+        }
+    }
 }
 
 fn default_master_bpm() -> f32 {
@@ -678,6 +731,7 @@ impl Default for EngineState {
             master_bpm: default_master_bpm(),
             master_limiter_enabled: default_master_limiter_enabled(),
             master_limiter_threshold_db: default_master_limiter_threshold_db(),
+            sidechain: SidechainConfig::default(),
         }
     }
 }
@@ -1081,6 +1135,47 @@ impl EngineState {
                 }
                 // Otherwise: no-op. The reducer is pure and the
                 // SharedClock side ignores bad values too.
+            }
+            EventKind::SetSidechainEnabled { enabled } => {
+                next.sidechain.enabled = *enabled;
+            }
+            EventKind::SetSidechainParams {
+                trigger_deck,
+                threshold_db,
+                ratio,
+                attack_ms,
+                release_ms,
+                makeup_gain_db,
+            } => {
+                let sc = &mut next.sidechain;
+                if let Some(deck) = trigger_deck {
+                    sc.trigger_deck = *deck;
+                }
+                if let Some(v) = threshold_db {
+                    if v.is_finite() {
+                        sc.threshold_db = v.clamp(-60.0, 0.0);
+                    }
+                }
+                if let Some(v) = ratio {
+                    if v.is_finite() {
+                        sc.ratio = v.clamp(1.0, 20.0);
+                    }
+                }
+                if let Some(v) = attack_ms {
+                    if v.is_finite() {
+                        sc.attack_ms = v.clamp(0.1, 100.0);
+                    }
+                }
+                if let Some(v) = release_ms {
+                    if v.is_finite() {
+                        sc.release_ms = v.clamp(10.0, 2000.0);
+                    }
+                }
+                if let Some(v) = makeup_gain_db {
+                    if v.is_finite() {
+                        sc.makeup_gain_db = v.clamp(0.0, 24.0);
+                    }
+                }
             }
             EventKind::TakeOver {
                 deck: id,
@@ -2198,6 +2293,125 @@ mod tests {
             },
         ));
         assert!(s.deck_a.effects[0].one_shot.is_none());
+    }
+
+    // -------- Sidechain compressor (#119 — schema slice) ----------
+
+    #[test]
+    fn sidechain_default_is_disabled_with_reasonable_params() {
+        let s = EngineState::default();
+        assert!(!s.sidechain.enabled);
+        assert!(matches!(s.sidechain.trigger_deck, DeckId::A));
+        assert!((s.sidechain.threshold_db - -12.0).abs() < f32::EPSILON);
+        assert!((s.sidechain.ratio - 4.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn set_sidechain_enabled_toggles() {
+        let s = EngineState::default();
+        let s = s.apply(&ev(1, EventKind::SetSidechainEnabled { enabled: true }));
+        assert!(s.sidechain.enabled);
+        let s = s.apply(&ev(2, EventKind::SetSidechainEnabled { enabled: false }));
+        assert!(!s.sidechain.enabled);
+    }
+
+    #[test]
+    fn set_sidechain_params_partial_update_preserves_other_fields() {
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::SetSidechainParams {
+                trigger_deck: None,
+                threshold_db: Some(-18.0),
+                ratio: None,
+                attack_ms: None,
+                release_ms: None,
+                makeup_gain_db: None,
+            },
+        ));
+        assert!((s.sidechain.threshold_db - -18.0).abs() < f32::EPSILON);
+        // ratio, attack, release, makeup unchanged from default.
+        assert!((s.sidechain.ratio - 4.0).abs() < f32::EPSILON);
+        assert!((s.sidechain.attack_ms - 5.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn set_sidechain_params_clamps_to_valid_ranges() {
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::SetSidechainParams {
+                trigger_deck: None,
+                threshold_db: Some(-100.0),
+                ratio: Some(50.0),
+                attack_ms: Some(0.0),
+                release_ms: Some(5000.0),
+                makeup_gain_db: Some(-5.0),
+            },
+        ));
+        assert!((s.sidechain.threshold_db - -60.0).abs() < f32::EPSILON);
+        assert!((s.sidechain.ratio - 20.0).abs() < f32::EPSILON);
+        assert!((s.sidechain.attack_ms - 0.1).abs() < f32::EPSILON);
+        assert!((s.sidechain.release_ms - 2000.0).abs() < f32::EPSILON);
+        assert!(s.sidechain.makeup_gain_db.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn set_sidechain_params_ignores_non_finite() {
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::SetSidechainParams {
+                trigger_deck: None,
+                threshold_db: Some(f32::NAN),
+                ratio: Some(f32::INFINITY),
+                attack_ms: None,
+                release_ms: None,
+                makeup_gain_db: None,
+            },
+        ));
+        // Defaults preserved.
+        assert!((s.sidechain.threshold_db - -12.0).abs() < f32::EPSILON);
+        assert!((s.sidechain.ratio - 4.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn set_sidechain_params_switches_trigger_deck() {
+        let s = EngineState::default();
+        let s = s.apply(&ev(
+            1,
+            EventKind::SetSidechainParams {
+                trigger_deck: Some(DeckId::B),
+                threshold_db: None,
+                ratio: None,
+                attack_ms: None,
+                release_ms: None,
+                makeup_gain_db: None,
+            },
+        ));
+        assert!(matches!(s.sidechain.trigger_deck, DeckId::B));
+    }
+
+    #[test]
+    fn sidechain_serde_roundtrip_with_wire_compat() {
+        // Newest snapshot — round-trips cleanly.
+        let s = EngineState::default();
+        let mut s = s.apply(&ev(1, EventKind::SetSidechainEnabled { enabled: true }));
+        s.sidechain.threshold_db = -18.0;
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(json.contains("sidechain"));
+        let s2: EngineState = serde_json::from_str(&json).expect("deserialize");
+        assert!(s2.sidechain.enabled);
+        assert!((s2.sidechain.threshold_db - -18.0).abs() < f32::EPSILON);
+
+        // Older snapshot — strip `sidechain` field, expect serde default.
+        let mut older = serde_json::to_value(EngineState::default()).expect("ser default");
+        if let Some(obj) = older.as_object_mut() {
+            obj.remove("sidechain");
+        }
+        let restored: EngineState = serde_json::from_value(older).expect("older snapshot");
+        assert!(!restored.sidechain.enabled);
+        assert!((restored.sidechain.threshold_db - -12.0).abs() < f32::EPSILON);
     }
 
     #[test]
