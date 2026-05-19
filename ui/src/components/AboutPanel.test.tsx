@@ -119,6 +119,12 @@ describe("AboutPanel", () => {
     __setSyncStatus({
       library_track_count: 42,
       pending_push_count: 0,
+      last_pull_micros: 0,
+      last_push_micros: 0,
+      last_pull_fetched: 0,
+      last_pull_applied: 0,
+      last_push_pushed: 0,
+      last_tick_error: "",
     });
     render(<AboutPanel client={makeClient()} />);
     expect(screen.getByTestId("about-library-count").textContent).toBe(
@@ -130,11 +136,66 @@ describe("AboutPanel", () => {
     __setSyncStatus({
       library_track_count: 42,
       pending_push_count: 3,
+      last_pull_micros: 0,
+      last_push_micros: 0,
+      last_pull_fetched: 0,
+      last_pull_applied: 0,
+      last_push_pushed: 0,
+      last_tick_error: "",
     });
     render(<AboutPanel client={makeClient()} />);
     expect(screen.getByTestId("about-library-count").textContent).toBe(
       "42 tracks · 3 pending sync",
     );
+  });
+
+  it("shows 'never' for last sync before first daemon tick", () => {
+    __setSyncStatus({
+      library_track_count: 5,
+      pending_push_count: 0,
+      last_pull_micros: 0,
+      last_push_micros: 0,
+      last_pull_fetched: 0,
+      last_pull_applied: 0,
+      last_push_pushed: 0,
+      last_tick_error: "",
+    });
+    render(<AboutPanel client={makeClient()} />);
+    expect(screen.getByTestId("about-last-sync").textContent).toBe("never");
+  });
+
+  it("shows seconds-ago string for a recent pull", () => {
+    const nowMs = Date.now();
+    __setSyncStatus({
+      library_track_count: 5,
+      pending_push_count: 0,
+      last_pull_micros: (nowMs - 12_000) * 1000,
+      last_push_micros: 0,
+      last_pull_fetched: 0,
+      last_pull_applied: 0,
+      last_push_pushed: 0,
+      last_tick_error: "",
+    });
+    render(<AboutPanel client={makeClient()} />);
+    const text = screen.getByTestId("about-last-sync").textContent ?? "";
+    expect(text.endsWith("s ago")).toBe(true);
+  });
+
+  it("appends tick-error suffix when daemon reports a fault", () => {
+    const nowMs = Date.now();
+    __setSyncStatus({
+      library_track_count: 5,
+      pending_push_count: 0,
+      last_pull_micros: (nowMs - 1_000) * 1000,
+      last_push_micros: 0,
+      last_pull_fetched: 0,
+      last_pull_applied: 0,
+      last_push_pushed: 0,
+      last_tick_error: "supabase: HTTP 503",
+    });
+    render(<AboutPanel client={makeClient()} />);
+    const text = screen.getByTestId("about-last-sync").textContent ?? "";
+    expect(text.includes("supabase: HTTP 503")).toBe(true);
   });
 
   it("renders all 7 feature flags", () => {
