@@ -40,8 +40,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Awaitable, Callable, Optional
 
+from .playlist import PlaylistQueue
 from .proposer import Proposal, TransitionProposer
-from .schemas import DeckId, EngineState, Event
+from .schemas import Deck, DeckId, EngineState, Event
 
 log = logging.getLogger(__name__)
 
@@ -126,12 +127,18 @@ class AutoMixController:
         *,
         state_changed: Optional[StateChangedFn] = None,
         lookahead_ms: int = DEFAULT_LOOKAHEAD_MS,
+        playlist: Optional[PlaylistQueue] = None,
         _clock: Optional[Callable[[], float]] = None,
     ) -> None:
         self._proposer = proposer
         self._submit_event = submit_event
         self._state_changed = state_changed
         self._lookahead_ms = lookahead_ms
+        # Optional explicit-queue source. When non-None and non-empty,
+        # the controller dequeues the head and builds a proposal around
+        # that track id instead of running the mashability ranker. Pass
+        # None to preserve pre-playlist-PR behaviour exactly.
+        self._playlist = playlist
         self._clock = _clock or time.monotonic
         # Per-source-deck state — auto-mix is opt-in PER deck, so both
         # decks need their own bookkeeping. Indexed by the *playing*
@@ -236,7 +243,7 @@ class AutoMixController:
                 await self._notify(deck_id, per.status, seconds_to_mix)
 
             if per.status == AutoMixStatus.IDLE:
-                proposal = self._proposer.on_state(state)
+                proposal = self._build_proposal(state)
                 if proposal is None:
                     # Library has nothing compatible — leave IDLE so a
                     # later tick can try again (library may grow mid-set).
@@ -303,6 +310,108 @@ class AutoMixController:
         if ref is None:
             return None
         return int(ref.duration_s * 1000)
+
+    def _build_proposal(self, state: EngineState) -> Optional[Proposal]:
+        """Pick the next track + build its event plan.
+
+        Priority rules:
+
+        1. If a playlist queue is wired AND non-empty, dequeue the head
+           and synthesize a :class:`Proposal` around that explicit
+           track — bypassing the mashability ranker. The DJ told us
+           what to play; honor it. Dangling entries (track removed
+           from library post-enqueue) are skipped by
+           :meth:`PlaylistQueue.dequeue` internally.
+        2. Otherwise, defer to the proposer's hysteresis-gated
+           mashability flow (the pre-PR behaviour).
+
+        Returns ``None`` when neither path can produce a proposal —
+        empty queue + ranker gates everything out, OR queue head's
+        track isn't in the library, OR no deck is currently playing.
+        """
+        # Mashability fallback — keep this *first* in the function so
+        # the import-cycle stays trivial. If we're going to use the
+        # ranker, we use it via the proposer (already in scope).
+        if self._playlist is None or len(self._playlist) == 0:
+            return self._proposer.on_state(state)
+
+        # Resolve the playing deck so we know which deck to target +
+        # which downbeat alignment to compute against. We mirror the
+        # proposer's heuristic by peeking at the EngineState directly.
+        active = _active_deck(state)
+        if active is None:
+            # Nothing playing — can't build a transition. Leave the
+            # queue head intact for the next tick.
+            return None
+        playing_deck_id, playing_deck = active
+        if playing_deck.loaded is None:
+            return None
+
+        # Pop the head — this is the consumption point. We do it
+        # *before* validating downstream so a malformed track id
+        # doesn't get retried every tick (the dequeue path already
+        # drops dangling-id entries; here we cope with the genuine
+        # "library got mutated mid-set" case).
+        track_id = self._playlist.dequeue()
+        if track_id is None:
+            return None
+        incoming = self._proposer._library.get(track_id)  # noqa: SLF001
+        if incoming is None:
+            # Race: dequeue() validated existence but a remove landed
+            # between then and now. Skip this tick — next iteration
+            # will try the next head.
+            return None
+
+        # Build the event sequence + plan shape directly. We bypass
+        # ``decisions.next_track_decision`` because it gates on
+        # mashability — the operator explicitly opted out of that gate
+        # by curating a playlist.
+        from .decisions import (
+            MashabilityFactors,
+            NextTrackPlan,
+            transition_plan,
+        )
+
+        target_deck_id, _ = state.other_deck(playing_deck_id)
+        # Score is informational only — we still surface it so the UI
+        # can show "this is a stretch / smooth blend" badges. Compute
+        # against the playing deck's loaded library row when we can.
+        playing_lib = self._proposer._library.get(  # noqa: SLF001
+            playing_deck.loaded.id
+        )
+        if playing_lib is not None:
+            from .decisions import mashability_score
+
+            score = mashability_score(
+                playing_lib.bpm,
+                playing_lib.camelot_key,
+                playing_lib.energy,
+                incoming,
+            )
+        else:
+            score = MashabilityFactors(0.0, 0.0, 0.0)
+
+        plan = NextTrackPlan(
+            incoming_track=incoming,
+            target_deck=target_deck_id,
+            score=score,
+            runner_ups=(),
+        )
+        events = tuple(transition_plan(state, plan))
+        shape = self._proposer._build_shape(  # noqa: SLF001
+            plan,
+            (60_000.0 / playing_deck.bpm) if playing_deck.bpm > 0 else 500.0,
+            playing_deck,
+        )
+        # Confidence: explicit DJ pick == treat as 1.0 even when the
+        # mashability penalty would say otherwise. The DJ knows.
+        return Proposal(
+            next_track_id=incoming.track_id,
+            transition_plan=shape,
+            confidence=1.0,
+            events=events,
+            score=score,
+        )
 
     async def _execute(self, deck_id: DeckId, proposal: Proposal) -> None:
         """Submit every event in the proposal's plan.
@@ -376,6 +485,25 @@ class AutoMixController:
         except RuntimeError:
             return
         loop.create_task(self._notify(deck_id, status, seconds_to_mix))
+
+
+def _active_deck(state: EngineState) -> Optional[tuple[DeckId, Deck]]:
+    """Pick the deck currently driving front-of-house audio.
+
+    Mirrors :func:`copilot.decisions._active_playing_deck` but kept
+    private to this module so the auto-mix layer doesn't reach into
+    decisions' private surface. Returns ``None`` when no deck is
+    playing — the playlist path treats that as "nothing to transition
+    *from*", same as the mashability path.
+    """
+    da, db = state.deck_a, state.deck_b
+    if da.playing and not db.playing:
+        return DeckId.A, da
+    if db.playing and not da.playing:
+        return DeckId.B, db
+    if da.playing and db.playing:
+        return (DeckId.A, da) if state.crossfader < 0.5 else (DeckId.B, db)
+    return None
 
 
 __all__ = [

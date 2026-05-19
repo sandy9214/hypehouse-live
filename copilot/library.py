@@ -63,9 +63,13 @@ if TYPE_CHECKING:  # pragma: no cover — type-only import to break cycle.
 # JSON blob in a single ``json`` column — schema-light because the
 # captured field set is still churning. See ``copilot/presets.py`` for
 # the in-memory shape + wire projection.
+# v8 adds the ``playlist_queue`` table — DJ-curated next-track order
+# consulted by the auto-mix controller before the mashability ranker.
+# See ``copilot/playlist.py`` for the row shape, mutation API, and the
+# auto-mix integration contract.
 # Migrations dispatch on the gap between this constant and the value
 # recorded in the ``schema_version`` table.
-TRACK_SCHEMA_VERSION = 7
+TRACK_SCHEMA_VERSION = 8
 
 LOUDNESS_TARGET_LUFS = -14.0
 
@@ -337,6 +341,28 @@ class TrackLibrary:
             );
             CREATE INDEX IF NOT EXISTS presets_created_at_idx
                 ON presets (created_at DESC);
+            """
+        )
+        # v8 migration — DJ playlist queue. One row per queued track;
+        # ``position`` is the 0-indexed play order (dense; recomputed
+        # on every mutation by :class:`copilot.playlist.PlaylistQueue`
+        # so the wire shape never carries holes). ``added_at`` is a
+        # plain ISO-8601 string so debug dumps stay grep-friendly —
+        # SQLite has no native TIMESTAMP type. ``track_id`` is NOT a
+        # SQL FK against ``tracks`` because a library re-scan can
+        # legitimately drop rows that the queue still references; the
+        # dequeue path resolves liveness against the library at
+        # consume time and silently skips dangling entries.
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS playlist_queue (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                track_id   TEXT NOT NULL,
+                position   INTEGER NOT NULL,
+                added_at   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS playlist_queue_pos_idx
+                ON playlist_queue (position);
             """
         )
         # Stamp the current schema version. The ``schema_version``

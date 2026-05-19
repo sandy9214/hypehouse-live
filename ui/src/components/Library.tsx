@@ -70,7 +70,10 @@ const searchStyle: CSSProperties = {
 
 const columnsRowStyle: CSSProperties = {
   display: "grid",
-  gridTemplateColumns: "2fr 1fr 64px 56px 72px 96px",
+  // Mirror the 7-col grid in `TrackRow.tsx` — the trailing column was
+  // widened from 96 to 156px to fit the playlist-queue PR's
+  // "→ Queue" button alongside the existing deck-load actions.
+  gridTemplateColumns: "2fr 1fr 64px 56px 72px 156px",
   gap: 8,
   padding: "4px 8px",
   fontSize: 11,
