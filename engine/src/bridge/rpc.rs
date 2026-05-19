@@ -229,6 +229,12 @@ pub enum BridgeNotice {
         /// is wired (e.g. unit tests that hit the bare
         /// `EngineHandle::new()` constructor).
         master_limiter_gain_reduction_db: f32,
+        /// Live sidechain compressor gain reduction in dB. Same audio-
+        /// thread atomic pattern as `master_limiter_gain_reduction_db`
+        /// — sampled once per notification. `0.0` when sidechain is
+        /// bypassed or when no GR atomic is wired (test path). #119
+        /// follow-up.
+        sidechain_gain_reduction_db: f32,
         /// Active tempo source at the moment this notification was
         /// built. Sourced from the shared clock's atomic — same
         /// rationale as `master_limiter_gain_reduction_db`: a live
@@ -293,6 +299,13 @@ struct EngineInner {
     /// the UI meter can render live. `None` in tests that don't spin
     /// up a real audio thread; the wire payload then carries `0.0`.
     master_limiter_gr: std::sync::Mutex<Option<Arc<AtomicI16>>>,
+    /// Optional shared handle on the sidechain compressor's
+    /// gain-reduction readout. Same pattern as `master_limiter_gr` —
+    /// `Some` once `attach_sidechain_gr` is called from `main.rs`; the
+    /// StateChanged emitter stamps a fresh sample on every notification
+    /// so the UI ducking meter can render without polling. #119
+    /// follow-up.
+    sidechain_gr: std::sync::Mutex<Option<Arc<AtomicI16>>>,
     /// Optional handle on the engine's `SharedClock`. When `Some`, every
     /// `BridgeNotice::StateChanged` we publish stamps the active
     /// [`ClockSource`] read off the clock's atomic so the UI BPM-lock
@@ -336,6 +349,7 @@ impl EngineHandle {
             boot_instant: Instant::now(),
             event_sink,
             master_limiter_gr: std::sync::Mutex::new(None),
+            sidechain_gr: std::sync::Mutex::new(None),
             shared_clock: std::sync::Mutex::new(None),
             perf_metrics: std::sync::Mutex::new(None),
         };
@@ -367,6 +381,33 @@ impl EngineHandle {
             .master_limiter_gr
             .lock()
             .expect("engine master_limiter_gr poisoned");
+        match slot.as_ref() {
+            None => 0.0,
+            Some(a) => decode_gain_reduction_db(a.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Wire the audio thread's sidechain compressor gain-reduction
+    /// atomic into this handle. Called once at startup; re-calling
+    /// replaces the previous handle so a future hot-swap is safe.
+    pub fn attach_sidechain_gr(&self, gr: Arc<AtomicI16>) {
+        let mut slot = self
+            .inner
+            .sidechain_gr
+            .lock()
+            .expect("engine sidechain_gr poisoned");
+        *slot = Some(gr);
+    }
+
+    /// Read the live sidechain gain reduction in dB. Returns `0.0`
+    /// when no audio thread is wired (test/bare mode) or when the
+    /// sidechain is bypassed.
+    pub fn sidechain_gain_reduction_db(&self) -> f32 {
+        let slot = self
+            .inner
+            .sidechain_gr
+            .lock()
+            .expect("engine sidechain_gr poisoned");
         match slot.as_ref() {
             None => 0.0,
             Some(a) => decode_gain_reduction_db(a.load(Ordering::Relaxed)),
@@ -587,12 +628,14 @@ impl EngineHandle {
         self.inner.log.lock().expect("engine log poisoned").push(ev);
 
         let gr_db = self.master_limiter_gain_reduction_db();
+        let sc_gr_db = self.sidechain_gain_reduction_db();
         let clock_source = self.clock_source();
         let perf = self.perf_snapshot();
         let _ = self.inner.notices.send(BridgeNotice::StateChanged {
             state: Box::new(next_state),
             last_event_id: id,
             master_limiter_gain_reduction_db: gr_db,
+            sidechain_gain_reduction_db: sc_gr_db,
             clock_source,
             perf,
         });
@@ -1077,6 +1120,7 @@ pub fn state_changed_notification(
     state: &EngineState,
     last_event_id: u64,
     master_limiter_gain_reduction_db: f32,
+    sidechain_gain_reduction_db: f32,
     clock_source: ClockSource,
     perf: PerfSnapshot,
 ) -> RpcNotification {
@@ -1086,6 +1130,7 @@ pub fn state_changed_notification(
             "state": state,
             "last_event_id": last_event_id,
             "master_limiter_gain_reduction_db": master_limiter_gain_reduction_db,
+            "sidechain_gain_reduction_db": sidechain_gain_reduction_db,
             "clock_source": clock_source.as_str(),
             "perf": perf,
         }),
@@ -1315,6 +1360,7 @@ mod tests {
                 state,
                 last_event_id,
                 master_limiter_gain_reduction_db,
+                sidechain_gain_reduction_db,
                 clock_source,
                 perf,
             } => {
@@ -1322,6 +1368,8 @@ mod tests {
                 assert!(state.deck_a.playing);
                 // No audio thread wired in tests; GR defaults to 0.
                 assert!(master_limiter_gain_reduction_db.abs() < f32::EPSILON);
+                // Same for sidechain GR — not wired by bare test handle.
+                assert!(sidechain_gain_reduction_db.abs() < f32::EPSILON);
                 // No shared clock wired in tests; source defaults to Internal.
                 assert_eq!(clock_source, ClockSource::Internal);
                 // No audio thread wired in tests; perf defaults to zero-snapshot.
@@ -1419,6 +1467,7 @@ mod tests {
             &EngineState::default(),
             1,
             -3.0,
+            0.0,
             ClockSource::Internal,
             PerfSnapshot::default(),
         );
@@ -1427,6 +1476,43 @@ mod tests {
             .as_f64()
             .unwrap();
         assert!((gr_v - (-3.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn state_changed_notification_includes_sidechain_gr_when_wired() {
+        let e = engine();
+        let gr = Arc::new(AtomicI16::new(-25)); // -2.5 dB
+        e.attach_sidechain_gr(Arc::clone(&gr));
+        let mut rx = e.subscribe();
+        e.submit_event_kind(EventKind::DeckPlay { deck: DeckId::A }, EventSource::Ui);
+        let n = rx.try_recv().expect("notification queued");
+        match n {
+            BridgeNotice::StateChanged {
+                sidechain_gain_reduction_db,
+                ..
+            } => {
+                assert!(
+                    (sidechain_gain_reduction_db - (-2.5)).abs() < 0.05,
+                    "expected -2.5 dB sidechain GR, got {sidechain_gain_reduction_db}",
+                );
+            }
+            BridgeNotice::AudioAlert { .. } | BridgeNotice::DecodeError { .. } => {
+                panic!("expected StateChanged")
+            }
+        }
+        let frame = state_changed_notification(
+            &EngineState::default(),
+            1,
+            0.0,
+            -2.5,
+            ClockSource::Internal,
+            PerfSnapshot::default(),
+        );
+        let payload = serde_json::to_value(&frame).unwrap();
+        let sc_v = payload["params"]["sidechain_gain_reduction_db"]
+            .as_f64()
+            .unwrap();
+        assert!((sc_v - (-2.5)).abs() < 1e-6);
     }
 
     #[test]
@@ -1457,6 +1543,7 @@ mod tests {
             &EngineState::default(),
             1,
             0.0,
+            0.0,
             ClockSource::MidiIn,
             PerfSnapshot::default(),
         );
@@ -1466,6 +1553,7 @@ mod tests {
             &EngineState::default(),
             1,
             0.0,
+            0.0,
             ClockSource::AbletonLink,
             PerfSnapshot::default(),
         );
@@ -1474,6 +1562,7 @@ mod tests {
         let frame3 = state_changed_notification(
             &EngineState::default(),
             1,
+            0.0,
             0.0,
             ClockSource::Internal,
             PerfSnapshot::default(),
@@ -1521,6 +1610,7 @@ mod tests {
         let frame = state_changed_notification(
             &EngineState::default(),
             7,
+            0.0,
             0.0,
             ClockSource::Internal,
             snap,

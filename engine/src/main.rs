@@ -257,6 +257,9 @@ async fn main() -> Result<()> {
     // into the bridge so every outgoing `engine.state_changed`
     // notification carries the live GR value for the UI meter.
     engine.attach_master_limiter_gr(stream.master_limiter_gr.clone());
+    // Sidechain GR mirror — same pattern, drives the UI ducking meter
+    // alongside the master-limiter readout (#119 follow-up).
+    engine.attach_sidechain_gr(stream.sidechain_gr.clone());
     // Wire the SharedClock into the bridge so every outgoing
     // `engine.state_changed` notification carries the active
     // `clock_source` (Internal / MidiIn / AbletonLink) for the UI
