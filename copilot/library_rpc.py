@@ -46,8 +46,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .key_match import camelot_to_semitones
 from .library import (
@@ -57,6 +58,9 @@ from .library import (
     TrackLibrary,
     TrackRef,
 )
+
+if TYPE_CHECKING:  # pragma: no cover — type-only import
+    from .streaming import StreamingProvider
 
 log = logging.getLogger(__name__)
 
@@ -120,6 +124,11 @@ def track_ref_to_wire(t: TrackRef) -> dict[str, Any]:
         "track_gain_db": (
             None if t.track_gain_db is None else float(t.track_gain_db)
         ),
+        # Schema v9 — row provenance. ``"local"`` for filesystem
+        # paths; provider name (``"soundcloud"`` etc.) for streaming
+        # rows. UI uses this to render a provider chip on library
+        # rows.
+        "source": t.source,
     }
 
 
@@ -202,11 +211,26 @@ class LibraryRpcHandler:
     # this handler rather than spinning up a separate RpcHandler class.
     # Wire layer pre-filters via :meth:`handles` which already covers
     # both ``library.*`` and ``key_match.*``.
+    #
+    # ``streaming.search`` / ``streaming.add_to_library`` are wired
+    # through this handler too — same reason (shared library access).
+    # The handler keeps a lazy provider registry; missing creds raise
+    # ``-32000`` (feature-not-installed) at the dispatch boundary so
+    # the UI can pop a "configure SoundCloud" affordance.
     EXTRA_METHODS = (
         "key_match.compute_offset",
+        "streaming.search",
+        "streaming.add_to_library",
     )
 
-    def __init__(self, library: TrackLibrary):
+    def __init__(
+        self,
+        library: TrackLibrary,
+        *,
+        streaming_providers: (
+            "dict[str, StreamingProvider] | None"
+        ) = None,
+    ):
         self._library = library
         # Per-process registry of in-flight stem-computation tasks,
         # keyed by ``track_id``. Kicking ``library.compute_stems``
@@ -216,6 +240,14 @@ class LibraryRpcHandler:
         # garbage-collect the task mid-compute (see
         # https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task).
         self._stem_tasks: dict[str, asyncio.Task[None]] = {}
+        # Lazy streaming-provider registry. Tests inject a fake;
+        # production construction uses :meth:`_lazy_get_provider`
+        # which instantiates the matching client on first access (so
+        # an operator without ``$SOUNDCLOUD_CLIENT_ID`` can still
+        # boot the co-pilot service — they just can't use streaming).
+        self._streaming_providers: dict[str, StreamingProvider] = (
+            dict(streaming_providers) if streaming_providers else {}
+        )
 
     @property
     def fully_qualified_methods(self) -> tuple[str, ...]:
@@ -262,6 +294,10 @@ class LibraryRpcHandler:
             return self._get_stems(params)
         if method == "key_match.compute_offset":
             return self._key_match_compute_offset(params)
+        if method == "streaming.search":
+            return self._streaming_search(params)
+        if method == "streaming.add_to_library":
+            return self._streaming_add_to_library(params)
         raise RpcError(-32601, f"method not found: {method}")
 
     # --- handlers -----------------------------------------------------
@@ -684,3 +720,196 @@ class LibraryRpcHandler:
             )
         offset = camelot_to_semitones(from_ref.camelot_key, to_ref.camelot_key)
         return {"semitones": float(offset)}
+
+    # --- streaming.* -------------------------------------------------
+
+    def _lazy_get_provider(self, name: str) -> "StreamingProvider":
+        """Return the cached provider client for ``name`` (lazy-instantiate).
+
+        Constructed on first request rather than at handler-init time
+        so an operator without streaming creds can still boot the
+        co-pilot — the only failure is at the moment they try to use
+        the feature, which is when a UI affordance can guide them
+        through the apply-for-key flow.
+
+        Raises:
+            RpcError: ``-32602`` unknown provider; ``-32000`` provider
+                creds not configured (the
+                :class:`StreamingAuthError` from the client's __init__
+                is translated here).
+        """
+        # Lazy import — the streaming module pulls urllib only, but
+        # keeping it lazy means the existing library_rpc tests don't
+        # import network code at collection time.
+        from .streaming import StreamingAuthError
+        from .streaming.soundcloud import SoundCloudClient
+
+        cached = self._streaming_providers.get(name)
+        if cached is not None:
+            return cached
+
+        client: "StreamingProvider"
+        if name == "soundcloud":
+            try:
+                client = SoundCloudClient()
+            except StreamingAuthError as exc:
+                # Surface the apply-for-key hint to the UI via the
+                # JSON-RPC error envelope's ``message`` field. The
+                # ``-32000`` code mirrors the missing-demucs branch in
+                # ``compute_stems`` so the UI's single "configure
+                # optional feature" handler covers both.
+                raise RpcError(
+                    JSONRPC_FEATURE_NOT_INSTALLED,
+                    str(exc),
+                    data={"provider": name},
+                ) from exc
+        else:
+            raise RpcError(
+                JSONRPC_INVALID_PARAMS,
+                f"unknown streaming provider: {name}",
+                data={"provider": name},
+            )
+        self._streaming_providers[name] = client
+        return client
+
+    def _streaming_search(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Search a streaming provider's catalog.
+
+        Wire shape::
+
+            { "provider": "soundcloud", "query": "lo-fi", "limit": 20 }
+
+        Returns::
+
+            { "provider": "soundcloud",
+              "query":    "lo-fi",
+              "results":  [ { "id": "...", "title": "...", ... }, ... ] }
+
+        Errors:
+            * ``-32602`` — missing / malformed param, unknown provider.
+            * ``-32000`` — provider creds not configured (apply-for-key
+              hint in ``message``).
+            * ``-32603`` — provider API error (network / 5xx).
+        """
+        provider_name = _coerce_str(
+            params.get("provider"), field="provider"
+        )
+        query = _coerce_str(
+            params.get("query"), field="query", allow_empty=True
+        )
+        limit = _coerce_int(params.get("limit"), field="limit", default=20)
+        provider = self._lazy_get_provider(provider_name)
+        # Lazy import for the typed exception — same reason as the
+        # provider lookup; keeps library_rpc importable when streaming
+        # is unused.
+        from .streaming import StreamingAuthError, StreamingError
+
+        try:
+            results = provider.search(query, limit=limit)
+        except StreamingAuthError as exc:
+            raise RpcError(
+                JSONRPC_FEATURE_NOT_INSTALLED,
+                str(exc),
+                data={"provider": provider_name},
+            ) from exc
+        except StreamingError as exc:
+            raise RpcError(
+                JSONRPC_INTERNAL_ERROR,
+                f"streaming provider error: {exc}",
+                data={"provider": provider_name},
+            ) from exc
+        return {
+            "provider": provider_name,
+            "query": query,
+            "results": [asdict(t) for t in results],
+        }
+
+    def _streaming_add_to_library(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Persist a streaming track into the library.
+
+        Wire shape::
+
+            { "provider":  "soundcloud",
+              "track_id":  "<provider-scoped id>",
+              "metadata":  { "title": "...", "artist": "...",
+                             "duration_s": 234.0,
+                             "genre": "...", "license": "cc-by",
+                             "key": "8B"  } }
+
+        ``metadata`` is the same shape :meth:`_streaming_search`
+        returns per result (an ``asdict`` of :class:`StreamingTrack`).
+        Caller round-trips the metadata so the library doesn't need a
+        second provider call at add time.
+
+        Returns::
+
+            { "track": <TrackRef wire shape> }
+
+        Errors:
+            * ``-32602`` — missing fields / malformed types / non-CC
+              ``license`` (defence-in-depth — search should have
+              filtered, but we re-check at the trust boundary).
+        """
+        from .streaming import is_cc_license
+
+        provider_name = _coerce_str(
+            params.get("provider"), field="provider"
+        )
+        track_id = _coerce_str(params.get("track_id"), field="track_id")
+        metadata = params.get("metadata")
+        if not isinstance(metadata, dict):
+            raise RpcError(
+                JSONRPC_INVALID_PARAMS,
+                "metadata must be an object",
+            )
+        # Re-check license — the search-time filter is best effort;
+        # this is the library trust boundary. ARR / unknown licenses
+        # are rejected with a loud error so a buggy provider can't
+        # poison the catalog.
+        license_str = metadata.get("license")
+        if not isinstance(license_str, str) or not is_cc_license(license_str):
+            raise RpcError(
+                JSONRPC_INVALID_PARAMS,
+                f"license must be Creative Commons, got {license_str!r}",
+                data={"license": license_str},
+            )
+        title_raw = metadata.get("title")
+        if not isinstance(title_raw, str) or not title_raw:
+            raise RpcError(
+                JSONRPC_INVALID_PARAMS,
+                "metadata.title must be a non-empty string",
+            )
+        artist_raw = metadata.get("artist")
+        artist = artist_raw if isinstance(artist_raw, str) else ""
+        duration_raw = metadata.get("duration_s")
+        if not isinstance(duration_raw, (int, float)) or isinstance(
+            duration_raw, bool
+        ):
+            raise RpcError(
+                JSONRPC_INVALID_PARAMS,
+                "metadata.duration_s must be a number",
+            )
+        stream_url_raw = metadata.get("stream_url")
+        if not isinstance(stream_url_raw, str) or not stream_url_raw:
+            raise RpcError(
+                JSONRPC_INVALID_PARAMS,
+                "metadata.stream_url must be a non-empty string",
+            )
+        key_raw = metadata.get("key")
+        camelot_key = key_raw if isinstance(key_raw, str) else None
+        genre_raw = metadata.get("genre")
+        genre = genre_raw if isinstance(genre_raw, str) else ""
+
+        ref = self._library.add_streaming_track(
+            provider=provider_name,
+            track_id=track_id,
+            title=title_raw,
+            artist=artist,
+            duration_s=float(duration_raw),
+            stream_url=stream_url_raw,
+            camelot_key=camelot_key,
+            genre=genre,
+        )
+        return {"track": track_ref_to_wire(ref)}
