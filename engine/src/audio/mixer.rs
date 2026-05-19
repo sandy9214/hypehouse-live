@@ -601,11 +601,45 @@ impl AudioMixer {
             // behind each variant.
             let (gain_a, gain_b) = crossfader_gains(self.crossfader, self.crossfader_curve);
 
-            // Downmix to mono + crossfade. Reuses the v0.1 contract
-            // (the engine output is mono until a separate stereo PR).
+            // Sidechain coefficients — fixed across this render block.
+            // Attack / release / makeup don't change at sample rate, so
+            // amortise the f32::exp + powf over the whole chunk.
+            let sc_attack = crate::audio::sidechain::time_coefficient(
+                self.sidechain.attack_ms,
+                self.sample_rate,
+            );
+            let sc_release = crate::audio::sidechain::time_coefficient(
+                self.sidechain.release_ms,
+                self.sample_rate,
+            );
+            let sc_makeup = crate::audio::sidechain::db_to_linear(self.sidechain.makeup_gain_db);
+
+            // Downmix to mono + (optionally sidechain-duck) + crossfade.
+            // Reuses the v0.1 contract (engine output is mono until a
+            // separate stereo PR).
             for i in 0..chunk {
-                let a = 0.5 * (a_slice[i * 2] + a_slice[i * 2 + 1]);
-                let b = 0.5 * (b_slice[i * 2] + b_slice[i * 2 + 1]);
+                let mut a = 0.5 * (a_slice[i * 2] + a_slice[i * 2 + 1]);
+                let mut b = 0.5 * (b_slice[i * 2] + b_slice[i * 2 + 1]);
+                if self.sidechain.enabled {
+                    let (trigger, non_trigger) = if self.sidechain.trigger_deck_is_a {
+                        (a, b)
+                    } else {
+                        (b, a)
+                    };
+                    let (_t, nt) = crate::audio::sidechain::process_sample(
+                        trigger,
+                        non_trigger,
+                        &mut self.sidechain,
+                        sc_attack,
+                        sc_release,
+                        sc_makeup,
+                    );
+                    if self.sidechain.trigger_deck_is_a {
+                        b = nt;
+                    } else {
+                        a = nt;
+                    }
+                }
                 let mix = a * gain_a + b * gain_b;
                 out[written + i] = mix;
             }
@@ -1686,6 +1720,109 @@ mod tests {
             deck: DeckId::B,
             handle: DecodeHandle::NONE,
             track_gain_db: -6.0,
+        }));
+        let mut buf = [0.0; 1024];
+        assert_no_alloc::assert_no_alloc(|| {
+            m.render(&mut buf);
+        });
+    }
+
+    // ----- Sidechain integration (#119 audio slice 2) -----
+
+    #[test]
+    fn sidechain_disabled_is_identical_to_pre_pr_render() {
+        // Both decks playing, oscillator path. With sidechain off
+        // the output should match the plain crossfade — i.e. the
+        // sidechain branch is a true no-op when disabled.
+        let mut m = AudioMixer::new(48_000);
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::A }));
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::B }));
+        m.apply(cmd(AudioCommandKind::Crossfader {
+            target: 0.5,
+            ramp_frames: 0,
+        }));
+        let mut buf_off = [0.0; 256];
+        m.render(&mut buf_off);
+
+        let mut m2 = AudioMixer::new(48_000);
+        m2.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::A }));
+        m2.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::B }));
+        m2.apply(cmd(AudioCommandKind::Crossfader {
+            target: 0.5,
+            ramp_frames: 0,
+        }));
+        m2.apply(cmd(AudioCommandKind::SetSidechain {
+            enabled: false,
+            trigger_deck_is_a: true,
+            threshold_db: -12.0,
+            ratio: 4.0,
+            attack_ms: 5.0,
+            release_ms: 200.0,
+            makeup_gain_db: 0.0,
+        }));
+        let mut buf_off2 = [0.0; 256];
+        m2.render(&mut buf_off2);
+
+        for (a, b) in buf_off.iter().zip(buf_off2.iter()) {
+            assert!((a - b).abs() < 1e-6, "disabled sidechain must be no-op");
+        }
+    }
+
+    #[test]
+    fn sidechain_enabled_ducks_non_trigger_deck_amplitude() {
+        // With both decks playing oscillator + sidechain ON triggered
+        // on A, the post-sidechain output should be quieter than the
+        // disabled-sidechain baseline (the B path got ducked).
+        let mut baseline = AudioMixer::new(48_000);
+        baseline.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::A }));
+        baseline.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::B }));
+        baseline.apply(cmd(AudioCommandKind::Crossfader {
+            target: 1.0, // All B — so the duck shows up clearly.
+            ramp_frames: 0,
+        }));
+        let mut buf_baseline = [0.0; 48_000 / 10];
+        baseline.render(&mut buf_baseline);
+        let baseline_energy: f32 = buf_baseline.iter().map(|s| s * s).sum();
+
+        let mut ducked = AudioMixer::new(48_000);
+        ducked.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::A }));
+        ducked.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::B }));
+        ducked.apply(cmd(AudioCommandKind::Crossfader {
+            target: 1.0,
+            ramp_frames: 0,
+        }));
+        ducked.apply(cmd(AudioCommandKind::SetSidechain {
+            enabled: true,
+            trigger_deck_is_a: true,
+            threshold_db: -24.0, // low threshold so the duck definitely kicks in
+            ratio: 8.0,
+            attack_ms: 1.0,
+            release_ms: 200.0,
+            makeup_gain_db: 0.0,
+        }));
+        let mut buf_ducked = [0.0; 48_000 / 10];
+        ducked.render(&mut buf_ducked);
+        let ducked_energy: f32 = buf_ducked.iter().map(|s| s * s).sum();
+
+        assert!(
+            ducked_energy < baseline_energy * 0.9,
+            "sidechain should reduce non-trigger energy: baseline={baseline_energy} ducked={ducked_energy}",
+        );
+    }
+
+    #[test]
+    fn sidechain_render_path_is_alloc_free() {
+        let mut m = AudioMixer::new(48_000);
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::A }));
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::B }));
+        m.apply(cmd(AudioCommandKind::SetSidechain {
+            enabled: true,
+            trigger_deck_is_a: true,
+            threshold_db: -12.0,
+            ratio: 4.0,
+            attack_ms: 5.0,
+            release_ms: 200.0,
+            makeup_gain_db: 0.0,
         }));
         let mut buf = [0.0; 1024];
         assert_no_alloc::assert_no_alloc(|| {
