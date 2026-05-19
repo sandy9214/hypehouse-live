@@ -36,6 +36,7 @@
 //! perceptible smear, but enough to eliminate the click. See ADR-004's
 //! comments on smooth-ramp parameter changes.
 
+use std::sync::atomic::{AtomicI16, Ordering};
 use std::sync::Arc;
 
 use crate::audio::clock::SharedClock;
@@ -215,6 +216,13 @@ pub struct AudioMixer {
     /// caches the latest config so the route step has its params
     /// ready when wired.
     sidechain: crate::audio::sidechain::SidechainState,
+    /// Sidechain compressor gain-reduction readout (dB × `GAIN_REDUCTION_SCALE`).
+    /// Audio thread writes the worst-case (most negative) GR seen
+    /// during each render block at end-of-block; control thread reads
+    /// via [`AudioMixer::sidechain_gain_reduction_atomic`] for the UI
+    /// meter. Always `≤ 0` (encoded i16). Stays at 0 when sidechain is
+    /// bypassed.
+    sidechain_gr_atomic: Arc<AtomicI16>,
 }
 
 /// Per-deck pitch/tempo output scratch capacity (interleaved stereo
@@ -252,6 +260,7 @@ impl AudioMixer {
             rec_scratch: [0.0; STEREO_PULL_FRAMES * 2],
             limiter: MasterLimiter::new(sample_rate),
             sidechain: crate::audio::sidechain::SidechainState::default(),
+            sidechain_gr_atomic: Arc::new(AtomicI16::new(0)),
         }
     }
 
@@ -644,6 +653,31 @@ impl AudioMixer {
                 out[written + i] = mix;
             }
 
+            // Update the sidechain gain-reduction atomic for the UI
+            // meter. Computed once per render block from the
+            // end-of-block envelope — stale by at most one block
+            // (~5 ms at 256-frame chunks @ 48 kHz). When the
+            // sidechain is bypassed we publish 0 dB so the meter
+            // springs back instantly on disengage.
+            let sc_gr_db = if self.sidechain.enabled {
+                let gain_lin = crate::audio::sidechain::compressor_gain(
+                    self.sidechain.envelope,
+                    self.sidechain.threshold_db,
+                    self.sidechain.ratio,
+                );
+                if gain_lin >= 1.0 {
+                    0.0
+                } else {
+                    crate::audio::sidechain::linear_to_db(gain_lin).max(-60.0)
+                }
+            } else {
+                0.0
+            };
+            let sc_gr_encoded =
+                (sc_gr_db * crate::audio::limiter::GAIN_REDUCTION_SCALE).round() as i16;
+            self.sidechain_gr_atomic
+                .store(sc_gr_encoded, Ordering::Relaxed);
+
             // Master-bus soft-clip limiter. Run **before** both the
             // recorder tee and the cpal output so the live mix +
             // saved `master.wav` are both protected. When the limiter
@@ -689,6 +723,22 @@ impl AudioMixer {
         &self,
     ) -> std::sync::Arc<std::sync::atomic::AtomicI16> {
         self.limiter.shared_gain_reduction()
+    }
+
+    /// Cheap clone of the sidechain compressor's gain-reduction
+    /// atomic. Mirror of `master_limiter_gain_reduction_atomic` —
+    /// reader is the bridge thread for the UI ducking meter (#119
+    /// follow-up). Encoded `i16 = dB × GAIN_REDUCTION_SCALE`; `0`
+    /// when the sidechain is bypassed.
+    pub fn sidechain_gain_reduction_atomic(&self) -> std::sync::Arc<std::sync::atomic::AtomicI16> {
+        Arc::clone(&self.sidechain_gr_atomic)
+    }
+
+    /// Current sidechain gain-reduction in dB, decoded from the
+    /// shared atomic. Test seam — production reads via the bridge
+    /// state-changed pipeline.
+    pub fn current_sidechain_gain_reduction_db(&self) -> f32 {
+        crate::audio::decode_gain_reduction_db(self.sidechain_gr_atomic.load(Ordering::Relaxed))
     }
 
     /// Return a mutable borrow of the per-deck pitch/tempo processor.
@@ -1807,6 +1857,74 @@ mod tests {
         assert!(
             ducked_energy < baseline_energy * 0.9,
             "sidechain should reduce non-trigger energy: baseline={baseline_energy} ducked={ducked_energy}",
+        );
+    }
+
+    #[test]
+    fn sidechain_gr_atomic_zero_when_disabled() {
+        let mut m = AudioMixer::new(48_000);
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::A }));
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::B }));
+        let mut buf = [0.0; 256];
+        m.render(&mut buf);
+        assert_eq!(m.current_sidechain_gain_reduction_db(), 0.0);
+    }
+
+    #[test]
+    fn sidechain_gr_atomic_reads_negative_when_ducking() {
+        let mut m = AudioMixer::new(48_000);
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::A }));
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::B }));
+        m.apply(cmd(AudioCommandKind::SetSidechain {
+            enabled: true,
+            trigger_deck_is_a: true,
+            threshold_db: -24.0,
+            ratio: 8.0,
+            attack_ms: 1.0,
+            release_ms: 200.0,
+            makeup_gain_db: 0.0,
+        }));
+        // Render ~100 ms to let the envelope settle above threshold.
+        let mut buf = [0.0; 4800];
+        m.render(&mut buf);
+        let gr = m.current_sidechain_gain_reduction_db();
+        assert!(
+            gr < 0.0,
+            "sidechain GR should be negative while ducking; got {gr}",
+        );
+    }
+
+    #[test]
+    fn sidechain_gr_atomic_returns_to_zero_after_disable() {
+        let mut m = AudioMixer::new(48_000);
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::A }));
+        m.apply(cmd(AudioCommandKind::DeckPlay { deck: DeckId::B }));
+        m.apply(cmd(AudioCommandKind::SetSidechain {
+            enabled: true,
+            trigger_deck_is_a: true,
+            threshold_db: -24.0,
+            ratio: 8.0,
+            attack_ms: 1.0,
+            release_ms: 200.0,
+            makeup_gain_db: 0.0,
+        }));
+        let mut buf = [0.0; 4800];
+        m.render(&mut buf);
+        assert!(m.current_sidechain_gain_reduction_db() < 0.0);
+        m.apply(cmd(AudioCommandKind::SetSidechain {
+            enabled: false,
+            trigger_deck_is_a: true,
+            threshold_db: -24.0,
+            ratio: 8.0,
+            attack_ms: 1.0,
+            release_ms: 200.0,
+            makeup_gain_db: 0.0,
+        }));
+        m.render(&mut buf);
+        assert_eq!(
+            m.current_sidechain_gain_reduction_db(),
+            0.0,
+            "GR must return to 0 dB on disable",
         );
     }
 
