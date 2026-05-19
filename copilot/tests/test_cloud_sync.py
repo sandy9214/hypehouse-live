@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from copilot.cloud_sync import (
     ConflictOutcome,
     InMemorySyncClient,
