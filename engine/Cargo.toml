@@ -52,7 +52,7 @@ futures-util = "0.3"
 # HTTP client — used by the bridge to proxy `library.*` JSON-RPC calls
 # to the copilot service's HTTP endpoint. `rustls-tls` avoids a native
 # OpenSSL dependency on the build/CI matrix.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 
 # Ring buffer for the event log + lock-free SPSC queue for the audio thread.
 ringbuf = "0.4"

@@ -758,6 +758,20 @@ fn open_media_source(
         let cursor = Cursor::new(bytes);
         return Ok(MediaSourceStream::new(Box::new(cursor), Default::default()));
     }
+    // HTTP(S) URLs are handled by the streaming media source — used
+    // by SoundCloud-style sources landed in PR #107 (closes #106).
+    // The decoder thread (per-track, on its own OS thread) is the
+    // only consumer of this source, so blocking network I/O here is
+    // safe re: ADR-004 (audio thread stays untouched).
+    if path.starts_with("http://") || path.starts_with("https://") {
+        let src = crate::audio::http_source::HttpMediaSource::open(path).map_err(|e| {
+            DecodeError::Io {
+                path: path.to_string(),
+                source: e,
+            }
+        })?;
+        return Ok(MediaSourceStream::new(Box::new(src), Default::default()));
+    }
     let file = File::open(Path::new(path)).map_err(|e| DecodeError::Io {
         path: path.to_string(),
         source: e,
