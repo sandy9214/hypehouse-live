@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+(Empty — promote items here as they land on `main`.)
+
+## [0.1.0] — 2026-05-19
+
 ### Added — Engine (Rust)
 - **`engine.session_info` WS RPC** — read-only snapshot of version +
   active output-device substring + 7 feature flags (MIDI clock IN/OUT,
@@ -100,7 +104,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catch_unwind tests + const-time bearer-compare timing smoke check
   (#109).
 
-## [0.1.0] — 2026-05-19
+## Initial v0.1.0 snapshot — 2026-05-19 (pre-consolidation draft from #114)
+
+> The headline section above (`## [0.1.0]`) is the authoritative
+> changelog entry for the v0.1.0 tag — the consolidated post-#114 work.
+> The block below is kept verbatim from the original release-notes
+> draft for historical reference; consolidated entries are now in the
+> primary `[0.1.0]` section above.
 
 Initial public preview. Software-only AI-augmented DJ tool. Closest peer:
 [Mixxx](https://mixxx.org). Differentiator: AI co-pilot with mashability-scored
