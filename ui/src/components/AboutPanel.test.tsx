@@ -10,7 +10,9 @@ import {
 import { AboutPanel } from "./AboutPanel";
 import {
   __resetSessionInfo,
+  __resetSyncStatus,
   __setSessionInfo,
+  __setSyncStatus,
   type SessionInfo,
 } from "../store/sessionInfo";
 import type { JsonRpcWS } from "../ws/client";
@@ -39,6 +41,7 @@ const makeClient = (
 describe("AboutPanel", () => {
   beforeEach((): void => {
     __resetSessionInfo();
+    __resetSyncStatus();
   });
   afterEach((): void => {
     cleanup();
@@ -110,6 +113,28 @@ describe("AboutPanel", () => {
     await waitFor(() => {
       expect(call).toHaveBeenCalledWith("engine.session_info");
     });
+  });
+
+  it("renders library track count + no pending suffix when zero", () => {
+    __setSyncStatus({
+      library_track_count: 42,
+      pending_push_count: 0,
+    });
+    render(<AboutPanel client={makeClient()} />);
+    expect(screen.getByTestId("about-library-count").textContent).toBe(
+      "42 tracks",
+    );
+  });
+
+  it("renders pending sync count when greater than zero", () => {
+    __setSyncStatus({
+      library_track_count: 42,
+      pending_push_count: 3,
+    });
+    render(<AboutPanel client={makeClient()} />);
+    expect(screen.getByTestId("about-library-count").textContent).toBe(
+      "42 tracks · 3 pending sync",
+    );
   });
 
   it("renders all 7 feature flags", () => {

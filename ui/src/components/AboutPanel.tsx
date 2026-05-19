@@ -12,7 +12,11 @@
 
 import type { CSSProperties, JSX } from "react";
 import type { JsonRpcWS } from "../ws/client";
-import { useSessionInfo, type SessionFeatures } from "../store/sessionInfo";
+import {
+  useSessionInfo,
+  useSyncStatus,
+  type SessionFeatures,
+} from "../store/sessionInfo";
 
 export interface AboutPanelProps {
   readonly client: JsonRpcWS;
@@ -89,6 +93,7 @@ const FEATURE_LABELS: ReadonlyArray<[keyof SessionFeatures, string]> = [
 
 export const AboutPanel = ({ client }: AboutPanelProps): JSX.Element => {
   const info = useSessionInfo(client);
+  const sync = useSyncStatus(client);
   const deviceLabel =
     info.output_device_substring === ""
       ? "(system default)"
@@ -107,6 +112,15 @@ export const AboutPanel = ({ client }: AboutPanelProps): JSX.Element => {
         <span style={labelStyle}>Audio sink</span>
         <span style={valueStyle} data-testid="about-output-device">
           {deviceLabel}
+        </span>
+      </div>
+      <div style={rowStyle}>
+        <span style={labelStyle}>Library</span>
+        <span style={valueStyle} data-testid="about-library-count">
+          {sync.library_track_count} tracks
+          {sync.pending_push_count > 0
+            ? ` · ${sync.pending_push_count} pending sync`
+            : ""}
         </span>
       </div>
       <div style={flagsRowStyle} data-testid="about-flags">

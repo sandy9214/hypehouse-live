@@ -205,6 +205,7 @@ class LibraryRpcHandler:
         "get_waveform",
         "compute_stems",
         "get_stems",
+        "sync_status",
     )
     # ``key_match.compute_offset`` lives in a sibling namespace but
     # needs read access to the same library, so we dispatch it through
@@ -292,6 +293,8 @@ class LibraryRpcHandler:
             return self._compute_stems(params)
         if method == "library.get_stems":
             return self._get_stems(params)
+        if method == "library.sync_status":
+            return self._sync_status(params)
         if method == "key_match.compute_offset":
             return self._key_match_compute_offset(params)
         if method == "streaming.search":
@@ -301,6 +304,18 @@ class LibraryRpcHandler:
         raise RpcError(-32601, f"method not found: {method}")
 
     # --- handlers -----------------------------------------------------
+
+    def _sync_status(self, _params: dict[str, Any]) -> dict[str, Any]:
+        """Cloud library sync status snapshot (#102 follow-up).
+
+        Returns ``{pending_push_count, library_track_count}`` so the UI
+        can render a badge without polling the entire catalog. Pure
+        read; no side effects.
+        """
+        return {
+            "pending_push_count": len(self._library.pending_push_ids()),
+            "library_track_count": self._library.count_tracks(),
+        }
 
     def _list_tracks(self, params: dict[str, Any]) -> dict[str, Any]:
         limit = _coerce_int(params.get("limit"), field="limit", default=100)

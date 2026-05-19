@@ -521,3 +521,38 @@ async def test_search_tracks_includes_hot_cues_after_set(
     assert result["tracks"][0]["hot_cues"] == cues
 
 
+# ---- sync_status (#102 follow-up) ----------------------------------
+
+
+@_asyncio
+async def test_sync_status_empty_library(library: TrackLibrary):
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.sync_status", {})
+    assert result == {"pending_push_count": 0, "library_track_count": 0}
+
+
+@_asyncio
+async def test_sync_status_after_local_adds(library: TrackLibrary):
+    _seed(library)  # 5 add_track calls → 5 pending push entries.
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.sync_status", {})
+    assert result["library_track_count"] == 5
+    assert result["pending_push_count"] == 5
+
+
+@_asyncio
+async def test_sync_status_after_clear_pending_push(library: TrackLibrary):
+    _seed(library)
+    library.clear_pending_push("alpha")
+    library.clear_pending_push("bravo")
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.sync_status", {})
+    assert result["library_track_count"] == 5
+    assert result["pending_push_count"] == 3
+
+
+def test_handler_handles_sync_status(library: TrackLibrary):
+    handler = LibraryRpcHandler(library)
+    assert handler.handles("library.sync_status") is True
+
+
