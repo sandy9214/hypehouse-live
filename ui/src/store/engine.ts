@@ -161,6 +161,30 @@ export interface Deck {
   stem_mode: boolean;
 }
 
+/**
+ * Sidechain compressor config (issue #119). Mirrors engine
+ * `state::SidechainConfig`. Defaults set engine-side.
+ */
+export interface SidechainConfig {
+  enabled: boolean;
+  trigger_deck: DeckId;
+  threshold_db: number;
+  ratio: number;
+  attack_ms: number;
+  release_ms: number;
+  makeup_gain_db: number;
+}
+
+export const DEFAULT_SIDECHAIN: SidechainConfig = {
+  enabled: false,
+  trigger_deck: "A",
+  threshold_db: -12,
+  ratio: 4,
+  attack_ms: 5,
+  release_ms: 200,
+  makeup_gain_db: 0,
+};
+
 export interface EngineState {
   decks: readonly [Deck, Deck];
   crossfader: number;
@@ -185,6 +209,14 @@ export interface EngineState {
    * `[-24.0, 0.0]`; the UI knob enforces the same window.
    */
   master_limiter_threshold_db: number;
+  /**
+   * Sidechain compressor config (issue #119). Mirror of
+   * `EngineState.sidechain` on the engine side. `#[serde(default)]`
+   * on the engine — older snapshots without the field deserialize to
+   * a default-disabled config. Optional on the UI side for the same
+   * wire-compat reason.
+   */
+  sidechain?: SidechainConfig;
   /**
    * Live master-bus limiter gain reduction in dB at the moment the
    * last `engine.state_changed` notification was published. Always
@@ -251,6 +283,7 @@ const emptyEngineState = (): EngineState => ({
   master_limiter_threshold_db: DEFAULT_MASTER_LIMITER_THRESHOLD_DB,
   master_limiter_gain_reduction_db: 0,
   clock_source: "internal",
+  sidechain: DEFAULT_SIDECHAIN,
 });
 
 let current: EngineState = emptyEngineState();

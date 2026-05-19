@@ -20,6 +20,8 @@ import { useEffect, useMemo, useState } from "react";
 import { DeckRow } from "./components/DeckRow";
 import { Onboarding } from "./components/Onboarding";
 import { OutputDevicePicker } from "./components/OutputDevicePicker";
+import { SidechainPanel } from "./components/SidechainPanel";
+import { useEngineState } from "./store/engine";
 import { Toaster } from "./components/Toaster";
 import { JsonRpcWS } from "./ws/client";
 import { useOnboarding } from "./store/onboarding";
@@ -82,11 +84,16 @@ export const App = (): JSX.Element => {
   const showWizard =
     !onboarding.complete && !dismissed && libraryTotal === 0;
 
+  const engineState = useEngineState();
+
   return (
     <main aria-label="hypehouse-live root">
       <DeckRow client={client} />
       <aside aria-label="Audio output settings" style={{ padding: "0.5rem 0" }}>
         <OutputDevicePicker client={client} />
+      </aside>
+      <aside aria-label="Sidechain compressor" style={{ padding: "0.5rem 0" }}>
+        <SidechainPanel client={client} state={engineState.sidechain ?? null} />
       </aside>
       <Toaster />
       {showWizard && (
