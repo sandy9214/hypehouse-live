@@ -27,6 +27,14 @@ export interface WaveformProps {
   downbeatsMs?: ReadonlyArray<number>;
   /** Per-frame position provider (rAF reads this). Falls back to `positionMs`. */
   positionProvider?: () => number;
+  /**
+   * Compact rendering path — used by the library hover-preview row.
+   * Skips the playhead, beat-grid + downbeat overlays, and bar.beat
+   * label; just paints the full-track min/max peaks across the canvas
+   * once. Independent of `mode` so consumers don't have to thread the
+   * scroll/full distinction into a tiny preview.
+   */
+  compactMode?: boolean;
 }
 
 export const WAVEFORM_GRADIENT_TOP = "#6ab0ff";
@@ -190,7 +198,7 @@ const labelStyle: CSSProperties = {
 export const Waveform = ({
   peaks, positionMs = 0, durationMs = 0, height = 96, width = 480,
   mode = "scroll", beatGridAnchorMs = 0, beatPeriodMs = 0,
-  downbeatsMs, positionProvider,
+  downbeatsMs, positionProvider, compactMode = false,
 }: WaveformProps): JSX.Element => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const labelRef = useRef<HTMLSpanElement | null>(null);
@@ -206,6 +214,16 @@ export const Waveform = ({
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
+    // Compact path: paint min/max peaks once across the canvas, no
+    // playhead, no beat-grid, no rAF loop. Used for the library
+    // hover preview where the row hasn't been loaded onto a deck yet
+    // so there's no playhead position to render.
+    if (compactMode) {
+      if (!stablePeaks || stablePeaks.length === 0)
+        drawFlat(ctx, width, height, WAVEFORM_BG);
+      else drawPeaksFull(ctx, stablePeaks, width, height);
+      return;
+    }
     if (mode === "full") {
       if (!stablePeaks || stablePeaks.length === 0)
         drawFlat(ctx, width, height, WAVEFORM_BG);
@@ -229,7 +247,7 @@ export const Waveform = ({
     };
     tick();
     return (): void => cancelAnimationFrame(raf);
-  }, [stablePeaks, stableDownbeats, mode, width, height]);
+  }, [stablePeaks, stableDownbeats, mode, width, height, compactMode]);
 
   return (
     <div style={{ position: "relative", width, height, display: "inline-block" }}>
@@ -239,10 +257,11 @@ export const Waveform = ({
         height={height}
         data-testid="waveform-canvas"
         data-mode={mode}
+        data-compact={compactMode ? "true" : "false"}
         data-has-peaks={stablePeaks !== null && stablePeaks.length > 0 ? "true" : "false"}
         style={canvasStyle}
       />
-      {mode === "scroll" ? (
+      {mode === "scroll" && !compactMode ? (
         <span ref={labelRef} data-testid="waveform-barbeat" style={labelStyle} />
       ) : null}
     </div>
