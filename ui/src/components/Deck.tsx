@@ -26,6 +26,7 @@ import {
   type EqBand,
 } from "./DeckControls";
 import { EffectRack } from "./EffectRack";
+import { LoopBarPresets } from "./LoopBarPresets";
 import { StemRack } from "./StemRack";
 import { useEffectsManifest } from "../store/effectsManifest";
 import {
@@ -426,6 +427,8 @@ export const Deck = ({ deck, side, client }: DeckProps): JSX.Element => {
         onLoopOut={onLoopOut}
         onCopilotToggle={onCopilotToggle}
       />
+
+      <LoopBarPresets deck={deck} client={client} />
 
       <AutoMixButton
         deck={deck.id}

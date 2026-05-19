@@ -166,6 +166,8 @@ describe("engine store — extrapolated position", () => {
               hot_cues: [null, null, null, null, null, null, null, null],
               loop_in_ms: null,
               loop_out_ms: null,
+              loop_active: false,
+              beat_period_ms: 0,
               copilot_enabled: false,
               effects: [
                 { effect_id: 0, params: {}, wet_dry: 0.5, enabled: false },
@@ -187,6 +189,8 @@ describe("engine store — extrapolated position", () => {
               hot_cues: [null, null, null, null, null, null, null, null],
               loop_in_ms: null,
               loop_out_ms: null,
+              loop_active: false,
+              beat_period_ms: 0,
               copilot_enabled: false,
               effects: [
                 { effect_id: 0, params: {}, wet_dry: 0.5, enabled: false },

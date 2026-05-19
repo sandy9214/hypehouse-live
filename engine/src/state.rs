@@ -227,6 +227,36 @@ pub enum EventKind {
     LoopExit {
         deck: DeckId,
     },
+    /// **Bar-aware auto-loop** — pro-DJ workflow. Tap "Loop 4" → engine
+    /// snaps `loop_in_ms` to the next downbeat and sets
+    /// `loop_out_ms = loop_in_ms + bars × 4 × beat_period_ms` (assuming
+    /// 4/4 time signature).
+    ///
+    /// `bars` is one of `[1, 2, 4, 8, 16]` — pro convention. Out-of-range
+    /// values are clamped to the **nearest** valid preset by the reducer
+    /// (`0` → `1`, `3` → `2`, `32` → `16`, …) rather than dropped so a
+    /// flaky MIDI controller or buggy bridge client still produces
+    /// audible behaviour. See [`EngineState::clamp_loop_bars`].
+    ///
+    /// Requires the deck to have a beat grid (`beat_period_ms > 0`) —
+    /// without one we can't know where the next downbeat lands. On a
+    /// deck with no beat grid the event is a **silent no-op** (matches
+    /// the reducer's defensive style on `HotCueSet` / `EffectSwapSlots`).
+    ///
+    /// Snap algorithm (mirrors hardware DJ behaviour):
+    /// 1. `current_pos = deck.position_ms`
+    /// 2. `next_downbeat = next_downbeat_at_or_after_ms(current_pos, …)`
+    ///    * if `deck.downbeats` non-empty → first entry `>= current_pos`,
+    ///      with extrapolation past the analyzed range
+    ///    * else compute analytically from
+    ///      `beat_grid_anchor_ms` + multiples of `beat_period_ms × 4`
+    /// 3. `loop_in_ms = next_downbeat`
+    /// 4. `loop_out_ms = loop_in_ms + bars × 4 × beat_period_ms`
+    /// 5. `loop_active = true`
+    SetLoopBars {
+        deck: DeckId,
+        bars: u8,
+    },
     /// Pure pitch shift in semitones (key change). **Tempo unchanged**
     /// — drives only the per-deck pitch resampler stage. Use
     /// `TempoBend` for tempo control. Clamped to ±12 by the reducer.
@@ -866,6 +896,42 @@ impl EngineState {
                 d.loop_out_ms = None;
                 d.loop_active = false;
             }
+            EventKind::SetLoopBars { deck: id, bars } => {
+                // Bar-aware auto-loop. Clamp `bars` to the nearest valid
+                // preset BEFORE inspecting the beat grid so a malformed
+                // command on a beat-gridless deck still no-ops
+                // consistently (same input, same observable state).
+                let bars = Self::clamp_loop_bars(*bars);
+                let d = next.deck(*id);
+                // Deck must have a beat grid; without `beat_period_ms`
+                // we'd compute a degenerate (zero-length) loop window.
+                // `loop_active` stays as-is so an already-armed manual
+                // loop survives a misfired preset tap.
+                if !d.beat_period_ms.is_finite() || d.beat_period_ms <= 0.0 {
+                    // No-op. Preserves the documented "beat grid
+                    // required" contract on `SetLoopBars`.
+                } else {
+                    let pos = d.position_ms;
+                    let next_downbeat = next_downbeat_at_or_after_ms(
+                        pos,
+                        d.beat_grid_anchor_ms,
+                        d.beat_period_ms,
+                        &d.downbeats,
+                    );
+                    // Loop length = bars × 4 beats × ms-per-beat.
+                    // `round` to integer ms so the audio thread sees a
+                    // stable `out_frame` regardless of `f32` precision
+                    // wobble. 16 bars × 4 × ~500 ms = ~32 s — well
+                    // inside f32's integer-exact range but rounding is
+                    // cheap insurance.
+                    let length_ms =
+                        (f64::from(bars) * 4.0 * f64::from(d.beat_period_ms)).round() as u64;
+                    let d = next.deck_mut(*id);
+                    d.loop_in_ms = Some(next_downbeat);
+                    d.loop_out_ms = Some(next_downbeat.saturating_add(length_ms));
+                    d.loop_active = true;
+                }
+            }
             EventKind::PitchBend {
                 deck: id,
                 semitones,
@@ -922,6 +988,52 @@ impl EngineState {
         next
     }
 
+    /// Valid bar-length presets for `EventKind::SetLoopBars`. Pro-DJ
+    /// convention; any out-of-range input is snapped to the nearest
+    /// preset by [`Self::clamp_loop_bars`]. Exposed as a constant so
+    /// the UI + translator + reducer agree on the canonical set.
+    pub const LOOP_BAR_PRESETS: [u8; 5] = [1, 2, 4, 8, 16];
+
+    /// Snap an arbitrary `bars` input to the nearest valid preset in
+    /// [`Self::LOOP_BAR_PRESETS`]. Ties (e.g. `3` is equidistant from
+    /// `2` and `4`) resolve to the **smaller** preset — DJs would
+    /// rather drop into a tighter loop than overshoot the phrase.
+    ///
+    /// * `0`, `1` → `1`
+    /// * `2`      → `2`
+    /// * `3`      → `2`  (tie-break down)
+    /// * `4`      → `4`
+    /// * `5`, `6` → `4`  (mid → down)
+    /// * `7`, `8` → `8`
+    /// * `9`..`12`→ `8`  (ties / lower halves)
+    /// * `13`..`16`→ `16`
+    /// * `17`+    → `16`
+    pub fn clamp_loop_bars(bars: u8) -> u8 {
+        let presets = Self::LOOP_BAR_PRESETS;
+        // Defensive: 0 lands on the smallest preset. Any value >= the
+        // largest preset lands on the largest. In between, walk pairs
+        // and pick whichever bound is nearer — tie-break down.
+        if bars <= presets[0] {
+            return presets[0];
+        }
+        let last = presets.len() - 1;
+        if bars >= presets[last] {
+            return presets[last];
+        }
+        for win in presets.windows(2) {
+            let lo = win[0];
+            let hi = win[1];
+            if bars >= lo && bars <= hi {
+                let d_lo = bars - lo;
+                let d_hi = hi - bars;
+                return if d_lo <= d_hi { lo } else { hi };
+            }
+        }
+        // Unreachable given the bounds checks above; fall back to the
+        // smallest preset rather than panicking — capital-system style.
+        presets[0]
+    }
+
     fn deck(&self, id: DeckId) -> &Deck {
         match id {
             DeckId::A => &self.deck_a,
@@ -935,6 +1047,40 @@ impl EngineState {
             DeckId::B => &mut self.deck_b,
         }
     }
+}
+
+/// Find the next downbeat at or after `pos_ms`.
+///
+/// 1. If `downbeats` is non-empty, return the first entry `>= pos_ms`.
+///    If all entries are before `pos_ms`, extrapolate past the last
+///    one using the analytical `beat_grid_anchor_ms + n × (beat_period_ms × 4)`.
+/// 2. Else compute analytically from `beat_grid_anchor_ms` and
+///    multiples of `beat_period_ms × 4` (assuming 4/4 time signature).
+///
+/// Caller must guarantee `beat_period_ms.is_finite() && > 0.0`.
+fn next_downbeat_at_or_after_ms(
+    pos_ms: u64,
+    beat_grid_anchor_ms: u64,
+    beat_period_ms: f32,
+    downbeats: &[u32],
+) -> u64 {
+    // Analyzed downbeats first — most accurate.
+    if let Some(d) = downbeats.iter().find(|&&db| u64::from(db) >= pos_ms) {
+        return u64::from(*d);
+    }
+    // Past the analyzed range (or empty): extrapolate from beat grid.
+    // bar_ms = 4 beats = 4 × beat_period_ms.
+    let bar_ms = f64::from(beat_period_ms) * 4.0;
+    if bar_ms <= 0.0 {
+        return pos_ms;
+    }
+    let anchor = beat_grid_anchor_ms as f64;
+    let pos = pos_ms as f64;
+    if pos <= anchor {
+        return beat_grid_anchor_ms;
+    }
+    let n = ((pos - anchor) / bar_ms).ceil();
+    (anchor + n * bar_ms).round() as u64
 }
 
 #[cfg(test)]
@@ -2164,5 +2310,228 @@ mod tests {
                 "out-of-range stem {bad_stem} mutated the gains array",
             );
         }
+    }
+
+    // ---------- SetLoopBars (bar-aware auto-loop) ----------
+
+    /// Helper: load a track with a 120 BPM beat grid anchored at 0 ms,
+    /// no analyzed downbeats. Used by the `SetLoopBars` tests so each
+    /// scenario can focus on the snap algorithm rather than re-stating
+    /// the boilerplate.
+    fn load_120_bpm_track(s: EngineState) -> EngineState {
+        s.apply(&ev(
+            1,
+            EventKind::DeckLoad {
+                deck: DeckId::A,
+                track: TrackRef {
+                    id: "t".into(),
+                    path: "/p".into(),
+                },
+                bpm: 120.0,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![],
+                hot_cues: [None; 8],
+                track_gain_db: 0.0,
+            },
+        ))
+    }
+
+    #[test]
+    fn clamp_loop_bars_snaps_to_nearest_preset() {
+        assert_eq!(EngineState::clamp_loop_bars(0), 1);
+        assert_eq!(EngineState::clamp_loop_bars(1), 1);
+        assert_eq!(EngineState::clamp_loop_bars(2), 2);
+        // 3 is equidistant from 2 and 4; tie-break **down** to 2.
+        assert_eq!(EngineState::clamp_loop_bars(3), 2);
+        assert_eq!(EngineState::clamp_loop_bars(4), 4);
+        assert_eq!(EngineState::clamp_loop_bars(5), 4);
+        assert_eq!(EngineState::clamp_loop_bars(6), 4);
+        assert_eq!(EngineState::clamp_loop_bars(7), 8);
+        assert_eq!(EngineState::clamp_loop_bars(8), 8);
+        assert_eq!(EngineState::clamp_loop_bars(13), 16);
+        assert_eq!(EngineState::clamp_loop_bars(16), 16);
+        assert_eq!(EngineState::clamp_loop_bars(32), 16);
+        assert_eq!(EngineState::clamp_loop_bars(255), 16);
+    }
+
+    #[test]
+    fn set_loop_bars_one_bar_at_120_bpm_is_2_seconds() {
+        // 120 BPM → 500 ms / beat → 2000 ms / 4-beat bar.
+        let s = load_120_bpm_track(EngineState::default());
+        let s = s.apply(&ev(
+            2,
+            EventKind::SetLoopBars {
+                deck: DeckId::A,
+                bars: 1,
+            },
+        ));
+        assert_eq!(s.deck_a.loop_in_ms, Some(0));
+        assert_eq!(s.deck_a.loop_out_ms, Some(2000));
+        assert!(s.deck_a.loop_active);
+    }
+
+    #[test]
+    fn set_loop_bars_four_bars_at_120_bpm_is_8_seconds() {
+        let s = load_120_bpm_track(EngineState::default());
+        let s = s.apply(&ev(
+            2,
+            EventKind::SetLoopBars {
+                deck: DeckId::A,
+                bars: 4,
+            },
+        ));
+        assert_eq!(s.deck_a.loop_in_ms, Some(0));
+        assert_eq!(s.deck_a.loop_out_ms, Some(8000));
+        assert!(s.deck_a.loop_active);
+    }
+
+    #[test]
+    fn set_loop_bars_snaps_in_to_next_downbeat() {
+        // Position 1234 ms, 120 BPM, anchor 0 → next downbeat = 2000 ms.
+        let s = load_120_bpm_track(EngineState::default());
+        let s = s.apply(&ev(
+            2,
+            EventKind::DeckCue {
+                deck: DeckId::A,
+                position_ms: 1234,
+            },
+        ));
+        let s = s.apply(&ev(
+            3,
+            EventKind::SetLoopBars {
+                deck: DeckId::A,
+                bars: 1,
+            },
+        ));
+        assert_eq!(s.deck_a.loop_in_ms, Some(2000));
+        assert_eq!(s.deck_a.loop_out_ms, Some(4000));
+        assert!(s.deck_a.loop_active);
+    }
+
+    #[test]
+    fn set_loop_bars_zero_clamps_to_one_bar() {
+        let s = load_120_bpm_track(EngineState::default());
+        let s = s.apply(&ev(
+            2,
+            EventKind::SetLoopBars {
+                deck: DeckId::A,
+                bars: 0,
+            },
+        ));
+        // 0 → 1, so length = 1 × 4 × 500 = 2000 ms.
+        assert_eq!(s.deck_a.loop_in_ms, Some(0));
+        assert_eq!(s.deck_a.loop_out_ms, Some(2000));
+        assert!(s.deck_a.loop_active);
+    }
+
+    #[test]
+    fn set_loop_bars_thirty_two_clamps_to_sixteen() {
+        let s = load_120_bpm_track(EngineState::default());
+        let s = s.apply(&ev(
+            2,
+            EventKind::SetLoopBars {
+                deck: DeckId::A,
+                bars: 32,
+            },
+        ));
+        // 32 → 16, so length = 16 × 4 × 500 = 32 000 ms.
+        assert_eq!(s.deck_a.loop_in_ms, Some(0));
+        assert_eq!(s.deck_a.loop_out_ms, Some(32_000));
+        assert!(s.deck_a.loop_active);
+    }
+
+    #[test]
+    fn set_loop_bars_without_beat_grid_is_noop() {
+        // Fresh deck — `beat_period_ms == 0.0`. Reducer must leave
+        // `loop_in_ms` / `loop_out_ms` / `loop_active` untouched.
+        let s = EngineState::default();
+        let before = s.deck_a.clone();
+        let s = s.apply(&ev(
+            1,
+            EventKind::SetLoopBars {
+                deck: DeckId::A,
+                bars: 4,
+            },
+        ));
+        assert_eq!(s.deck_a.loop_in_ms, before.loop_in_ms);
+        assert_eq!(s.deck_a.loop_out_ms, before.loop_out_ms);
+        assert!(!s.deck_a.loop_active);
+    }
+
+    #[test]
+    fn set_loop_bars_prefers_analyzed_downbeats_grid() {
+        // Analyzed bars at 100, 2100, 4100, … — offset 100 ms from
+        // the analytic grid. Cursor at 500 → first analyzed entry
+        // >= 500 is 2100; loop length still 1 bar = 2000 ms.
+        let s = EngineState::default().apply(&ev(
+            1,
+            EventKind::DeckLoad {
+                deck: DeckId::A,
+                track: TrackRef {
+                    id: "t".into(),
+                    path: "/p".into(),
+                },
+                bpm: 120.0,
+                beat_grid_anchor_ms: 0,
+                downbeats_ms: vec![100, 2100, 4100, 6100],
+                hot_cues: [None; 8],
+                track_gain_db: 0.0,
+            },
+        ));
+        let s = s.apply(&ev(
+            2,
+            EventKind::DeckCue {
+                deck: DeckId::A,
+                position_ms: 500,
+            },
+        ));
+        let s = s.apply(&ev(
+            3,
+            EventKind::SetLoopBars {
+                deck: DeckId::A,
+                bars: 1,
+            },
+        ));
+        assert_eq!(s.deck_a.loop_in_ms, Some(2100));
+        assert_eq!(s.deck_a.loop_out_ms, Some(4100));
+        assert!(s.deck_a.loop_active);
+    }
+
+    #[test]
+    fn set_loop_bars_preserves_apply_purity() {
+        // Reducer must never mutate `self`.
+        let s = load_120_bpm_track(EngineState::default());
+        let _ = s.apply(&ev(
+            2,
+            EventKind::SetLoopBars {
+                deck: DeckId::A,
+                bars: 4,
+            },
+        ));
+        assert_eq!(s.deck_a.loop_in_ms, None);
+        assert_eq!(s.deck_a.loop_out_ms, None);
+        assert!(!s.deck_a.loop_active);
+    }
+
+    #[test]
+    fn next_downbeat_analytic_at_or_after_pos() {
+        // anchor 0, beat_period 500 ms → bar = 2000 ms.
+        let empty = DownbeatGrid::new();
+        assert_eq!(next_downbeat_at_or_after_ms(0, 0, 500.0, &empty), 0);
+        assert_eq!(next_downbeat_at_or_after_ms(1, 0, 500.0, &empty), 2000);
+        assert_eq!(next_downbeat_at_or_after_ms(1999, 0, 500.0, &empty), 2000);
+        assert_eq!(next_downbeat_at_or_after_ms(2000, 0, 500.0, &empty), 2000);
+        assert_eq!(next_downbeat_at_or_after_ms(2001, 0, 500.0, &empty), 4000);
+    }
+
+    #[test]
+    fn next_downbeat_falls_back_to_extrapolation_past_analyzed_range() {
+        // Analyzed grid 0..=4000; cursor at 5000 must extrapolate
+        // using the last analyzed downbeat + beat_period × 4.
+        let grid = DownbeatGrid::from_slice(&[0, 2000, 4000]);
+        let next = next_downbeat_at_or_after_ms(5000, 0, 500.0, &grid);
+        // Last analyzed = 4000; analytic next downbeat at-or-after
+        // 5000 seeded from 4000 with bar = 2000 ms → 6000.
+        assert_eq!(next, 6000);
     }
 }
