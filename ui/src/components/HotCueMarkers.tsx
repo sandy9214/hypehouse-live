@@ -16,7 +16,13 @@
 // 1 = orange, ..., 7 = magenta) so DJs migrating from Rekordbox
 // recognise the layout immediately.
 
-import { useEffect, useRef, type CSSProperties, type JSX } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  type CSSProperties,
+  type JSX,
+} from "react";
 import type { JsonRpcWS } from "../ws/client";
 import type { DeckId } from "../store/engine";
 import { SCROLL_HALF_WINDOW_MS, playheadX, scrollXForMs } from "./Waveform";
@@ -55,6 +61,15 @@ export const SLOT_COLORS: ReadonlyArray<string> = [
 const MARKER_WIDTH = 12;
 const MARKER_HEIGHT = 18;
 
+/**
+ * Marker border — kept as a theme-style export so future palette work
+ * (issue #123, follow-up to #122 council review) can swap to a CSS
+ * variable / design-token without touching component internals. The
+ * value here is the pre-PR rgba; design refresh can lift it without
+ * a behavior change.
+ */
+export const HOTCUE_MARKER_BORDER = "rgba(0, 0, 0, 0.4)";
+
 const containerStyle = (width: number, height: number): CSSProperties => ({
   position: "absolute",
   top: 0,
@@ -71,7 +86,7 @@ const markerStyle = (color: string, height: number): CSSProperties => ({
   height: MARKER_HEIGHT,
   marginLeft: -MARKER_WIDTH / 2,
   background: color,
-  border: "1px solid rgba(0,0,0,0.4)",
+  border: `1px solid ${HOTCUE_MARKER_BORDER}`,
   borderRadius: "3px 3px 0 0",
   cursor: "pointer",
   pointerEvents: "auto",
@@ -151,6 +166,19 @@ export const HotCueMarkers = ({
     new Array(hotCues.length).fill(null),
   );
 
+  // Cache the indices of slots that actually carry a cue. Lets the
+  // scroll-mode rAF skip 6-7 of 8 iterations when most slots are
+  // empty (common case). Re-memoised only when the hot_cues array
+  // changes (state_changed notification), not on every frame.
+  const activeSlots = useMemo((): ReadonlyArray<number> => {
+    const out: number[] = [];
+    for (let i = 0; i < hotCues.length; i += 1) {
+      const v = hotCues[i];
+      if (v !== null && v !== undefined && v >= 0) out.push(i);
+    }
+    return out;
+  }, [hotCues]);
+
   // Scroll mode: rAF tick recomputes each marker's left + visibility.
   // Full mode: positions baked in at render time below; no rAF needed.
   useEffect((): (() => void) | void => {
@@ -158,7 +186,7 @@ export const HotCueMarkers = ({
     let raf = 0;
     const tick = (): void => {
       const center = positionProvider ? positionProvider() : positionMs;
-      for (let slot = 0; slot < hotCues.length; slot += 1) {
+      for (const slot of activeSlots) {
         const el = markerRefs.current[slot];
         if (!el) continue;
         const x = cueMarkerX(
@@ -184,6 +212,7 @@ export const HotCueMarkers = ({
     // notifications arrive; re-arm the rAF closure when they do.
   }, [
     mode,
+    activeSlots,
     hotCues,
     durationMs,
     width,
