@@ -19,6 +19,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { DeckRow } from "./components/DeckRow";
 import { Onboarding } from "./components/Onboarding";
+import { OutputDevicePicker } from "./components/OutputDevicePicker";
 import { Toaster } from "./components/Toaster";
 import { JsonRpcWS } from "./ws/client";
 import { useOnboarding } from "./store/onboarding";
@@ -84,6 +85,9 @@ export const App = (): JSX.Element => {
   return (
     <main aria-label="hypehouse-live root">
       <DeckRow client={client} />
+      <aside aria-label="Audio output settings" style={{ padding: "0.5rem 0" }}>
+        <OutputDevicePicker client={client} />
+      </aside>
       <Toaster />
       {showWizard && (
         <Onboarding
