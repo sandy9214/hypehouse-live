@@ -528,7 +528,41 @@ async def test_search_tracks_includes_hot_cues_after_set(
 async def test_sync_status_empty_library(library: TrackLibrary):
     handler = LibraryRpcHandler(library)
     result = await handler.dispatch("library.sync_status", {})
-    assert result == {"pending_push_count": 0, "library_track_count": 0}
+    assert result["pending_push_count"] == 0
+    assert result["library_track_count"] == 0
+    # Daemon stats default to zero when no daemon is wired.
+    assert result["last_pull_micros"] == 0
+    assert result["last_push_micros"] == 0
+    assert result["last_tick_error"] == ""
+
+
+@_asyncio
+async def test_sync_status_includes_daemon_stats_when_wired(
+    library: TrackLibrary,
+):
+    """When the service wires a SyncDaemon, sync_status surfaces the
+    last-tick counters so the UI can render "last synced X ago".
+    """
+    from copilot.cloud_sync import SyncStats
+
+    class StubDaemon:
+        def stats(self) -> SyncStats:
+            return SyncStats(
+                last_pull_micros=1_700_000_000_000_000,
+                last_push_micros=1_700_000_000_000_001,
+                last_pull_fetched=7,
+                last_pull_applied=5,
+                last_push_pushed=3,
+                last_tick_error="",
+            )
+
+    handler = LibraryRpcHandler(library, sync_daemon=StubDaemon())
+    result = await handler.dispatch("library.sync_status", {})
+    assert result["last_pull_micros"] == 1_700_000_000_000_000
+    assert result["last_pull_fetched"] == 7
+    assert result["last_pull_applied"] == 5
+    assert result["last_push_pushed"] == 3
+    assert result["last_tick_error"] == ""
 
 
 @_asyncio

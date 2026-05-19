@@ -74,8 +74,13 @@ class CoPilotService:
         end_of_track_trigger_ms: int = _END_OF_TRACK_TRIGGER_MS,
         bridge_token: str = "",
         proposer: TransitionProposer | None = None,
+        sync_daemon: object | None = None,
     ):
         self._library = library
+        # Optional cloud-sync daemon — when wired, the library RPC's
+        # `sync_status` includes last-tick stats. Typed as `object`
+        # to avoid an import cycle.
+        self._sync_daemon = sync_daemon
         self._engine_ws_url = engine_ws_url or os.environ.get(
             "HYPEHOUSE_ENGINE_WS", DEFAULT_ENGINE_WS
         )
@@ -106,7 +111,7 @@ class CoPilotService:
         # Library RPC handler — exposes ``library.*`` methods to whatever
         # transport wires them up (UI WS server, future engine proxy).
         # Owned by the service so it shares the library handle + lifetime.
-        self._library_rpc = LibraryRpcHandler(library)
+        self._library_rpc = LibraryRpcHandler(library, sync_daemon=sync_daemon)
 
         # Preset RPC handler — exposes ``presets.*`` methods. Shares the
         # library's SQLite connection via ``library.preset_store()`` so a

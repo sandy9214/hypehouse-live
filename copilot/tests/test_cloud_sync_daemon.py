@@ -187,6 +187,47 @@ def test_daemon_swallows_tick_exceptions(tmp_path: Path) -> None:
     assert client.calmed_down, "daemon should survive a thrown tick"
 
 
+def test_stats_zero_before_first_tick(tmp_path: Path) -> None:
+    daemon = SyncDaemon(InMemorySyncClient(), tmp_path / "lib.db", tick_seconds=60)
+    s = daemon.stats()
+    assert s.last_pull_micros == 0
+    assert s.last_push_micros == 0
+    assert s.last_pull_fetched == 0
+    assert s.last_pull_applied == 0
+    assert s.last_push_pushed == 0
+    assert s.last_tick_error == ""
+
+
+def test_stats_populated_after_tick_once(tmp_path: Path) -> None:
+    db = tmp_path / "lib.db"
+    lib = TrackLibrary(db)
+    lib.add_track(_make_track("t1"))
+    lib.add_track(_make_track("t2"))
+    lib.close()
+    client = InMemorySyncClient(
+        seed=[
+            RemoteTrack(
+                track_id="remote-a",
+                path="/r/a.mp3",
+                bpm=120.0,
+                camelot_key="8B",
+                energy=0.5,
+                duration_s=180.0,
+                updated_at_micros=42,
+            ),
+        ],
+    )
+    daemon = SyncDaemon(client, db, tick_seconds=60)
+    daemon.tick_once()
+    s = daemon.stats()
+    assert s.last_pull_micros > 0
+    assert s.last_push_micros > 0
+    assert s.last_pull_fetched == 1  # the cloud row
+    assert s.last_pull_applied == 1
+    assert s.last_push_pushed == 2  # the two local rows
+    assert s.last_tick_error == ""
+
+
 def test_daemon_swallows_sync_error_specifically(
     tmp_path: Path, caplog
 ) -> None:
