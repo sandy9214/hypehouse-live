@@ -152,6 +152,12 @@ pub mod method {
     /// session's master.wav and emit chapter markers per `DeckLoad`.
     /// Backed by `crate::recording::export::export_session`.
     pub const EXPORT_SESSION: &str = "engine.export_session";
+    /// Enumerate cpal output device names so the UI can render a picker.
+    /// Read-only; selection requires an engine restart with the chosen
+    /// substring in `HYPEHOUSE_OUTPUT_DEVICE` (live hot-swap is deferred —
+    /// see ADR-TBD; cpal stream rebuild is non-trivial under an active
+    /// audio thread). Backed by `crate::audio::io::enumerate_output_devices`.
+    pub const LIST_OUTPUT_DEVICES: &str = "engine.list_output_devices";
     /// In-band bearer-token auth for browser WS clients that cannot set
     /// the `Authorization` header at upgrade. See `auth::AuthState`.
     pub const AUTH_HELLO: &str = "auth.hello";
@@ -817,6 +823,36 @@ fn param_descriptor_to_json(d: &ParamDescriptor) -> Value {
     })
 }
 
+/// Build the `engine.list_output_devices` result body from a slice of
+/// device names. Pure — separated from cpal enumeration so unit tests
+/// can drive the JSON shape without touching CoreAudio (which is unsafe
+/// inside macOS unit-test threads on some hosts — see io.rs).
+///
+/// Response shape: `{ "devices": [ { "name": "...", "is_default": bool }, ... ] }`.
+/// `is_default` is true for the entry that equals `default_name`
+/// (case-sensitive — cpal returns the canonical OS name; substring
+/// matching only applies on selection, not display).
+fn list_output_devices_result_from(names: &[String], default_name: Option<&str>) -> Value {
+    let devices: Vec<Value> = names
+        .iter()
+        .map(|n| {
+            let is_default = default_name.is_some_and(|d| d == n.as_str());
+            serde_json::json!({ "name": n, "is_default": is_default })
+        })
+        .collect();
+    serde_json::json!({ "devices": devices })
+}
+
+/// Build the `engine.list_output_devices` result by enumerating the
+/// default cpal host. Runtime entrypoint — wraps the pure builder above.
+fn list_output_devices_result() -> Value {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+    let names = crate::audio::io::enumerate_output_devices(&host);
+    let default_name = host.default_output_device().and_then(|d| d.name().ok());
+    list_output_devices_result_from(&names, default_name.as_deref())
+}
+
 /// Build the `engine.list_effects` result body. Pure — no I/O, no
 /// allocation outside the JSON nodes themselves.
 fn list_effects_result() -> Value {
@@ -924,6 +960,10 @@ pub fn dispatch(engine: &EngineHandle, req: RpcRequest) -> RpcResponse {
         // future top-level fields like `version`) rather than a bare
         // array. See docs/api/ws-protocol.md.
         method::LIST_EFFECTS => RpcResponse::ok(id, list_effects_result()),
+        // Output-device enumeration for the UI picker (issue #111 follow-up).
+        // Read-only — selection still requires an engine restart with
+        // `HYPEHOUSE_OUTPUT_DEVICE` set; live hot-swap deferred.
+        method::LIST_OUTPUT_DEVICES => RpcResponse::ok(id, list_output_devices_result()),
         // History — read-only enumeration of past session dirs. Pure
         // disk I/O; never touches live engine state. Errors are
         // bubbled as `-32603 internal` because the caller did nothing
@@ -1708,6 +1748,77 @@ mod tests {
         let req = submit(method::LIST_EFFECTS, Value::Null, 31);
         let resp = dispatch(&e, req);
         assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+    }
+
+    // ---------------------------------------------------------------
+    // engine.list_output_devices — cpal device enumeration for UI picker.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn list_output_devices_result_shape_with_no_devices() {
+        let v = list_output_devices_result_from(&[], None);
+        assert_eq!(v["devices"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn list_output_devices_result_marks_default_correctly() {
+        let names: Vec<String> = vec![
+            "MacBook Pro Speakers".into(),
+            "BlackHole 2ch".into(),
+            "External Headphones".into(),
+        ];
+        let v = list_output_devices_result_from(&names, Some("BlackHole 2ch"));
+        let devices = v["devices"].as_array().expect("devices must be an array");
+        assert_eq!(devices.len(), 3);
+        assert_eq!(
+            devices[0]["name"],
+            serde_json::json!("MacBook Pro Speakers")
+        );
+        assert_eq!(devices[0]["is_default"], serde_json::json!(false));
+        assert_eq!(devices[1]["name"], serde_json::json!("BlackHole 2ch"));
+        assert_eq!(devices[1]["is_default"], serde_json::json!(true));
+        assert_eq!(devices[2]["is_default"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn list_output_devices_result_with_no_default_match_marks_all_false() {
+        let names: Vec<String> = vec!["A".into(), "B".into()];
+        let v = list_output_devices_result_from(&names, Some("Nonexistent"));
+        let devices = v["devices"].as_array().unwrap();
+        for d in devices {
+            assert_eq!(d["is_default"], serde_json::json!(false));
+        }
+    }
+
+    #[test]
+    fn list_output_devices_result_with_none_default_marks_all_false() {
+        let names: Vec<String> = vec!["A".into(), "B".into()];
+        let v = list_output_devices_result_from(&names, None);
+        let devices = v["devices"].as_array().unwrap();
+        assert!(devices
+            .iter()
+            .all(|d| d["is_default"] == serde_json::json!(false)));
+    }
+
+    // Live cpal-enumeration smoke test gated `#[ignore]` for the same
+    // reason as `audio::io::pick_output_device_*`: macOS CoreAudio is not
+    // safe to call from cargo unit-test threads on some hosts (SIGSEGV).
+    // Available via `cargo test -- --ignored` on dev boxes.
+    #[test]
+    #[ignore = "cpal enumeration segfaults in macOS unit-test threads; run via --ignored on dev box"]
+    fn list_output_devices_via_dispatch_returns_devices_array() {
+        let e = engine();
+        let req = submit(method::LIST_OUTPUT_DEVICES, Value::Null, 200);
+        let resp = dispatch(&e, req);
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let result = resp.result.expect("must return a result");
+        let devices = result["devices"]
+            .as_array()
+            .expect("devices array must be present");
+        for d in devices {
+            assert!(d["name"].is_string());
+            assert!(d["is_default"].is_boolean());
+        }
     }
 
     #[test]

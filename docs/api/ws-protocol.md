@@ -439,6 +439,36 @@ Reserved `id` values:
 | 3  | reverb  | Schroeder 4-comb + 2-allpass |
 | 4  | gate    | beat-synced gate (master BPM x period_div) |
 
+### `engine.list_output_devices`
+
+Enumerate cpal output device names so the UI can render a picker. Read-only;
+the engine does **not** hot-swap on selection — the user persists the desired
+substring in `HYPEHOUSE_OUTPUT_DEVICE` and restarts the engine. Live hot-swap
+is deferred (ADR-TBD) because tearing down + rebuilding a cpal Stream under an
+active audio thread is non-trivial.
+
+Use case: livestreaming. Set `HYPEHOUSE_OUTPUT_DEVICE=BlackHole` (macOS) /
+`VB-Cable` (Windows) / `pipewire-loopback` (Linux) → engine routes master mix
+into the virtual sink → OBS / Twitch captures lossless audio without
+screen-share loopback. See issue #111.
+
+**Params**: none.
+**Result**: object with a `devices` array. `is_default = true` flags the
+host's current default output device (cpal canonical name match).
+
+```json
+{
+  "devices": [
+    { "name": "MacBook Pro Speakers", "is_default": true },
+    { "name": "BlackHole 2ch", "is_default": false },
+    { "name": "External Headphones (USB)", "is_default": false }
+  ]
+}
+```
+
+Defunct devices (cpal `name()` returns Err) are skipped. Empty array is
+valid when the host has no audio sink (e.g. headless container).
+
 ### `engine.list_sessions`
 
 Enumerate persisted past sessions on disk. Read-only — never touches
