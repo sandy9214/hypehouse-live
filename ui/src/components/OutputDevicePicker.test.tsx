@@ -1,32 +1,6 @@
 // OutputDevicePicker.test.tsx — store + dropdown integration.
 
-// Vitest 4 + jsdom 29 ship a non-spec localStorage (plain object, no
-// Storage prototype + missing methods). Polyfill with a Map-backed
-// spec-shaped object so the store's guarded reads/writes round-trip.
-// Mirrors the trick used in MappingStore.test.ts + Onboarding.test.tsx.
-const installLocalStoragePolyfill = (): void => {
-  const store = new Map<string, string>();
-  const polyfill = {
-    getItem: (k: string): string | null =>
-      store.has(k) ? (store.get(k) as string) : null,
-    setItem: (k: string, v: string): void => {
-      store.set(k, String(v));
-    },
-    removeItem: (k: string): void => {
-      store.delete(k);
-    },
-    clear: (): void => store.clear(),
-    key: (i: number): string | null => Array.from(store.keys())[i] ?? null,
-    get length(): number {
-      return store.size;
-    },
-  };
-  Object.defineProperty(window, "localStorage", {
-    configurable: true,
-    writable: true,
-    value: polyfill,
-  });
-};
+import { installLocalStoragePolyfill } from "../test-utils/localStoragePolyfill";
 installLocalStoragePolyfill();
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
