@@ -205,4 +205,91 @@ describe("EffectSlot", () => {
     );
     expect(screen.queryByTestId("fx-params-A-0")).toBeNull();
   });
+
+  it("renders no one-shot row for empty slot", (): void => {
+    render(
+      <EffectSlot
+        deck="A"
+        slot={0}
+        state={emptySlot()}
+        manifest={manifest}
+        client={makeClient().client}
+      />,
+    );
+    expect(screen.queryByTestId("fx-oneshot-row-A-0")).toBeNull();
+  });
+
+  it("renders 4 one-shot preset buttons on an assigned slot", (): void => {
+    render(
+      <EffectSlot
+        deck="A"
+        slot={0}
+        state={filterSlot()}
+        manifest={manifest}
+        client={makeClient().client}
+      />,
+    );
+    expect(screen.getByTestId("fx-oneshot-A-0-1")).toBeTruthy();
+    expect(screen.getByTestId("fx-oneshot-A-0-4")).toBeTruthy();
+    expect(screen.getByTestId("fx-oneshot-A-0-8")).toBeTruthy();
+    expect(screen.getByTestId("fx-oneshot-A-0-16")).toBeTruthy();
+  });
+
+  it("clicking a one-shot preset emits EffectOneShot with the beats payload", (): void => {
+    const mb = makeClient();
+    render(
+      <EffectSlot
+        deck="B"
+        slot={2}
+        state={filterSlot()}
+        manifest={manifest}
+        client={mb.client}
+      />,
+    );
+    const btn = screen.getByTestId("fx-oneshot-B-2-4");
+    fireEvent.pointerDown(btn);
+    fireEvent.pointerUp(btn);
+    expect(submitted(mb)).toContainEqual({
+      EffectOneShot: { deck: "B", slot: 2, beats: 4 },
+    });
+  });
+
+  it("renders countdown when one_shot is in flight", (): void => {
+    const futureMicros = Date.now() * 1000 + 2_000_000; // ~2 s remaining
+    const state: EffectSlotState = {
+      ...filterSlot(),
+      one_shot: { ends_at_micros: futureMicros, was_enabled: false },
+    };
+    render(
+      <EffectSlot
+        deck="A"
+        slot={0}
+        state={state}
+        manifest={manifest}
+        client={makeClient().client}
+      />,
+    );
+    const countdown = screen.getByTestId("fx-oneshot-countdown-A-0");
+    expect(countdown.textContent).toMatch(/\d+\s*ms/);
+  });
+
+  it("no countdown when one_shot has elapsed", (): void => {
+    const state: EffectSlotState = {
+      ...filterSlot(),
+      one_shot: {
+        ends_at_micros: Date.now() * 1000 - 1_000_000,
+        was_enabled: false,
+      },
+    };
+    render(
+      <EffectSlot
+        deck="A"
+        slot={0}
+        state={state}
+        manifest={manifest}
+        client={makeClient().client}
+      />,
+    );
+    expect(screen.queryByTestId("fx-oneshot-countdown-A-0")).toBeNull();
+  });
 });

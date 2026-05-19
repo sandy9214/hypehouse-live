@@ -10,6 +10,7 @@
 // The engine reducer is the source of truth — we read `effects[slot]`
 // from props for display and never store local control state.
 
+import { useEffect, useState } from "react";
 import type { CSSProperties, JSX, ChangeEvent } from "react";
 import type { JsonRpcWS } from "../ws/client";
 import type { DeckId, EffectSlotState } from "../store/engine";
@@ -85,6 +86,44 @@ const selectStyle: CSSProperties = {
 
 const enableBtnStyle: CSSProperties = { padding: "2px 6px", fontSize: 10 };
 
+const oneShotRowStyle: CSSProperties = {
+  display: "flex",
+  gap: 3,
+  alignItems: "center",
+  flexWrap: "wrap",
+};
+
+const oneShotLabelStyle: CSSProperties = {
+  fontSize: 9,
+  color: "#888",
+  marginRight: 2,
+  letterSpacing: 0.5,
+};
+
+const oneShotBtnStyle: CSSProperties = {
+  padding: "2px 5px",
+  fontSize: 10,
+  minWidth: 22,
+};
+
+const countdownStyle: CSSProperties = {
+  fontSize: 9,
+  color: "#e0a800",
+  fontVariantNumeric: "tabular-nums",
+  marginLeft: 4,
+};
+
+/** Industry-standard preset durations — match the loop bar presets row. */
+const ONE_SHOT_BEAT_PRESETS: ReadonlyArray<number> = [1, 4, 8, 16];
+
+/**
+ * Live wall-clock micros. `Date.now() * 1000` is close enough — the
+ * engine's `ts_micros` is also `SystemTime::now()` based, not the
+ * audio clock, so the two share an origin. ±1ms drift is acceptable
+ * for a UI countdown.
+ */
+const wallClockMicros = (): number => Date.now() * 1000;
+
 const submit = (
   client: JsonRpcWS,
   payload: Record<string, unknown>,
@@ -121,6 +160,27 @@ export const EffectSlot = ({
     submit(client, {
       EffectEnable: { deck, slot, enabled: !state.enabled },
     });
+  const onOneShot = (beats: number): void =>
+    submit(client, { EffectOneShot: { deck, slot, beats } });
+
+  // Live wall-clock countdown for an in-flight one-shot. Re-render at
+  // 60 fps via a tiny rAF tick — cheap (one tick per active slot only;
+  // unset → effect short-circuits before the ref is even installed).
+  const oneShot = state.one_shot ?? null;
+  const [nowUs, setNowUs] = useState(wallClockMicros);
+  useEffect((): (() => void) | void => {
+    if (!oneShot) return;
+    let raf = 0;
+    const tick = (): void => {
+      setNowUs(wallClockMicros());
+      raf = requestAnimationFrame(tick);
+    };
+    tick();
+    return (): void => cancelAnimationFrame(raf);
+  }, [oneShot]);
+  const remainingMs = oneShot
+    ? Math.max(0, Math.round((oneShot.ends_at_micros - nowUs) / 1000))
+    : 0;
 
   return (
     <div
@@ -173,6 +233,41 @@ export const EffectSlot = ({
           {state.enabled ? "ON" : "OFF"}
         </Button>
       </div>
+
+      {active ? (
+        <div
+          style={oneShotRowStyle}
+          data-testid={`fx-oneshot-row-${deck}-${slot}`}
+          aria-label={`one-shot-deck-${deck}-slot-${slot}`}
+        >
+          <span style={oneShotLabelStyle}>1-SHOT</span>
+          {ONE_SHOT_BEAT_PRESETS.map(
+            (beats): JSX.Element => (
+              <Button
+                key={beats}
+                onClick={(): void => onOneShot(beats)}
+                pressed={
+                  oneShot !== null && remainingMs > 0 && beats === remainingMs
+                }
+                testId={`fx-oneshot-${deck}-${slot}-${beats}`}
+                ariaLabel={`one-shot-${beats}-beats-deck-${deck}-slot-${slot}`}
+                style={oneShotBtnStyle}
+              >
+                {beats}
+              </Button>
+            ),
+          )}
+          {oneShot && remainingMs > 0 ? (
+            <span
+              style={countdownStyle}
+              data-testid={`fx-oneshot-countdown-${deck}-${slot}`}
+              aria-live="polite"
+            >
+              {remainingMs} ms
+            </span>
+          ) : null}
+        </div>
+      ) : null}
 
       {active ? (
         <div style={rowStyle} data-testid={`fx-params-${deck}-${slot}`}>

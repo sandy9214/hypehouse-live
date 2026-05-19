@@ -73,11 +73,26 @@ const normaliseClockSource = (raw: unknown): ClockSource => {
  * `effect_id` = 0 means empty. `params` is a string→number map keyed
  * by the param descriptor's `name`.
  */
+/**
+ * Beat-FX one-shot scheduled disengage. Mirrors `engine::state::OneShotState`.
+ * `ends_at_micros` is wall-clock micros (since UNIX epoch, same scale as
+ * the engine's `Event.ts_micros`). UI countdown renders the remaining
+ * window as `ends_at_micros - now_micros`; engine wall clock is the
+ * authoritative source (no need to recompute against current beat_period_ms,
+ * which can mutate mid-flight — see issue #128).
+ */
+export interface OneShotState {
+  ends_at_micros: number;
+  was_enabled: boolean;
+}
+
 export interface EffectSlotState {
   effect_id: number;
   params: Readonly<Record<string, number>>;
   wet_dry: number;
   enabled: boolean;
+  /** `null` / undefined when no one-shot is active. */
+  one_shot?: OneShotState | null;
 }
 
 export interface Deck {
