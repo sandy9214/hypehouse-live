@@ -24,13 +24,14 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Optional
 
 from .bootstrap import bootstrap_pull, bootstrap_push
-from .client import SyncClient
+from .client import SyncClient, SyncError
 
 DEFAULT_TICK_SECONDS = 60.0
 
@@ -129,12 +130,28 @@ class SyncDaemon:
         while not self._stop.wait(self._tick):
             try:
                 self.tick_once()
-            except Exception as exc:  # noqa: BLE001
-                # Swallow + log — a bad tick should never crash the
-                # process. Cloud-sync errors are not user-fatal; they
-                # only delay propagation.
+            except SyncError as exc:
+                # Transport-level failures are expected — flaky cloud
+                # is the whole reason this is async + retried.
                 self._log.warning(
-                    "cloud sync: daemon tick raised %s — continuing", exc
+                    "cloud sync: transport error during tick: %s", exc
+                )
+            except sqlite3.Error as exc:
+                # Local-DB hiccup (lock contention with the main
+                # thread's writes, busy timeout, etc.). Recoverable —
+                # next tick re-opens the connection.
+                self._log.warning(
+                    "cloud sync: local DB error during tick: %s", exc
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Anything else is unexpected — log at ERROR so an
+                # operator tailing the log sees it. We still don't
+                # re-raise; killing the daemon thread would silently
+                # disable cloud sync for the rest of the process.
+                self._log.error(
+                    "cloud sync: unexpected daemon tick error: %s",
+                    exc,
+                    exc_info=exc,
                 )
             # Light sleep avoids a tight error-loop on a misbehaving
             # client; the `Event.wait` above is the main pacing wait.
