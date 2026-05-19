@@ -19,6 +19,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { DeckRow } from "./components/DeckRow";
 import { Onboarding } from "./components/Onboarding";
+import { AboutPanel } from "./components/AboutPanel";
 import { OutputDevicePicker } from "./components/OutputDevicePicker";
 import { SidechainPanel } from "./components/SidechainPanel";
 import { useEngineState } from "./store/engine";
@@ -98,6 +99,9 @@ export const App = (): JSX.Element => {
           state={engineState.sidechain ?? null}
           grDb={engineState.sidechain_gain_reduction_db}
         />
+      </aside>
+      <aside aria-label="Engine info" style={{ padding: "0.5rem 0" }}>
+        <AboutPanel client={client} />
       </aside>
       <Toaster />
       {showWizard && (
