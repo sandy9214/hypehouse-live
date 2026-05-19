@@ -76,7 +76,7 @@ if TYPE_CHECKING:  # pragma: no cover — type-only import to break cycle.
 # See ``copilot/streaming/__init__.py`` for the provider abstraction.
 # Migrations dispatch on the gap between this constant and the value
 # recorded in the ``schema_version`` table.
-TRACK_SCHEMA_VERSION = 9
+TRACK_SCHEMA_VERSION = 10
 
 # Source-column enum values. Persisted as plain strings (not a SQL
 # enum) so older readers introspect cleanly. ``SOURCE_LOCAL`` is the
@@ -354,6 +354,25 @@ class TrackLibrary:
                 "ALTER TABLE tracks "
                 "ADD COLUMN source TEXT NOT NULL DEFAULT 'local'"
             )
+        if "updated_at_micros" not in cols:
+            # v10 migration — last-write-wins watermark for cloud
+            # library sync (#102). Wall-clock micros at the latest
+            # write; the cloud syncer compares the local value
+            # against the remote row's ``updated_at_micros`` to pick
+            # a winner. Backfilled with 0 for pre-v10 rows so an
+            # incoming cloud row (with a real non-zero timestamp)
+            # immediately wins on first pull — desirable default
+            # because cloud rows ARE newer than the legacy local
+            # state. Subsequent local writes stamp the column via
+            # :func:`_now_micros` so the local row reclaims dominance.
+            self._conn.execute(
+                "ALTER TABLE tracks "
+                "ADD COLUMN updated_at_micros INTEGER NOT NULL DEFAULT 0"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS tracks_updated_at_micros_idx "
+                "ON tracks (updated_at_micros)"
+            )
         # v6 migration — user preset snapshots. Lives in its own table
         # rather than as columns on ``tracks`` because presets aren't
         # per-track. ``name`` is UNIQUE so the UI's "save current" flow
@@ -430,12 +449,17 @@ class TrackLibrary:
         # doesn't measure loudness (every existing test fixture) just
         # inserts NULL into both, which the engine reads as
         # passthrough.
+        # v10: stamp ``updated_at_micros`` on every local write so the
+        # cloud syncer (#102) can run last-write-wins against the
+        # remote watermark without callers having to set the value
+        # by hand.
         self._conn.execute(
             "INSERT OR REPLACE INTO tracks "
             "(track_id, path, bpm, camelot_key, energy, duration_s, "
             " beat_grid_anchor_ms, beat_period_ms, downbeats_json, "
-            " hot_cues_json, lufs, track_gain_db, source) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " hot_cues_json, lufs, track_gain_db, source, "
+            " updated_at_micros) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 track.track_id,
                 track.path,
@@ -454,6 +478,62 @@ class TrackLibrary:
                     else float(track.track_gain_db)
                 ),
                 str(track.source or SOURCE_LOCAL),
+                _now_micros(),
+            ),
+        )
+        self._conn.commit()
+
+    # --- cloud library sync surface (#102) -------------------------------
+
+    def local_updated_at_micros(self, track_id: str) -> int | None:
+        """Return the stored ``updated_at_micros`` for a track, or
+        ``None`` when the row doesn't exist. Drives the cloud syncer's
+        last-write-wins comparison.
+        """
+        row = self._conn.execute(
+            "SELECT updated_at_micros FROM tracks WHERE track_id = ?",
+            (track_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row["updated_at_micros"])
+
+    def upsert_from_remote(
+        self,
+        *,
+        track_id: str,
+        path: str,
+        bpm: float,
+        camelot_key: str,
+        energy: float,
+        duration_s: float,
+        hot_cues: list[int | None],
+        updated_at_micros: int,
+    ) -> None:
+        """Write a remote-sourced row, preserving the remote
+        ``updated_at_micros`` literally. Distinct from :meth:`add_track`
+        which stamps the column with :func:`_now_micros` for local
+        writes — for remote rows we want the wire timestamp so a
+        subsequent local edit can supersede it cleanly.
+        """
+        self._conn.execute(
+            "INSERT OR REPLACE INTO tracks "
+            "(track_id, path, bpm, camelot_key, energy, duration_s, "
+            " beat_grid_anchor_ms, beat_period_ms, downbeats_json, "
+            " hot_cues_json, lufs, track_gain_db, source, "
+            " updated_at_micros) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, '[]', ?, NULL, NULL, ?, ?)",
+            (
+                track_id,
+                path,
+                float(bpm),
+                camelot_key,
+                float(energy),
+                float(duration_s),
+                60_000.0 / max(1.0, float(bpm)),
+                _hot_cues_to_json(hot_cues),
+                "cloud",
+                int(updated_at_micros),
             ),
         )
         self._conn.commit()
@@ -1197,6 +1277,17 @@ def _normalize_hot_cues(hot_cues: list[int | None]) -> list[int | None]:
             )
         out.append(int(v))
     return out
+
+
+def _now_micros() -> int:
+    """Wall-clock micros — used to stamp ``updated_at_micros`` on
+    local writes (#102). Same scale as the engine's ``Event.ts_micros``
+    and the cloud syncer's ``RemoteTrack.updated_at_micros`` so
+    last-write-wins comparisons are apples-to-apples across paths.
+    """
+    import time as _time
+
+    return int(_time.time() * 1_000_000)
 
 
 def _hot_cues_to_json(hot_cues: list[int | None]) -> str:
