@@ -141,10 +141,13 @@ def test_schema_version_is_current():
     not a column on ``tracks``). v7 added the loudness leveler columns
     (``lufs`` + ``track_gain_db``). v8 added the ``playlist_queue``
     table (DJ-curated next-track order; see ``copilot/playlist.py``).
-    Pinning to a literal here rather than a >= comparison so a future
-    regression that *lowers* the version fails loudly.
+    v9 added the ``source`` column on ``tracks`` (row provenance —
+    ``"local"`` vs ``"soundcloud"`` / future streaming providers;
+    drives the lazy-analysis path for streaming rows). Pinning to a
+    literal here rather than a >= comparison so a future regression
+    that *lowers* the version fails loudly.
     """
-    assert TRACK_SCHEMA_VERSION == 8
+    assert TRACK_SCHEMA_VERSION == 9
     assert HOT_CUE_SLOTS == 8
 
 

@@ -67,9 +67,22 @@ if TYPE_CHECKING:  # pragma: no cover — type-only import to break cycle.
 # consulted by the auto-mix controller before the mashability ranker.
 # See ``copilot/playlist.py`` for the row shape, mutation API, and the
 # auto-mix integration contract.
+# v9 adds the ``source`` column to ``tracks`` — origin of the row
+# ("local" for files on disk, "soundcloud" / "beatport" / "mixcloud"
+# for streaming providers). Streaming rows store the playable HTTP URL
+# in ``path`` so the engine's decoder treats them uniformly; the
+# ``source`` column lets the UI render a provider chip and lets the
+# library defer analysis (BPM / key / waveform) until first deck-load.
+# See ``copilot/streaming/__init__.py`` for the provider abstraction.
 # Migrations dispatch on the gap between this constant and the value
 # recorded in the ``schema_version`` table.
-TRACK_SCHEMA_VERSION = 8
+TRACK_SCHEMA_VERSION = 9
+
+# Source-column enum values. Persisted as plain strings (not a SQL
+# enum) so older readers introspect cleanly. ``SOURCE_LOCAL`` is the
+# default backfill for pre-v9 rows; streaming sources use the provider
+# name (lowercased) — see :class:`copilot.streaming.StreamingProvider`.
+SOURCE_LOCAL = "local"
 
 LOUDNESS_TARGET_LUFS = -14.0
 
@@ -143,6 +156,12 @@ class TrackRef:
     # as 0 dB (passthrough).
     lufs: float | None = None
     track_gain_db: float | None = None
+    # Schema v9 — provenance of the row. ``"local"`` for filesystem
+    # paths (the default for back-compat), ``"soundcloud"`` /
+    # ``"beatport"`` / etc. for streaming-provider rows whose ``path``
+    # field holds a playable HTTP URL. Defaulted last so every
+    # positional ``TrackRef(...)`` call site keeps working.
+    source: str = "local"
 
 
 # Hard compatibility gates. Tracks outside these can sometimes mix but the
@@ -324,6 +343,17 @@ class TrackLibrary:
             self._conn.execute(
                 "ALTER TABLE tracks ADD COLUMN track_gain_db REAL"
             )
+        if "source" not in cols:
+            # v9 migration — row provenance. ``"local"`` is the
+            # backfill for every pre-v9 row (a SQL-side DEFAULT keeps
+            # the migration a single ALTER without a per-row UPDATE).
+            # Streaming providers write their own name
+            # (:attr:`StreamingProvider.name`). NOT NULL so a future
+            # writer can't insert a row without an explicit source.
+            self._conn.execute(
+                "ALTER TABLE tracks "
+                "ADD COLUMN source TEXT NOT NULL DEFAULT 'local'"
+            )
         # v6 migration — user preset snapshots. Lives in its own table
         # rather than as columns on ``tracks`` because presets aren't
         # per-track. ``name`` is UNIQUE so the UI's "save current" flow
@@ -404,8 +434,8 @@ class TrackLibrary:
             "INSERT OR REPLACE INTO tracks "
             "(track_id, path, bpm, camelot_key, energy, duration_s, "
             " beat_grid_anchor_ms, beat_period_ms, downbeats_json, "
-            " hot_cues_json, lufs, track_gain_db) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " hot_cues_json, lufs, track_gain_db, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 track.track_id,
                 track.path,
@@ -423,9 +453,97 @@ class TrackLibrary:
                     if track.track_gain_db is None
                     else float(track.track_gain_db)
                 ),
+                str(track.source or SOURCE_LOCAL),
             ),
         )
         self._conn.commit()
+
+    def add_streaming_track(
+        self,
+        *,
+        provider: str,
+        track_id: str,
+        title: str,
+        artist: str,
+        duration_s: float,
+        stream_url: str,
+        camelot_key: str | None = None,
+        genre: str = "",
+    ) -> TrackRef:
+        """Persist a streaming-provider track into the catalog.
+
+        Streaming rows skip the heavy local-file analyzer pass at
+        ingest time — BPM / key / LUFS / waveform analysis is deferred
+        to first deck-load (the engine fetches a buffered prefix, the
+        co-pilot's analyzer runs on it, results back-fill the row). At
+        ingest time we only know:
+
+        * The provider-reported ``duration_s`` (trusted for catalog
+          display; the analyzer re-measures on load).
+        * The provider-reported ``camelot_key`` if any (SoundCloud
+          doesn't expose key, so this is usually ``None``).
+
+        The ``track_id`` stored in the library is namespaced
+        ``"<provider>:<id>"`` so streaming sources can't collide with
+        local-file ids (which use ``Path.stem``).
+
+        Args:
+            provider: Provider name (matches
+                :attr:`StreamingProvider.name` — ``"soundcloud"`` etc.).
+            track_id: Provider-scoped track id. Namespaced internally;
+                returned ``TrackRef.track_id`` is ``"<provider>:<id>"``.
+            title: Display title (folded into the namespaced id via
+                ``"{provider}:{track_id}"`` — title is not part of the
+                key, just metadata; we don't have a title column yet).
+            artist: Display artist; currently unused at the storage
+                layer (title + artist will move to dedicated columns
+                when the streaming UI ships).
+            duration_s: Provider-reported duration in seconds.
+            stream_url: Playable HTTP URL. Stored in ``path`` so the
+                engine's existing DeckLoad path consumes it without
+                schema branching.
+            camelot_key: Provider-supplied key string; ``None`` if
+                unavailable.
+            genre: Free-form provider-supplied genre string;
+                currently unused at the storage layer.
+
+        Returns:
+            The persisted :class:`TrackRef`. The ``bpm`` / ``energy``
+            fields are placeholders (120 / 0.0) — the lazy analyzer
+            fills them on first deck-load.
+        """
+        # ``title`` / ``artist`` / ``genre`` aren't first-class columns
+        # yet. The streaming UI surfaces them via the wire shape returned
+        # from ``streaming.search``; for v0.1 storage we accept them so
+        # the call site is forward-compatible, but only stamp ``path``
+        # and the namespaced id into the row. A future schema bump
+        # (v10?) will promote title/artist to dedicated columns; the
+        # call signature stays the same.
+        _ = (title, artist, genre)  # explicit no-op acknowledgement
+        prefixed_id = f"{provider}:{track_id}"
+        # Placeholders for analysis-derived fields. BPM defaults to
+        # 120 (the proposer's safe-default) so a deck-load before
+        # analysis still has a sane beat-grid period. Energy 0.0 lets
+        # the mashability ranker safely de-prioritise the row until
+        # real analysis lands. ``camelot_key`` falls back to ``"?"``
+        # which :func:`camelot_distance` already treats as "filter out
+        # of mashup gates" — symmetric with how the local analyzer
+        # handles a failed-key file.
+        safe_bpm = 120.0
+        ref = TrackRef(
+            track_id=prefixed_id,
+            path=stream_url,
+            bpm=safe_bpm,
+            camelot_key=camelot_key or "?",
+            energy=0.0,
+            duration_s=float(duration_s),
+            beat_grid_anchor_ms=0,
+            beat_period_ms=60_000.0 / safe_bpm,
+            downbeats_ms=[],
+            source=str(provider),
+        )
+        self.add_track(ref)
+        return ref
 
     def set_hot_cues(
         self, track_id: str, hot_cues: list[int | None]
@@ -1008,6 +1126,10 @@ class TrackLibrary:
         # v7 loudness columns — NULL-safe.
         lufs_raw = r["lufs"] if "lufs" in keys else None
         gain_raw = r["track_gain_db"] if "track_gain_db" in keys else None
+        # v9 source column — default to ``"local"`` so a row from an
+        # older driver path (or a corrupted column) still types-checks
+        # against the wire shape.
+        source_raw = r["source"] if "source" in keys else SOURCE_LOCAL
         return TrackRef(
             track_id=r["track_id"],
             path=r["path"],
@@ -1029,6 +1151,7 @@ class TrackLibrary:
             hot_cues=hot_cues,
             lufs=None if lufs_raw is None else float(lufs_raw),
             track_gain_db=None if gain_raw is None else float(gain_raw),
+            source=str(source_raw) if source_raw else SOURCE_LOCAL,
         )
 
 
