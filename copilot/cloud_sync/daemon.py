@@ -27,11 +27,28 @@ import os
 import sqlite3
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from .bootstrap import bootstrap_pull, bootstrap_push
 from .client import SyncClient, SyncError
+
+
+@dataclass(frozen=True)
+class SyncStats:
+    """Snapshot of the daemon's last-tick counters.
+
+    Wall-clock micros (same scale as `Event.ts_micros`). All fields
+    `0` before the first tick — UI renders "never synced" then.
+    """
+
+    last_pull_micros: int = 0
+    last_push_micros: int = 0
+    last_pull_fetched: int = 0
+    last_pull_applied: int = 0
+    last_push_pushed: int = 0
+    last_tick_error: str = ""
 
 DEFAULT_TICK_SECONDS = 60.0
 
@@ -53,6 +70,8 @@ class SyncDaemon:
         self._log = logger or logging.getLogger("copilot.cloud_sync.daemon")
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._stats_lock = threading.Lock()
+        self._stats = SyncStats()
 
     @classmethod
     def from_env(
@@ -111,7 +130,13 @@ class SyncDaemon:
         self._thread = None
 
     def tick_once(self) -> None:
-        """Run a single pull + push cycle (test seam)."""
+        """Run a single pull + push cycle (test seam).
+
+        Records counters into `self._stats` so the UI badge can show
+        "last synced X ago" without polling the cloud directly. The
+        record happens under `_stats_lock` so an RPC reader thread
+        sees a consistent snapshot.
+        """
         # Lazy-import to avoid pulling library.py into this module's
         # cold-start path when the daemon isn't used (e.g. local-only
         # mode where the sync client is the InMemory fallback).
@@ -119,10 +144,37 @@ class SyncDaemon:
 
         library = TrackLibrary(self._library_path)
         try:
-            bootstrap_pull(self._client, library=library, logger=self._log)
-            bootstrap_push(self._client, library, logger=self._log)
+            pull_result = bootstrap_pull(
+                self._client, library=library, logger=self._log
+            )
+            push_result = bootstrap_push(
+                self._client, library, logger=self._log
+            )
+            now_us = int(time.time() * 1_000_000)
+            with self._stats_lock:
+                self._stats = SyncStats(
+                    last_pull_micros=now_us,
+                    last_push_micros=now_us,
+                    last_pull_fetched=pull_result.fetched_count,
+                    last_pull_applied=pull_result.applied_count
+                    + pull_result.inserted_count,
+                    last_push_pushed=push_result.pushed_count,
+                    last_tick_error=(
+                        pull_result.transport_error
+                        or push_result.transport_error
+                        or ""
+                    ),
+                )
         finally:
             library.close()
+
+    def stats(self) -> SyncStats:
+        """Thread-safe snapshot of the last-tick counters. Returns a
+        fresh frozen dataclass so the caller can read without holding
+        the lock.
+        """
+        with self._stats_lock:
+            return self._stats
 
     def _loop(self) -> None:
         # Wait one tick BEFORE the first sync so we don't double up
@@ -158,4 +210,4 @@ class SyncDaemon:
             time.sleep(0)
 
 
-__all__ = ["DEFAULT_TICK_SECONDS", "SyncDaemon"]
+__all__ = ["DEFAULT_TICK_SECONDS", "SyncDaemon", "SyncStats"]

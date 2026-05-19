@@ -123,10 +123,14 @@ async def _run(args: argparse.Namespace) -> int:
     # with the process; explicit .stop() in the finally block.
     sync_daemon = SyncDaemon.from_env(sync_client, args.library_db, logger=log)
     sync_daemon.start()
+    # Make sync daemon stats available to the library RPC so UI's
+    # `library.sync_status` includes "last synced X ago" data.
+    # (Constructor needs the daemon up-front; see service.__init__.)
     service = CoPilotService(
         library,
         engine_ws_url=args.engine_ws,
         bridge_token=args.bridge_token,
+        sync_daemon=sync_daemon,
     )
     if args.http_server:
         run_coro = service.run_with_http_server(

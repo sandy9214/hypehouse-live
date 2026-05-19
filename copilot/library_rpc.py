@@ -231,8 +231,15 @@ class LibraryRpcHandler:
         streaming_providers: (
             "dict[str, StreamingProvider] | None"
         ) = None,
+        sync_daemon: object | None = None,
     ):
         self._library = library
+        # Optional cloud-sync daemon — when present, `sync_status`
+        # folds the last-tick stats into the response so the UI can
+        # render "last synced X ago". Typed as `object` to avoid an
+        # import cycle (`daemon.py` ships in the same package but the
+        # circular reference would force a TYPE_CHECKING shim).
+        self._sync_daemon = sync_daemon
         # Per-process registry of in-flight stem-computation tasks,
         # keyed by ``track_id``. Kicking ``library.compute_stems``
         # twice for the same track is a no-op — the second call
@@ -308,14 +315,42 @@ class LibraryRpcHandler:
     def _sync_status(self, _params: dict[str, Any]) -> dict[str, Any]:
         """Cloud library sync status snapshot (#102 follow-up).
 
-        Returns ``{pending_push_count, library_track_count}`` so the UI
-        can render a badge without polling the entire catalog. Pure
-        read; no side effects.
+        Always returns ``pending_push_count`` + ``library_track_count``.
+        When a `SyncDaemon` is wired (production path), folds in the
+        last-tick stats (`last_pull_micros`, `last_push_micros`,
+        `last_pull_fetched`, `last_pull_applied`, `last_push_pushed`,
+        `last_tick_error`). Returns `0` / `""` defaults when the
+        daemon isn't wired (test path / pre-cloud-sync local-only
+        runs).
         """
-        return {
+        out: dict[str, Any] = {
             "pending_push_count": len(self._library.pending_push_ids()),
             "library_track_count": self._library.count_tracks(),
         }
+        if self._sync_daemon is not None:
+            stats = self._sync_daemon.stats()  # type: ignore[attr-defined]
+            out.update(
+                {
+                    "last_pull_micros": int(stats.last_pull_micros),
+                    "last_push_micros": int(stats.last_push_micros),
+                    "last_pull_fetched": int(stats.last_pull_fetched),
+                    "last_pull_applied": int(stats.last_pull_applied),
+                    "last_push_pushed": int(stats.last_push_pushed),
+                    "last_tick_error": str(stats.last_tick_error),
+                }
+            )
+        else:
+            out.update(
+                {
+                    "last_pull_micros": 0,
+                    "last_push_micros": 0,
+                    "last_pull_fetched": 0,
+                    "last_pull_applied": 0,
+                    "last_push_pushed": 0,
+                    "last_tick_error": "",
+                }
+            )
+        return out
 
     def _list_tracks(self, params: dict[str, Any]) -> dict[str, Any]:
         limit = _coerce_int(params.get("limit"), field="limit", default=100)

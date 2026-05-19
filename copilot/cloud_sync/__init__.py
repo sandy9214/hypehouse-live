@@ -58,7 +58,7 @@ from .client import (
     SyncClient,
     SyncError,
 )
-from .daemon import DEFAULT_TICK_SECONDS, SyncDaemon
+from .daemon import DEFAULT_TICK_SECONDS, SyncDaemon, SyncStats
 from .supabase import SupabaseSyncClient
 from .syncer import ConflictOutcome, LibrarySyncer, PullResult, PushResult
 
@@ -74,4 +74,5 @@ __all__ = [
     "SyncClient",
     "SyncDaemon",
     "SyncError",
+    "SyncStats",
 ]
