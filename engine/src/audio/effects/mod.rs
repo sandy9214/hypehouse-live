@@ -21,11 +21,13 @@ use crate::audio::clock::SharedClock;
 pub mod echo;
 pub mod filter;
 pub mod gate;
+pub mod lfo;
 pub mod reverb;
 
 pub use echo::Echo;
 pub use filter::Filter;
 pub use gate::Gate;
+pub use lfo::{apply_lfo_to_params, Lfo, LfoConfig, RateDiv, Shape};
 pub use reverb::Reverb;
 
 /// Numeric effect id reserved in the registry. 0 = empty slot.
@@ -136,6 +138,16 @@ pub struct FxBank {
     /// 0..1 wet/dry blend. 1.0 = full wet.
     pub wet_dry: f32,
     pub enabled: bool,
+    /// Optional per-slot LFO modulating one chosen param. `None` =
+    /// static params (legacy behaviour). Configured / cleared via
+    /// `AudioCommandKind::EffectLfoSet` / `EffectLfoClear`. POD —
+    /// `LfoConfig: Copy` so this stays alloc-free.
+    pub lfo: Option<Lfo>,
+    /// Snapshot of the SharedClock so the LFO can re-read live BPM +
+    /// frame each `process()` call. Cloning a SharedClock is a single
+    /// `Arc` bump — alloc-free; not held inside the `Option<Lfo>` so
+    /// we don't re-clone the Arc on every event.
+    clock: SharedClock,
 }
 
 impl FxBank {
@@ -146,12 +158,29 @@ impl FxBank {
             filter: Filter::new(),
             echo: Echo::new(sample_rate),
             reverb: Reverb::new(sample_rate),
-            gate: Gate::new(clock, sample_rate, master_bpm),
+            gate: Gate::new(clock.clone(), sample_rate, master_bpm),
             effect_id: EFFECT_NONE,
             params: [0.0; MAX_PARAMS],
             wet_dry: 0.5,
             enabled: false,
+            lfo: None,
+            clock,
         }
+    }
+
+    /// Attach (or replace) the slot's modulation LFO. Pure metadata —
+    /// no audio-thread state to reset because the LFO is a pure-fn of
+    /// (frame, bpm, sr).
+    #[inline]
+    pub fn set_lfo(&mut self, config: LfoConfig) {
+        self.lfo = Some(Lfo::new(config));
+    }
+
+    /// Detach any attached LFO. Subsequent `process()` calls run with
+    /// the slot's static params.
+    #[inline]
+    pub fn clear_lfo(&mut self) {
+        self.lfo = None;
     }
 
     /// Re-assign this slot to a different effect id. `reset()` the
@@ -162,6 +191,11 @@ impl FxBank {
         self.params = default_params(effect_id);
         self.wet_dry = 0.5;
         self.enabled = true;
+        // Re-assigning the slot to a different effect implicitly clears
+        // any prior LFO: the old `target_param` index almost certainly
+        // means something different under the new effect's descriptor
+        // table, so silently re-applying it is a footgun.
+        self.lfo = None;
         match effect_id {
             EFFECT_FILTER => self.filter.reset(),
             EFFECT_ECHO => self.echo.reset(),
@@ -175,6 +209,7 @@ impl FxBank {
     pub fn clear(&mut self) {
         self.effect_id = EFFECT_NONE;
         self.enabled = false;
+        self.lfo = None;
     }
 
     /// Update one param by descriptor index. Out-of-range index is
@@ -193,17 +228,35 @@ impl FxBank {
 
     /// **Audio-thread side**. Process `buf` (interleaved stereo) in
     /// place. No-op when slot is empty / disabled / fully dry.
+    ///
+    /// If `self.lfo` is `Some`, the slot's static `params` are modulated
+    /// per [`apply_lfo_to_params`] before dispatching to the effect's
+    /// `process()`. The modulation is computed once per buffer (at the
+    /// buffer's start frame) — sufficient for sub-audio-rate LFOs at
+    /// typical render-block sizes (256-2048 frames) without paying the
+    /// CPU for per-sample modulation. POD copy of the params table
+    /// stays on the stack — no allocation.
     #[inline]
     pub fn process(&mut self, buf: &mut [f32], sample_rate: u32) {
         if !self.enabled || self.effect_id == EFFECT_NONE || self.wet_dry <= 0.0 {
             return;
         }
         let wet = self.wet_dry.clamp(0.0, 1.0);
+        // Effective params: either the static table or a per-buffer
+        // LFO-modulated snapshot.
+        let params = match &self.lfo {
+            None => self.params,
+            Some(lfo) => {
+                let bpm = self.clock.master_bpm();
+                let frame = self.clock.frame();
+                apply_lfo_to_params(&self.params, lfo, self.effect_id, frame, sample_rate, bpm)
+            }
+        };
         match self.effect_id {
-            EFFECT_FILTER => self.filter.process(buf, &self.params, wet, sample_rate),
-            EFFECT_ECHO => self.echo.process(buf, &self.params, wet, sample_rate),
-            EFFECT_REVERB => self.reverb.process(buf, &self.params, wet, sample_rate),
-            EFFECT_GATE => self.gate.process(buf, &self.params, wet, sample_rate),
+            EFFECT_FILTER => self.filter.process(buf, &params, wet, sample_rate),
+            EFFECT_ECHO => self.echo.process(buf, &params, wet, sample_rate),
+            EFFECT_REVERB => self.reverb.process(buf, &params, wet, sample_rate),
+            EFFECT_GATE => self.gate.process(buf, &params, wet, sample_rate),
             _ => {}
         }
     }
@@ -275,6 +328,97 @@ mod tests {
         let mut buf2 = [0.0_f32; 64];
         b.process(&mut buf2, 48_000);
         assert!(buf2.iter().all(|s| s.abs() < 1e-6));
+    }
+
+    #[test]
+    fn lfo_attached_to_filter_slot_modulates_cutoff() {
+        // Verify the FxBank-level wiring: attaching an LFO to a Filter
+        // slot causes the params seen by the inner effect to vary with
+        // the SharedClock frame. We assert on the *params snapshot* the
+        // bank computes (cheaper + more robust than measuring filter
+        // output energy across biquad transients).
+        let clock = SharedClock::with_bpm(240.0);
+        let mut bank = FxBank::new(48_000, clock.clone(), 240.0);
+        bank.assign(EFFECT_FILTER);
+        bank.params[0] = 1000.0; // cutoff_hz
+        bank.params[1] = 0.0; // resonance
+        bank.params[2] = 0.0; // LP
+        bank.set_lfo(LfoConfig::new(Shape::Sine, RateDiv::Bar, 1.0, 0));
+
+        // At frame 0 the sine LFO is 0 → cutoff unchanged.
+        {
+            let lfo = bank.lfo.as_ref().expect("lfo set");
+            let p = apply_lfo_to_params(
+                &bank.params,
+                lfo,
+                bank.effect_id,
+                clock.frame(),
+                48_000,
+                clock.master_bpm(),
+            );
+            assert!(
+                (p[0] - 1000.0).abs() < 1e-3,
+                "LFO @ phase 0 should leave cutoff at 1000, got {}",
+                p[0]
+            );
+        }
+        // Advance to 1/4 LFO cycle (12_000 frames @ Bar / 240 BPM / 48 kHz).
+        clock.advance(12_000);
+        {
+            let lfo = bank.lfo.as_ref().expect("lfo set");
+            let p = apply_lfo_to_params(
+                &bank.params,
+                lfo,
+                bank.effect_id,
+                clock.frame(),
+                48_000,
+                clock.master_bpm(),
+            );
+            // +1 sine × depth=1 × 2 octaves → cutoff × 4 = 4000 Hz.
+            assert!(
+                (p[0] - 4000.0).abs() < 5.0,
+                "LFO @ phase 1/4 should swing cutoff to ~4000, got {}",
+                p[0]
+            );
+        }
+        // End-to-end: confirm `process()` still runs without panic /
+        // NaN at the modulated state.
+        let mut buf = vec![0.5_f32; 2048];
+        bank.process(&mut buf, 48_000);
+        assert!(buf.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn assigning_new_effect_clears_lfo() {
+        let mut b = bank();
+        b.assign(EFFECT_FILTER);
+        b.set_lfo(LfoConfig::new(Shape::Sine, RateDiv::Beat, 1.0, 0));
+        assert!(b.lfo.is_some());
+        // Re-assign to a different effect → LFO cleared. Stale
+        // target_param under a new descriptor table would be a footgun.
+        b.assign(EFFECT_ECHO);
+        assert!(b.lfo.is_none(), "assigning a new effect must clear the LFO");
+    }
+
+    #[test]
+    fn clear_slot_clears_lfo() {
+        let mut b = bank();
+        b.assign(EFFECT_FILTER);
+        b.set_lfo(LfoConfig::new(Shape::Sine, RateDiv::Beat, 1.0, 0));
+        b.clear();
+        assert!(b.lfo.is_none(), "clearing a slot must clear the LFO");
+    }
+
+    #[test]
+    fn assert_no_alloc_process_with_lfo() {
+        let clock = SharedClock::with_bpm(120.0);
+        let mut b = FxBank::new(48_000, clock, 120.0);
+        b.assign(EFFECT_FILTER);
+        b.set_lfo(LfoConfig::new(Shape::Sine, RateDiv::Quarter, 0.6, 0));
+        let mut buf = [0.1_f32; 2048];
+        assert_no_alloc::assert_no_alloc(|| {
+            b.process(&mut buf, 48_000);
+        });
     }
 
     #[test]

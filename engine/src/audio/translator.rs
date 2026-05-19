@@ -505,6 +505,37 @@ pub fn event_to_commands_with_errors(
                 });
             }
         }
+        EventKind::EffectLfoSet { deck, slot, config } => {
+            // Forward the post-reducer config so the audio thread + state
+            // log agree on the final (clamped) values.
+            let resolved = next
+                .deck_ref(*deck)
+                .effects
+                .get(*slot as usize)
+                .and_then(|s| s.lfo);
+            if let Some(c) = resolved {
+                out.push(AudioCommand {
+                    at_frame: now_frame,
+                    kind: AudioCommandKind::EffectLfoSet {
+                        deck: *deck,
+                        slot: *slot,
+                        config: c,
+                    },
+                });
+            } else {
+                // Out-of-range slot — drop silently (mirrors EffectParam path).
+                let _ = config;
+            }
+        }
+        EventKind::EffectLfoClear { deck, slot } => {
+            out.push(AudioCommand {
+                at_frame: now_frame,
+                kind: AudioCommandKind::EffectLfoClear {
+                    deck: *deck,
+                    slot: *slot,
+                },
+            });
+        }
         EventKind::SetMasterLimiterEnabled { .. } => {
             // Read the reducer-finalized value so the audio thread +
             // state log always agree.
@@ -1163,6 +1194,96 @@ mod tests {
             }
             other => panic!("expected SetMasterLimiterThreshold, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn effect_lfo_set_emits_audio_command_with_clamped_config() {
+        // ADR-006 — EffectLfoSet event must round-trip through the
+        // reducer (depth + target_param clamped) and emit an
+        // EffectLfoSet audio command carrying the *post-reducer* config.
+        use crate::audio::effects::{LfoConfig, RateDiv, Shape};
+        let s0 = EngineState::default();
+        let assign = ev(
+            1,
+            EventKind::EffectAssign {
+                deck: DeckId::A,
+                slot: 0,
+                effect_id: 1, // Filter
+            },
+        );
+        let s1 = s0.apply(&assign);
+        // Over-max depth (2.0) + valid target_param (0=cutoff_hz).
+        let cfg = LfoConfig::new(Shape::Sine, RateDiv::Quarter, 2.0, 0);
+        let set = ev(
+            2,
+            EventKind::EffectLfoSet {
+                deck: DeckId::A,
+                slot: 0,
+                config: cfg,
+            },
+        );
+        let s2 = s1.apply(&set);
+        let cmds = translate(&s1, &s2, &set, 0);
+        assert_eq!(cmds.len(), 1);
+        match cmds[0].kind {
+            AudioCommandKind::EffectLfoSet { deck, slot, config } => {
+                assert_eq!(deck, DeckId::A);
+                assert_eq!(slot, 0);
+                // Depth was 2.0 → clamped to 1.0 by the reducer.
+                assert!(
+                    (config.depth - 1.0).abs() < 1e-6,
+                    "depth must be reducer-clamped to 1.0, got {}",
+                    config.depth
+                );
+                assert_eq!(config.target_param, 0);
+                assert_eq!(config.shape, Shape::Sine);
+                assert_eq!(config.rate_div, RateDiv::Quarter);
+            }
+            other => panic!("expected EffectLfoSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effect_lfo_clear_emits_audio_command() {
+        use crate::audio::effects::{LfoConfig, RateDiv, Shape};
+        let s0 = EngineState::default();
+        let assign = ev(
+            1,
+            EventKind::EffectAssign {
+                deck: DeckId::B,
+                slot: 1,
+                effect_id: 1,
+            },
+        );
+        let s1 = s0.apply(&assign);
+        let set = ev(
+            2,
+            EventKind::EffectLfoSet {
+                deck: DeckId::B,
+                slot: 1,
+                config: LfoConfig::new(Shape::Saw, RateDiv::Beat, 0.7, 0),
+            },
+        );
+        let s2 = s1.apply(&set);
+        let clear = ev(
+            3,
+            EventKind::EffectLfoClear {
+                deck: DeckId::B,
+                slot: 1,
+            },
+        );
+        let s3 = s2.apply(&clear);
+        let cmds = translate(&s2, &s3, &clear, 0);
+        assert_eq!(cmds.len(), 1);
+        match cmds[0].kind {
+            AudioCommandKind::EffectLfoClear { deck, slot } => {
+                assert_eq!(deck, DeckId::B);
+                assert_eq!(slot, 1);
+            }
+            other => panic!("expected EffectLfoClear, got {other:?}"),
+        }
+        // Reducer cleared the slot's lfo field.
+        assert!(s3.deck_b.effects[1].lfo.is_none());
     }
 
     // ---------------------------------------------------------------------

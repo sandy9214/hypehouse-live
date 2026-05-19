@@ -301,6 +301,23 @@ pub enum EventKind {
         slot_a: u8,
         slot_b: u8,
     },
+    /// ADR-006 — attach (or replace) a per-slot LFO that modulates one
+    /// chosen effect param. Pure metadata: the audio thread re-reads
+    /// frame + master BPM off the SharedClock on every `process()` call
+    /// so a single config carries no internal state. Cleared by
+    /// [`EventKind::EffectLfoClear`] or implicitly by `EffectAssign`
+    /// (re-assigning the slot's effect resets the LFO since the param
+    /// indices may now mean something different).
+    EffectLfoSet {
+        deck: DeckId,
+        slot: u8,
+        config: crate::audio::effects::LfoConfig,
+    },
+    /// ADR-006 — detach the slot's LFO. Slot reverts to static params.
+    EffectLfoClear {
+        deck: DeckId,
+        slot: u8,
+    },
     CopilotEngage {
         deck: DeckId,
     },
@@ -474,6 +491,11 @@ pub struct EffectSlot {
     /// 0.0 = dry, 1.0 = full wet.
     pub wet_dry: f32,
     pub enabled: bool,
+    /// Optional LFO modulating one chosen param. `None` = static params
+    /// (the wire-compat default; older snapshots without this field
+    /// deserialize cleanly via `#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lfo: Option<crate::audio::effects::LfoConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -694,6 +716,11 @@ impl EngineState {
                         params: Default::default(),
                         wet_dry: 0.5,
                         enabled: true,
+                        // `EffectAssign` re-assigns the slot's effect →
+                        // any prior LFO's `target_param` may now mean
+                        // something different. Clear it; UI re-attaches
+                        // via a fresh `EffectLfoSet` event.
+                        lfo: None,
                     };
                 }
             }
@@ -745,6 +772,34 @@ impl EngineState {
                 let b = (*slot_b).min(last) as usize;
                 if a != b {
                     next.deck_mut(*id).effects.swap(a, b);
+                }
+            }
+            EventKind::EffectLfoSet {
+                deck: id,
+                slot,
+                config,
+            } => {
+                if let Some(s) = next.deck_mut(*id).effects.get_mut(*slot as usize) {
+                    // Defensive: depth is clamped + target_param is
+                    // bounded against the effect's descriptor list. The
+                    // audio side clamps too, but we want the state log
+                    // to record the post-clamp value so snapshots round-
+                    // trip cleanly.
+                    let mut c = *config;
+                    c.depth = c.depth.clamp(0.0, 1.0);
+                    let max_param = crate::audio::effects::descriptors(s.effect_id).len();
+                    if (c.target_param as usize) >= max_param {
+                        // Out-of-range target — clamp to the last valid
+                        // descriptor (or 0 if the slot is empty). Mirrors
+                        // the defensive behaviour of `set_param`.
+                        c.target_param = max_param.saturating_sub(1) as u8;
+                    }
+                    s.lfo = Some(c);
+                }
+            }
+            EventKind::EffectLfoClear { deck: id, slot } => {
+                if let Some(s) = next.deck_mut(*id).effects.get_mut(*slot as usize) {
+                    s.lfo = None;
                 }
             }
             EventKind::DeckPlay { deck: id } => {
