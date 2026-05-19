@@ -115,3 +115,90 @@ export const useSessionInfo = (client: JsonRpcWS): SessionInfo => {
   }, [client]);
   return snapshot;
 };
+
+
+// ---- Cloud library sync status (#102 follow-up) -------------------
+
+export interface SyncStatus {
+  pending_push_count: number;
+  library_track_count: number;
+}
+
+const DEFAULT_SYNC_STATUS: SyncStatus = {
+  pending_push_count: 0,
+  library_track_count: 0,
+};
+
+const isSyncStatus = (v: unknown): v is SyncStatus => {
+  if (!v || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  return (
+    typeof o.pending_push_count === "number" &&
+    typeof o.library_track_count === "number"
+  );
+};
+
+type SyncStatusListener = () => void;
+const syncStatusListeners: Set<SyncStatusListener> = new Set();
+let syncStatus: SyncStatus = DEFAULT_SYNC_STATUS;
+
+const notifySync = (): void => {
+  for (const l of syncStatusListeners) l();
+};
+const subscribeSync = (l: SyncStatusListener): (() => void) => {
+  syncStatusListeners.add(l);
+  return () => {
+    syncStatusListeners.delete(l);
+  };
+};
+const getSyncSnapshot = (): SyncStatus => syncStatus;
+
+export const __setSyncStatus = (next: SyncStatus): void => {
+  syncStatus = next;
+  notifySync();
+};
+
+export const __resetSyncStatus = (): void => {
+  syncStatus = DEFAULT_SYNC_STATUS;
+  notifySync();
+};
+
+/**
+ * Re-fetch cloud sync status. Cheap RPC (one count + one len query
+ * on a tiny table); safe to call on a refresh poll.
+ */
+export const fetchSyncStatus = async (
+  client: JsonRpcWS,
+): Promise<SyncStatus> => {
+  try {
+    const result = await client.call<unknown>("library.sync_status");
+    if (isSyncStatus(result)) {
+      __setSyncStatus(result);
+    } else {
+      __setSyncStatus(DEFAULT_SYNC_STATUS);
+    }
+  } catch {
+    __setSyncStatus(DEFAULT_SYNC_STATUS);
+  }
+  return syncStatus;
+};
+
+/** Hook — fetches once on mount; polls every `refreshMs` while hooked. */
+export const useSyncStatus = (
+  client: JsonRpcWS,
+  refreshMs = 5_000,
+): SyncStatus => {
+  const snapshot = useSyncExternalStore(
+    subscribeSync,
+    getSyncSnapshot,
+    getSyncSnapshot,
+  );
+  useEffect(() => {
+    void fetchSyncStatus(client);
+    const id = window.setInterval(() => {
+      void fetchSyncStatus(client);
+    }, refreshMs);
+    return () => window.clearInterval(id);
+  }, [client, refreshMs]);
+  return snapshot;
+};
