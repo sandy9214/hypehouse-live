@@ -58,6 +58,7 @@ from .client import (
     SyncClient,
     SyncError,
 )
+from .supabase import SupabaseSyncClient
 from .syncer import ConflictOutcome, LibrarySyncer, PullResult
 
 __all__ = [
@@ -66,6 +67,7 @@ __all__ = [
     "LibrarySyncer",
     "PullResult",
     "RemoteTrack",
+    "SupabaseSyncClient",
     "SyncClient",
     "SyncError",
 ]
