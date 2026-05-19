@@ -81,7 +81,7 @@ thiserror = "2"
 # `engine/src/telemetry.rs` and `docs/telemetry.md`). `rustls` keeps us
 # off OpenSSL; `panic` wires the panic hook so unwinds in the audio
 # thread bubble up as Sentry events. No `unsafe` is added.
-sentry = { version = "0.32", default-features = false, features = ["backtrace", "contexts", "panic", "rustls", "reqwest"] }
+sentry = { version = "0.48", default-features = false, features = ["backtrace", "contexts", "panic", "rustls", "reqwest"] }
 
 [dev-dependencies]
 criterion = "0.7"
