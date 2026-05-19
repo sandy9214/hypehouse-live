@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added — Engine (Rust)
+- **`engine.session_info` WS RPC** — read-only snapshot of version +
+  active output-device substring + 7 feature flags (MIDI clock IN/OUT,
+  Ableton Link, Sentry, recording, rate-limit, shared CI). Pure handler
+  reads env each call so mid-session flag flips are reflected on the
+  next request (#144).
+- **Sidechain gain-reduction atomic + bridge wire** — audio thread
+  writes the live GR (dB × scale) to a shared `Arc<AtomicI16>`; bridge
+  stamps it on every `engine.state_changed` payload as
+  `sidechain_gain_reduction_db` so the UI can render a ducking meter
+  without polling. End-of-render-block update cadence (~5 ms lag at
+  256-frame chunks @ 48 kHz). Mirrors the master-limiter GR pattern
+  (#141 / #142).
 - **Sidechain compressor** — engine schema + DSP module + audio-path
   integration. Reducer-clamped params (threshold / ratio / attack /
   release / makeup), envelope follower + hard-knee ducker in the
@@ -30,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   control-thread daemons that inject synthetic events (#132).
 
 ### Added — UI (TypeScript)
+- **AboutPanel** — consumer of the new `engine.session_info` RPC.
+  Renders engine version + active audio sink + 7 feature flag chips
+  (green=on, grey=off). One-shot fetch on mount; not subscribed to
+  `state_changed` because the payload is session-static (#145).
+- **Sidechain GR meter** — vertical bar in `SidechainPanel`, clamped
+  0..-24 dB with amber→deep-orange gradient + 0/-12/-24 scale labels.
+  Driven by the new `sidechain_gain_reduction_db` envelope field on
+  every `engine.state_changed` notification (#143).
 - **Sidechain compressor settings panel** — toggle + trigger-deck switch
   + 5 param knobs (threshold / ratio / attack / release / makeup), wires
   to the new engine events (#136).
