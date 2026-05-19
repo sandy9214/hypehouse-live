@@ -18,6 +18,7 @@ import signal
 import sys
 from pathlib import Path
 
+from .cloud_sync.bootstrap import bootstrap_pull, build_sync_client_from_env
 from .library import TrackLibrary
 from .service import CoPilotService
 from .telemetry import init_telemetry
@@ -100,6 +101,14 @@ async def _run(args: argparse.Namespace) -> int:
     init_telemetry()
     log.info("opening library at %s", args.library_db)
     library = TrackLibrary(args.library_db)
+    # Cloud library sync (#102). Build the SyncClient from env so a
+    # missing SUPABASE_URL / SUPABASE_ANON_KEY drops us into the
+    # InMemorySyncClient fallback (local-only). Bootstrap pull runs
+    # synchronously so the startup log carries the row count;
+    # transport errors are absorbed by bootstrap_pull and logged at
+    # WARN level so a flaky cloud never blocks the engine.
+    sync_client = build_sync_client_from_env(logger=log)
+    bootstrap_pull(sync_client, logger=log)
     service = CoPilotService(
         library,
         engine_ws_url=args.engine_ws,
