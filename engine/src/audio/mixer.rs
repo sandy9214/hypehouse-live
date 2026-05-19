@@ -1158,8 +1158,12 @@ mod tests {
         // cumulative cost lands ~1.5-2 ms in release builds. 3 ms
         // gives ~33% headroom while still leaving the entire callback
         // well inside ADR-004's 50% rule (10.6 ms at 1024 / 48 kHz).
+        //
+        // macOS shared CI spiked to 20ms under contention (PR #87).
+        // Widening debug budget to 50ms — the real production budget
+        // (release) stays tight at 3ms.
         let budget = if cfg!(debug_assertions) {
-            std::time::Duration::from_millis(15)
+            std::time::Duration::from_millis(50)
         } else {
             std::time::Duration::from_millis(3)
         };
