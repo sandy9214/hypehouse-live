@@ -1,8 +1,11 @@
 # hypehouse-live
 
-AI DJ player v2 — **live multi-deck mixing with AI co-pilot**.
+**AI-augmented DJ tool — software-only, open source.**
 
-Rust audio engine (sub-5ms latency) + Tauri/WebSocket bridge + TypeScript UI + native MIDI via `midir`.
+Rust audio engine + Tauri/WebSocket bridge + TypeScript UI + Python AI co-pilot.
+Target: bedroom DJs / livestreamers / mixtape creators + AI auto-mix workflows. No DJ controller hardware required — runs on a laptop with keyboard + mouse. Optional WebMIDI in browser if a controller IS present.
+
+Closest peer: **Mixxx** (open-source DJ software). Differentiator: AI co-pilot with mashability-scored auto-mix + stem-aware mixing + LUFS-normalized library + cloud-shareable preset snapshots + crowd-pleaser export.
 
 ## Quick map
 
@@ -35,8 +38,16 @@ Rust audio engine (sub-5ms latency) + Tauri/WebSocket bridge + TypeScript UI + n
 
 ## Status
 
-- v0.1 in development
-- v1 (mixtape compiler) remains live at github.com/sandy9214/HypeHouse — use that for batch render
+- **Software-only positioning** (2026-05-18) — pivoted away from "drive your CDJ from a laptop" market. Target = Mixxx audience + AI auto-mix workflow. See [issue #93](https://github.com/sandy9214/hypehouse-live/issues/93) for v0.x caveats.
+- v0.1 in development. v0.2 beta: 1-2 weeks (synthetic audio bake-in + Tauri unsigned binaries).
+- v1.0 target: 3-4 months (streaming source + cloud library + marketing).
+- v1 (mixtape compiler) remains live at github.com/sandy9214/HypeHouse — use that for batch render.
+
+## Out of scope (v1)
+
+- Pioneer ProDJ Link
+- Vinyl mode / scratch emulation w/ hardware turntable controllers
+- Native CDJ / DDJ hardware-specific timing — software-only with WebMIDI fallback only.
 
 ## Setup
 

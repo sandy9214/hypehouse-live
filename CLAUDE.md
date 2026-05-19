@@ -4,9 +4,13 @@ Team-shared context. AI DJ Player v2 — live mixing.
 
 ## Overview
 
-Live multi-deck DJ player with optional AI co-pilot. Rust audio engine (sub-5ms latency) + WebMIDI controllers + Tauri/WebSocket bridge to a TypeScript frontend. Optional Python co-pilot service uses the HypeHouse v1 analyzer (BPM/key/beats) + mashup scoring to suggest next tracks and execute phrase-aligned transitions when toggled on.
+**Software-only AI-augmented DJ tool.** Closest peer: Mixxx (open-source DJ software). Differentiator: AI co-pilot with mashability-scored auto-mix + stem-aware mixing + LUFS-normalized library + cloud-shareable preset snapshots + crowd-pleaser export.
 
-Distinction from HypeHouse v1: v1 is a **mixtape compiler** (render to mp3, then play). v2 is a **live player** (real-time multi-deck, controller-driven, AI co-pilot as opt-in feature). Same audio-analysis core, totally different surface.
+Rust audio engine + Tauri/WebSocket bridge + TypeScript UI + Python AI co-pilot.
+
+**Hardware out of scope** (pivot 2026-05-18): no Pioneer CDJ/DDJ-specific timing, no ProDJ Link, no vinyl-mode scratch hardware emulation. WebMIDI works as a fallback when a controller IS present (e.g. via a USB DDJ-200) but is NOT the primary input — keyboard + mouse + UI are. Target audience = bedroom DJs, livestreamers, mixtape creators, AI-assisted set automation.
+
+Distinction from HypeHouse v1: v1 is a **mixtape compiler** (batch render to mp3, then play). v2 is a **software-only live tool** (real-time multi-deck + AI co-pilot + export-to-mixtape). Same audio-analysis core, totally different surface.
 
 ## Tech stack
 

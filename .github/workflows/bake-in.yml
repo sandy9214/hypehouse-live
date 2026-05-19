@@ -1,0 +1,120 @@
+name: bake-in
+
+# v0.2 beta synthetic bake-in. Heavy — default 25 min run, bumps to
+# 240 min for the full soak. Manual dispatch only so a casual PR
+# doesn't burn an hour of runner time on every push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_min:
+        description: "Bake wall-clock minutes (25 for sanity, 240 for soak)"
+        required: false
+        default: "25"
+      track_count:
+        description: "Synthetic catalog size"
+        required: false
+        default: "50"
+      playlist_len:
+        description: "Tracks to enqueue (transitions = N-1)"
+        required: false
+        default: "30"
+
+permissions:
+  contents: read
+
+jobs:
+  bake:
+    name: synthetic bake-in
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # cap above the 240-min soak so even the long run completes
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install ALSA + PulseAudio dummy sink
+        # The engine boots cpal which needs a working ALSA/Pulse path
+        # on Linux. The dummy sink module is loaded so the engine sees
+        # an output device without any physical hardware attached.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev pulseaudio-utils pulseaudio
+          pulseaudio --start --exit-idle-time=-1 || true
+          pactl load-module module-null-sink sink_name=bake_in_sink \
+            sink_properties=device.description=bake_in_sink || true
+          pactl set-default-sink bake_in_sink || true
+
+      - name: Setup Rust 1.88 toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+          key: bake-in-cargo-${{ runner.os }}-${{ hashFiles('engine/Cargo.lock') }}
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install copilot + harness deps
+        # The harness imports the copilot package to spawn it via
+        # `python -m copilot`. Install editable so the in-repo sources
+        # are picked up rather than a stale PyPI version.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e copilot[test]
+          pip install ruff mypy
+
+      - name: ruff + mypy on harness
+        # Hard gate the new scripts/ tree on lint/type cleanliness so
+        # the bake-in harness doesn't rot quietly alongside the engine.
+        run: |
+          ruff check scripts/bake_in
+          mypy --strict --ignore-missing-imports scripts/bake_in
+
+      - name: Pytest harness smoke tests
+        run: make bake-in-tests
+
+      - name: Run bake-in
+        env:
+          DURATION_MIN: ${{ github.event.inputs.duration_min }}
+          BAKE_COUNT: ${{ github.event.inputs.track_count }}
+          BAKE_PLAYLIST: ${{ github.event.inputs.playlist_len }}
+          BAKE_OUT_DIR: ${{ github.workspace }}/bake-in-out
+        run: make bake-in
+
+      - name: Bundle bake-in artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          cd bake-in-out
+          # master.wav.zip is the big asset — keep it separate from the
+          # tiny JSON summaries so a green run's review needs only the
+          # 50 KB summary download.
+          if compgen -G "sessions/*/master.wav" > /dev/null; then
+            zip -qr master.wav.zip sessions/*/master.wav
+          fi
+          ls -lah .
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bake-in-report
+          path: |
+            bake-in-out/run_report.json
+            bake-in-out/verify_summary.json
+            bake-in-out/sessions/**/events.jsonl
+            bake-in-out/telemetry.log
+            bake-in-out/master.wav.zip
+            bake-in-out/engine.stderr.log
+            bake-in-out/copilot.stderr.log
+          if-no-files-found: warn
+          retention-days: 14
