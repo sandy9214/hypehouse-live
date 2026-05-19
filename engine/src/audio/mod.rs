@@ -33,6 +33,7 @@ pub mod mixer;
 pub mod perf;
 pub mod pitch_tempo;
 pub mod ring;
+pub mod sidechain;
 pub mod translator;
 pub mod wsola;
 

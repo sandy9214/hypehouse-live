@@ -209,6 +209,12 @@ pub struct AudioMixer {
     /// protected against clipping when both decks are loud + effects
     /// are active. See [`crate::audio::limiter`] for the algorithm.
     limiter: MasterLimiter,
+    /// Sidechain compressor state (issue #119). Updated via
+    /// [`AudioCommandKind::SetSidechain`]. Audio-path integration
+    /// (envelope follower + duck) lands in slice 2; this slice just
+    /// caches the latest config so the route step has its params
+    /// ready when wired.
+    sidechain: crate::audio::sidechain::SidechainState,
 }
 
 /// Per-deck pitch/tempo output scratch capacity (interleaved stereo
@@ -245,6 +251,7 @@ impl AudioMixer {
             recorder: None,
             rec_scratch: [0.0; STEREO_PULL_FRAMES * 2],
             limiter: MasterLimiter::new(sample_rate),
+            sidechain: crate::audio::sidechain::SidechainState::default(),
         }
     }
 
@@ -458,6 +465,29 @@ impl AudioMixer {
             }
             AudioCommandKind::SetMasterLimiterThreshold { threshold_db } => {
                 self.limiter.set_threshold_db(threshold_db);
+            }
+            AudioCommandKind::SetSidechain {
+                enabled,
+                trigger_deck_is_a,
+                threshold_db,
+                ratio,
+                attack_ms,
+                release_ms,
+                makeup_gain_db,
+            } => {
+                self.sidechain.enabled = enabled;
+                self.sidechain.trigger_deck_is_a = trigger_deck_is_a;
+                self.sidechain.threshold_db = threshold_db;
+                self.sidechain.ratio = ratio;
+                self.sidechain.attack_ms = attack_ms;
+                self.sidechain.release_ms = release_ms;
+                self.sidechain.makeup_gain_db = makeup_gain_db;
+                // Reset envelope when disabling so next engage starts
+                // clean. (Enabling keeps the prior envelope — usually 0
+                // anyway since we just reset on the disable edge.)
+                if !enabled {
+                    self.sidechain.envelope = 0.0;
+                }
             }
         }
     }

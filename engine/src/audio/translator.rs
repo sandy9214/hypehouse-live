@@ -610,18 +610,33 @@ pub fn event_to_commands_with_errors(
         // Non-audio-relevant events — pure state, no audio command needed.
         // (`SetMasterBpm` updates the SharedClock side-channel separately;
         // see ADR-007 §v0.1 — the audio thread doesn't consume it.)
-        // Sidechain* events: DSP wiring deferred (issue #119); audio
-        // side will eventually mirror via a dedicated AudioCommandKind.
         EventKind::HotCueSet { .. }
         | EventKind::LoopIn { .. }
         | EventKind::PhaseNudge { .. }
         | EventKind::CopilotEngage { .. }
         | EventKind::CopilotDisengage { .. }
         | EventKind::SetMasterBpm { .. }
-        | EventKind::SetSidechainEnabled { .. }
-        | EventKind::SetSidechainParams { .. }
         | EventKind::SessionStart
         | EventKind::SessionEnd => {}
+        // Sidechain (#119): emit a SetSidechain audio command on EVERY
+        // sidechain-touching event. Cheap (single ring slot) and means
+        // the audio thread always sees the freshest config without
+        // having to diff the prior state.
+        EventKind::SetSidechainEnabled { .. } | EventKind::SetSidechainParams { .. } => {
+            let sc = &next.sidechain;
+            out.push(AudioCommand {
+                at_frame: now_frame,
+                kind: AudioCommandKind::SetSidechain {
+                    enabled: sc.enabled,
+                    trigger_deck_is_a: matches!(sc.trigger_deck, crate::state::DeckId::A),
+                    threshold_db: sc.threshold_db,
+                    ratio: sc.ratio,
+                    attack_ms: sc.attack_ms,
+                    release_ms: sc.release_ms,
+                    makeup_gain_db: sc.makeup_gain_db,
+                },
+            });
+        }
     }
 
     let _ = prev; // keep the diff-style signature even when unused in some arms
