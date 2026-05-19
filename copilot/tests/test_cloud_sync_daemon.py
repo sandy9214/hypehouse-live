@@ -185,3 +185,57 @@ def test_daemon_swallows_tick_exceptions(tmp_path: Path) -> None:
         time.sleep(0.05)
     daemon.stop()
     assert client.calmed_down, "daemon should survive a thrown tick"
+
+
+def test_daemon_swallows_sync_error_specifically(
+    tmp_path: Path, caplog
+) -> None:
+    """Transport SyncError logs at WARN, not ERROR — common case."""
+    import logging as _logging
+
+    from copilot.cloud_sync import SyncError as _SyncError
+
+    db = tmp_path / "lib.db"
+    lib = TrackLibrary(db)
+    lib.add_track(_make_track("t"))
+    lib.close()
+
+    class FlakyClient:
+        def __init__(self) -> None:
+            self._calls = 0
+            self.recovered = False
+
+        def list_tracks(self, *, since_micros: int = 0):
+            self._calls += 1
+            if self._calls < 2:
+                raise _SyncError("backend 503")
+            self.recovered = True
+            return []
+
+        def get_track(self, _id):
+            return None
+
+        def upsert_track(self, _t):
+            return None
+
+        def delete_track(self, _id):
+            return False
+
+    client = FlakyClient()
+    daemon = SyncDaemon(client, db, tick_seconds=0.05)
+    with caplog.at_level(_logging.WARNING, logger="copilot.cloud_sync.daemon"):
+        daemon.start()
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if client.recovered:
+                break
+            time.sleep(0.05)
+        daemon.stop()
+    assert client.recovered
+    # Transport-error log line must have appeared at WARN, not ERROR.
+    warn_msgs = [r for r in caplog.records if r.levelno == _logging.WARNING]
+    assert any("transport error" in r.message for r in warn_msgs)
+    error_msgs = [r for r in caplog.records if r.levelno >= _logging.ERROR]
+    assert not error_msgs, (
+        f"SyncError should NOT escalate to ERROR; saw: {error_msgs}"
+    )
