@@ -10,10 +10,11 @@
 //   picked up by the engine (otherwise the dropdown's persisted choice
 //   silently doesn't apply).
 
-import type { CSSProperties, JSX } from "react";
+import { useState, type CSSProperties, type JSX } from "react";
 import type { JsonRpcWS } from "../ws/client";
 import {
   formatRelativeMicros,
+  syncNow,
   useSessionInfo,
   useSyncStatus,
   type SessionFeatures,
@@ -57,6 +58,36 @@ const valueStyle: CSSProperties = {
   fontSize: "0.75rem",
 };
 
+const syncRowStyle: CSSProperties = {
+  display: "flex",
+  justifyContent: "space-between",
+  alignItems: "center",
+  gap: "0.6rem",
+};
+
+const syncButtonStyle: CSSProperties = {
+  background: "#1a2a3a",
+  color: "#9cd0e0",
+  border: "1px solid #2a3f55",
+  padding: "2px 8px",
+  borderRadius: "0.25rem",
+  fontSize: "0.7rem",
+  cursor: "pointer",
+  fontFamily: "inherit",
+};
+
+const syncButtonBusyStyle: CSSProperties = {
+  ...syncButtonStyle,
+  cursor: "wait",
+  opacity: 0.6,
+};
+
+const syncErrorStyle: CSSProperties = {
+  color: "#e09c9c",
+  fontSize: "0.7rem",
+  marginTop: "0.1rem",
+};
+
 const flagsRowStyle: CSSProperties = {
   display: "flex",
   flexWrap: "wrap",
@@ -95,6 +126,24 @@ const FEATURE_LABELS: ReadonlyArray<[keyof SessionFeatures, string]> = [
 export const AboutPanel = ({ client }: AboutPanelProps): JSX.Element => {
   const info = useSessionInfo(client);
   const sync = useSyncStatus(client);
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState<string>("");
+  const onSyncNow = async (): Promise<void> => {
+    if (syncing) return;
+    setSyncing(true);
+    setSyncError("");
+    try {
+      await syncNow(client);
+    } catch (e) {
+      // RPC error surface — `-32000` = "cloud sync not configured" /
+      // `-32603` = transport or DB failure. We render either inline
+      // so the operator knows the click landed but the sync didn't.
+      const message = e instanceof Error ? e.message : String(e);
+      setSyncError(message);
+    } finally {
+      setSyncing(false);
+    }
+  };
   const deviceLabel =
     info.output_device_substring === ""
       ? "(system default)"
@@ -124,15 +173,34 @@ export const AboutPanel = ({ client }: AboutPanelProps): JSX.Element => {
             : ""}
         </span>
       </div>
-      <div style={rowStyle}>
+      <div style={syncRowStyle}>
         <span style={labelStyle}>Last sync</span>
-        <span style={valueStyle} data-testid="about-last-sync">
-          {formatRelativeMicros(sync.last_pull_micros)}
-          {sync.last_tick_error !== ""
-            ? ` · ${sync.last_tick_error}`
-            : ""}
+        <span
+          style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}
+        >
+          <span style={valueStyle} data-testid="about-last-sync">
+            {formatRelativeMicros(sync.last_pull_micros)}
+            {sync.last_tick_error !== ""
+              ? ` · ${sync.last_tick_error}`
+              : ""}
+          </span>
+          <button
+            type="button"
+            data-testid="about-sync-now"
+            onClick={onSyncNow}
+            disabled={syncing}
+            style={syncing ? syncButtonBusyStyle : syncButtonStyle}
+            aria-label="Force sync now"
+          >
+            {syncing ? "syncing…" : "sync now"}
+          </button>
         </span>
       </div>
+      {syncError !== "" ? (
+        <div style={syncErrorStyle} data-testid="about-sync-error">
+          {syncError}
+        </div>
+      ) : null}
       <div style={flagsRowStyle} data-testid="about-flags">
         {FEATURE_LABELS.map(([key, label]): JSX.Element => {
           const enabled = info.features[key];
