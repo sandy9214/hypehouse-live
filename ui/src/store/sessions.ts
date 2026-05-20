@@ -167,10 +167,23 @@ export const fetchSessions = async (
  */
 export const useSessions = (client: JsonRpcWS): SessionsStoreState => {
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
-  useEffect((): void => {
+  useEffect((): (() => void) | void => {
     if (!snapshot.loaded && !snapshot.loading) {
       void fetchSessions(client);
     }
+    // Refresh on every WS reconnect — engine restart appends new
+    // sessions to the log; the cached `loaded` flag would otherwise
+    // hide them until page reload. Same `onOpen` + typeof-tolerance
+    // pattern as `useSessionInfo` (#207) / `useOutputDevices`
+    // (#210) / `useEffectsManifest` (#223).
+    const ow = (
+      client as { onOpen?: (cb: () => void) => () => void }
+    ).onOpen;
+    if (typeof ow !== "function") return;
+    const unsub = ow.call(client, (): void => {
+      void fetchSessions(client, { force: true });
+    });
+    return unsub;
   }, [client, snapshot.loaded, snapshot.loading]);
   return snapshot;
 };
