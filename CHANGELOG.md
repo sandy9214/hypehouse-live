@@ -259,6 +259,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test-ui` → `test-tauri` → `test-copilot` in sequence with
   fast-fail on first non-zero exit. Convenient pre-merge gate;
   can replace the four per-suite calls in CI (#229).
+- **UI: presets store refetches on WS reconnect** — module-level
+  `WeakSet<JsonRpcWS>` subscribes to `onOpen` once per client and
+  fires `refetchPresets`, so a reconnect that lands while the
+  Presets panel is hidden still syncs against the new socket (same
+  conditional-mount race Codex caught for sessions in #224 R1).
+  `fetchPresets` gains a `{ force }` option; cached state survives
+  panel remounts so there's no fetch-storm on toggle. Codex #231
+  R1 caught a follow-on P1 — a stale `presets.list` response could
+  overwrite an optimistic save/delete that landed mid-flight — so
+  R2 added a monotonic `cacheGeneration` counter that mutations
+  bump and fetches snapshot, dropping their result on mismatch
+  (#231).
 
 ## [0.1.0] — 2026-05-19
 
