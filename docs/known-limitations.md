@@ -22,13 +22,6 @@ Source-of-truth doc — replaces the now-closed GitHub issue #93.
   no feedback loops). Tracked in ADR-007.
 - **Ableton Link v0.2 shipped as a stub only** — real `rust-link`
   integration deferred pending LGPL sign-off (ADR-009).
-- **Sidechain compressor: schema + UI only, DSP deferred.** The
-  `SetSidechainEnabled` event and the sidechain settings panel
-  persist + render, but the audio path does NOT yet duck the
-  non-trigger deck. See `docs/api/ws-protocol.md` (the
-  `SetSidechainEnabled` row notes "currently schema-only") and
-  `ui/src/components/SidechainPanel.tsx`. Tracked as a DSP-wiring
-  follow-up PR.
 - **Output device selection is restart-only.** Picking a different
   sink from the dropdown persists the substring but does not
   hot-swap the live `cpal` stream — the UI shows "Restart engine to

@@ -5,10 +5,10 @@
 // engine state mirror; every input fires `submit_event` with the
 // matching event variant (SetSidechainEnabled or SetSidechainParams).
 //
-// The audio DSP that actually ducks the non-trigger deck is deferred
-// to a follow-up PR — for now this panel drives only the engine's
-// `state::SidechainConfig` mirror (so the wire surface + persistence
-// flow are testable end-to-end before any audio path lands).
+// The audio DSP that actually ducks the non-trigger deck is wired
+// in `engine/src/audio/mixer.rs` — the panel writes to the engine's
+// `state::SidechainConfig` mirror and the audio path picks the
+// changes up on the next render block.
 
 import type { CSSProperties, JSX } from "react";
 import type { JsonRpcWS } from "../ws/client";
