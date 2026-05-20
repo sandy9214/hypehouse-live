@@ -165,25 +165,37 @@ export const fetchSessions = async (
  * React hook returning the cached sessions snapshot. Pass a live
  * `JsonRpcWS`; on first mount it kicks off `engine.list_sessions`.
  */
+// Track clients we've already wired an onOpen subscriber for.
+// `WeakSet` so a client GC'd by the runtime doesn't pin its
+// subscription. Module-level (NOT hook-local) so the subscription
+// survives mount/unmount of the History panel — without this, a
+// reconnect that fires while the panel is hidden gets lost, and
+// the next mount sees `loaded=true` + skips the refetch (Codex
+// #224 R1 P1 finding).
+const sessionsClientsSubscribed: WeakSet<JsonRpcWS> = new WeakSet();
+
+const ensureSessionsOpenSubscribed = (client: JsonRpcWS): void => {
+  if (sessionsClientsSubscribed.has(client)) return;
+  const ow = (
+    client as { onOpen?: (cb: () => void) => () => void }
+  ).onOpen;
+  if (typeof ow !== "function") return;
+  sessionsClientsSubscribed.add(client);
+  ow.call(client, (): void => {
+    void fetchSessions(client, { force: true });
+  });
+};
+
 export const useSessions = (client: JsonRpcWS): SessionsStoreState => {
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
-  useEffect((): (() => void) | void => {
+  useEffect((): void => {
+    // Wire the persistent reconnect subscription once per client.
+    // Cheap idempotent — early-returns on the second call for the
+    // same client.
+    ensureSessionsOpenSubscribed(client);
     if (!snapshot.loaded && !snapshot.loading) {
       void fetchSessions(client);
     }
-    // Refresh on every WS reconnect — engine restart appends new
-    // sessions to the log; the cached `loaded` flag would otherwise
-    // hide them until page reload. Same `onOpen` + typeof-tolerance
-    // pattern as `useSessionInfo` (#207) / `useOutputDevices`
-    // (#210) / `useEffectsManifest` (#223).
-    const ow = (
-      client as { onOpen?: (cb: () => void) => () => void }
-    ).onOpen;
-    if (typeof ow !== "function") return;
-    const unsub = ow.call(client, (): void => {
-      void fetchSessions(client, { force: true });
-    });
-    return unsub;
   }, [client, snapshot.loaded, snapshot.loading]);
   return snapshot;
 };
