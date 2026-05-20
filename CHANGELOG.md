@@ -293,6 +293,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same cache-and-refetch-on-reconnect contract. Calls out the
   single-page pagination caveat: non-default-offset callers must
   pass `{ force: true }` to bypass the cache (#235).
+- **UI: setHotCues updates the cached library row** — closes #237.
+  Previously `setHotCues` returned the freshly-persisted track but
+  did not write `current.tracks`, so deck reloads after a hot-cue
+  edit silently regressed to the previous saved state until the
+  next list_tracks fetch. Fix splices the row in place on RPC
+  success; defensive no-op when the row isn't in the cache. Codex
+  R1 caught the equivalent stale-list race that #231 R1 caught for
+  presets: a `setHotCues` that lands while a `list_tracks` is
+  in-flight could be clobbered by the older response. R2 mirrored
+  the `cacheGeneration` counter pattern — `setHotCues` bumps,
+  `fetchLibrary` snapshots and discards on mismatch (#238).
 
 ## [0.1.0] — 2026-05-19
 
