@@ -1052,13 +1052,15 @@ set may be tightened to an enum once the audio thread lands.
 
 ### `engine.decode_error`
 
-Surfaces a decode-pipeline failure on a `DeckLoad` event. The Rust
-engine's `DecodeService::open` call may fail for several reasons (file
-not found, unsupported format, exhausted decode slots, …). Instead of
-silently dropping the load, the bridge fans out an `engine.decode_error`
-notification so connected UIs can render a transient toast and the
-operator immediately sees what went wrong. Deck state stays unchanged —
-this notification is a side channel, not a reducer event.
+Surfaces a decode-pipeline failure on a `DeckLoad` or
+`DeckLoadStems` event. The Rust engine's `DecodeService::open` /
+`DecodeService::open_stems` calls may fail for several reasons
+(file not found, unsupported format, exhausted decode slots, …).
+Instead of silently dropping the load, the bridge fans out an
+`engine.decode_error` notification so connected UIs can render a
+transient toast and the operator immediately sees what went wrong.
+Deck state stays unchanged — this notification is a side channel,
+not a reducer event.
 
 ```json
 {
@@ -1092,7 +1094,8 @@ Today's set, with the underlying `DecodeError` variant it maps from:
 failure and is meant for display + log capture, not for parsing.
 
 The first six rows are produced **synchronously** by the control
-thread when `DecodeService::open` returns `Err` on a `DeckLoad` event.
+thread when `DecodeService::open` (for `DeckLoad`) or
+`DecodeService::open_stems` (for `DeckLoadStems`) returns `Err`.
 
 The last two rows (`mid_stream_decode_failure` + `decoder_thread_panic`)
 are produced **asynchronously** by the decoder thread once it has

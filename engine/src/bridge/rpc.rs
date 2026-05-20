@@ -545,10 +545,24 @@ impl EngineHandle {
         });
     }
 
-    /// Publish a `decode_error` notification. Called by the control
-    /// thread when the translator's `DecodeService::open` errors on a
-    /// `DeckLoad` event. Non-blocking — drops silently if no clients are
-    /// currently subscribed (e.g. unit tests, paused UI).
+    /// Publish a `decode_error` notification. Called from two
+    /// distinct paths, both non-blocking — drops silently if no
+    /// clients are currently subscribed (unit tests, paused UI):
+    ///
+    /// 1. **Open-time** — control thread fans out
+    ///    `event_to_commands_with_errors` failures from
+    ///    `engine/src/main.rs` whenever the translator's
+    ///    `DecodeService::open` / `DecodeService::open_stems`
+    ///    errors on a `DeckLoad` or `DeckLoadStems` event (see
+    ///    `engine/src/audio/translator.rs`).
+    /// 2. **Mid-stream** — the decode-drain side channel in
+    ///    `engine/src/bridge/decode_drain.rs` calls this for
+    ///    mid-stream `DecodeFailure` (`mid_stream_decode_failure`
+    ///    category) or decoder thread panics
+    ///    (`decoder_thread_panic` category).
+    ///
+    /// UI surface: `ui/src/store/notifications.ts` buffers both
+    /// kinds in a single queue with timer-driven eviction.
     pub fn publish_decode_error(
         &self,
         deck: DeckId,
