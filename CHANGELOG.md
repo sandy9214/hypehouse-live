@@ -61,6 +61,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pending_push` from `tracks`; returns the new queued count.
   Calls `wake_now` so the freshly filled queue starts draining
   immediately (#179).
+- **`library.stems_status` RPC** — aggregate counts of tracks by
+  demucs stems-status (`ready` / `pending` / `failed` / `none`).
+  Single GROUP BY with `COALESCE(stems_status, 'none')`; unknown
+  enum values bucket to `none` defensively. New
+  `STEMS_STATUS_NONE` constant alongside the existing three so the
+  wire contract is referenced symbolically (#195).
 
 ### Added — UI (TypeScript)
 - **AboutPanel "Library" row** — shows `N tracks · M pending sync`
@@ -89,6 +95,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Library.tsx` post-filters via `usePendingPushIds`. Empty-state
   renders the specific "No tracks are pending cloud sync." message
   when the filter is on and the query is empty (#187).
+- **AboutPanel "Stems" row** — `useStemsStatus(client)` hook polls
+  `library.stems_status` every 15s; renders
+  `N ready · M pending · K failed` when any non-zero. Hidden in the
+  steady "nothing computed yet" state to keep the panel quiet
+  (#197).
 
 ### Added — Tooling / scripts
 - **`scripts/cloud_sync_status.py`** — stdlib-only ops-monitoring
