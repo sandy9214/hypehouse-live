@@ -8,7 +8,7 @@
 #   * node + npm (for the UI)
 #   * `cargo install tauri-cli@2` once per workstation for `dev-tauri` / `build-tauri`.
 
-.PHONY: help build-engine build-ui dev-tauri build-tauri test-engine test-tauri test-ui clean bake-in bake-in-tests supabase-print
+.PHONY: help build-engine build-ui dev-tauri build-tauri test-engine test-tauri test-ui clean bake-in bake-in-tests supabase-print cloud-sync-status
 
 # v0.2 bake-in defaults — 25-minute sanity run. Bump DURATION_MIN=240
 # for the four-hour soak the release checklist demands.
@@ -31,6 +31,7 @@ help:
 	@echo "  make bake-in DURATION_MIN=240   — full 4-hour soak"
 	@echo "  make bake-in-tests  — pytest the bake-in harness scripts only"
 	@echo "  make supabase-print — print cloud-sync schema migrations + setup steps"
+	@echo "  make cloud-sync-status — print library + pending-push counts (ops monitoring)"
 	@echo "  make clean          — clean cargo + node build artifacts"
 
 build-engine:
@@ -92,3 +93,12 @@ bake-in-tests:
 # SQL editor. See docs/cloud-sync.md for the full guide.
 supabase-print:
 	$(PYTHON) scripts/print_supabase_migrations.py
+
+# Print cloud-sync queue status for ops monitoring. Stdlib only;
+# opens the library DB read-only. Use `--json` for machine output,
+# or pass an explicit path:
+#   make cloud-sync-status DB=/path/to/library.db
+# Default DB path matches `copilot/main.py` (~/.hypehouse-live/library.db,
+# overridable via $HYPEHOUSE_LIBRARY_DB).
+cloud-sync-status:
+	$(PYTHON) scripts/cloud_sync_status.py $(if $(DB),"$(DB)")
