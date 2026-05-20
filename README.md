@@ -38,7 +38,7 @@ Closest peer: **Mixxx** (open-source DJ software). Differentiator: AI co-pilot w
 
 ## Status
 
-- **Software-only positioning** (2026-05-18) — pivoted away from "drive your CDJ from a laptop" market. Target = Mixxx audience + AI auto-mix workflow. See [issue #93](https://github.com/sandy9214/hypehouse-live/issues/93) for v0.x caveats.
+- **Software-only positioning** (2026-05-18) — pivoted away from "drive your CDJ from a laptop" market. Target = Mixxx audience + AI auto-mix workflow. See [docs/known-limitations.md](docs/known-limitations.md) for v0.x caveats.
 - v0.1 in development. v0.2 beta: 1-2 weeks (synthetic audio bake-in + Tauri unsigned binaries).
 - v1.0 target: 3-4 months (streaming source + cloud library + marketing).
 - v1 (mixtape compiler) remains live at github.com/sandy9214/HypeHouse — use that for batch render.
