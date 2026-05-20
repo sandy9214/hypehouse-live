@@ -86,6 +86,20 @@ export const __resetSessionInfo = (): void => {
   notify();
 };
 
+/**
+ * Force a re-fetch even if the cache is warm. Used by the WS
+ * reconnect path (`client.onOpen(...)`) so the AboutPanel
+ * feature-flag chips reflect the engine's *current* env (not what
+ * it was at the start of this UI session). Engine restarts mid-UI
+ * session are the main case.
+ */
+export const refetchSessionInfo = async (
+  client: JsonRpcWS,
+): Promise<SessionInfo> => {
+  fetchedOnce = false;
+  return fetchSessionInfo(client);
+};
+
 export const fetchSessionInfo = async (
   client: JsonRpcWS,
 ): Promise<SessionInfo> => {
@@ -112,6 +126,19 @@ export const useSessionInfo = (client: JsonRpcWS): SessionInfo => {
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   useEffect(() => {
     void fetchSessionInfo(client);
+    // Subscribe to WS open events so an engine restart mid-session
+    // refreshes the feature-flag chips + version + audio sink.
+    // Older clients that don't expose `onOpen` (e.g. mocked
+    // JsonRpcWS in tests that haven't been updated) are tolerated
+    // via getattr-style typeof check — symmetric with the daemon
+    // `wake_now` fallback pattern.
+    const ow = (client as { onOpen?: (cb: () => void) => () => void })
+      .onOpen;
+    if (typeof ow !== "function") return;
+    const unsub = ow.call(client, (): void => {
+      void refetchSessionInfo(client);
+    });
+    return unsub;
   }, [client]);
   return snapshot;
 };
