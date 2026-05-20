@@ -280,3 +280,137 @@ def test_daemon_swallows_sync_error_specifically(
     assert not error_msgs, (
         f"SyncError should NOT escalate to ERROR; saw: {error_msgs}"
     )
+
+
+# ----- exponential backoff ---------------------------------------
+
+
+def test_next_wait_returns_base_tick_without_failures(tmp_path: Path) -> None:
+    daemon = SyncDaemon(
+        InMemorySyncClient(), tmp_path / "lib.db", tick_seconds=60.0
+    )
+    assert daemon.next_wait_seconds() == 60.0
+
+
+def test_next_wait_doubles_each_consecutive_failure(tmp_path: Path) -> None:
+    daemon = SyncDaemon(
+        InMemorySyncClient(), tmp_path / "lib.db", tick_seconds=30.0
+    )
+    daemon._consecutive_failures = 1  # noqa: SLF001
+    assert daemon.next_wait_seconds() == 60.0
+    daemon._consecutive_failures = 2  # noqa: SLF001
+    assert daemon.next_wait_seconds() == 120.0
+    daemon._consecutive_failures = 3  # noqa: SLF001
+    assert daemon.next_wait_seconds() == 240.0
+
+
+def test_next_wait_caps_at_max_backoff(tmp_path: Path) -> None:
+    from copilot.cloud_sync.daemon import MAX_BACKOFF_SECONDS
+
+    daemon = SyncDaemon(
+        InMemorySyncClient(), tmp_path / "lib.db", tick_seconds=60.0
+    )
+    daemon._consecutive_failures = 5  # noqa: SLF001
+    # 60 * 2**5 = 1920s > 600s cap → clamped to 600s
+    assert daemon.next_wait_seconds() == MAX_BACKOFF_SECONDS
+    daemon._consecutive_failures = 100  # noqa: SLF001
+    # Far-out failure counts must still be clamped, not overflow.
+    assert daemon.next_wait_seconds() == MAX_BACKOFF_SECONDS
+
+
+def test_tick_once_resets_consecutive_failures_on_success(
+    tmp_path: Path,
+) -> None:
+    daemon = SyncDaemon(
+        InMemorySyncClient(), tmp_path / "lib.db", tick_seconds=60.0
+    )
+    daemon._consecutive_failures = 3  # noqa: SLF001
+    daemon.tick_once()
+    assert daemon._consecutive_failures == 0  # noqa: SLF001
+
+
+def test_consecutive_failures_mutation_is_lock_protected(
+    tmp_path: Path,
+) -> None:
+    """Two threads incrementing _consecutive_failures via tick_once
+    must never lose an increment to a torn read-modify-write.
+    `sync_now` (via the RPC handler thread) + the daemon `_loop`
+    (its own thread) exercise this in production.
+    """
+    import threading
+
+    class FlakyPullClient:
+        """Same shape as the test below — every tick records a
+        transport_error so the counter bumps."""
+
+        def list_tracks(self, *, since_micros=0):  # noqa: ARG002
+            from copilot.cloud_sync.client import SyncError
+
+            raise SyncError("HTTP 503")
+
+        def get_track(self, _id):
+            return None
+
+        def upsert_track(self, _t):
+            return None
+
+        def delete_track(self, _id):
+            return False
+
+    daemon = SyncDaemon(
+        FlakyPullClient(), tmp_path / "lib.db", tick_seconds=60.0
+    )
+    N_PER_THREAD = 50
+    barrier = threading.Barrier(2)
+
+    def worker() -> None:
+        barrier.wait()
+        for _ in range(N_PER_THREAD):
+            daemon.tick_once()
+
+    t1 = threading.Thread(target=worker)
+    t2 = threading.Thread(target=worker)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10.0)
+    t2.join(timeout=10.0)
+    # 100 ticks all errored → counter must be exactly 100. Without
+    # locking the read-modify-write, lost updates would land here as
+    # a value < 100.
+    assert daemon._consecutive_failures == 2 * N_PER_THREAD  # noqa: SLF001
+
+
+def test_tick_once_bumps_failures_on_transport_error(
+    tmp_path: Path,
+) -> None:
+    """When pull or push records a `transport_error`, the daemon
+    records the failure so the next sleep backs off."""
+
+    class FlakyPullClient:
+        """Returns a transport-error via the public list_tracks
+        exception path that bootstrap_pull catches → PullResult
+        with transport_error set."""
+
+        def list_tracks(self, *, since_micros=0):  # noqa: ARG002
+            from copilot.cloud_sync.client import SyncError
+
+            raise SyncError("HTTP 503")
+
+        def get_track(self, _id):
+            return None
+
+        def upsert_track(self, _t):
+            return None
+
+        def delete_track(self, _id):
+            return False
+
+    daemon = SyncDaemon(
+        FlakyPullClient(), tmp_path / "lib.db", tick_seconds=60.0
+    )
+    daemon.tick_once()
+    assert daemon._consecutive_failures == 1  # noqa: SLF001
+    daemon.tick_once()
+    assert daemon._consecutive_failures == 2  # noqa: SLF001
+    # Backoff schedule reflects the count.
+    assert daemon.next_wait_seconds() == 240.0  # 60 * 4

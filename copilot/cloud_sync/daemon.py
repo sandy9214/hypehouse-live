@@ -52,6 +52,13 @@ class SyncStats:
 
 DEFAULT_TICK_SECONDS = 60.0
 
+# Cap the exponential backoff at 10 minutes. After ~6 consecutive
+# failures (60s * 2^5 = 32min uncapped) we'd be sleeping longer than
+# the operator's attention span; 10min is a reasonable ceiling that
+# still gives the cloud time to recover but keeps a steady heartbeat
+# of "are you alive yet" probes.
+MAX_BACKOFF_SECONDS = 600.0
+
 
 class SyncDaemon:
     """Background pull-push loop. Stop with `.stop()`."""
@@ -72,6 +79,14 @@ class SyncDaemon:
         self._thread: Optional[threading.Thread] = None
         self._stats_lock = threading.Lock()
         self._stats = SyncStats()
+        # Exponential-backoff state. Bumped on any tick that records a
+        # transport-error in pull or push; reset to zero on the first
+        # clean tick. Reads/writes are protected by `_stats_lock`
+        # because `library.sync_now` (#161) calls `tick_once` from the
+        # RPC handler thread, while the daemon loop calls it from its
+        # own thread — without the lock a concurrent
+        # increment+reset can lose either signal.
+        self._consecutive_failures = 0
 
     @classmethod
     def from_env(
@@ -129,6 +144,30 @@ class SyncDaemon:
             thread.join(timeout=join_timeout_s)
         self._thread = None
 
+    def next_wait_seconds(self) -> float:
+        """Sleep length before the next scheduled tick.
+
+        Without any failure state, this is the configured tick.
+        On consecutive transport errors the daemon backs off
+        exponentially (`tick * 2 ** failures`) capped at
+        `MAX_BACKOFF_SECONDS` (10 minutes).
+
+        Public method (rather than a private `_next_wait`) so tests
+        can assert the schedule directly without monkey-patching.
+        Reads `_consecutive_failures` under `_stats_lock` since the
+        counter is mutated from both the daemon thread and the RPC
+        handler thread (via `sync_now` → `tick_once`).
+        """
+        with self._stats_lock:
+            failures = self._consecutive_failures
+        if failures <= 0:
+            return self._tick
+        # Clamp the exponent to avoid integer overflow at very high
+        # failure counts (Python ints are arbitrary precision but
+        # 2**100 * 60 is still nonsense).
+        exponent = min(failures, 16)
+        return min(self._tick * (2 ** exponent), MAX_BACKOFF_SECONDS)
+
     def tick_once(self) -> None:
         """Run a single pull + push cycle (test seam).
 
@@ -136,6 +175,10 @@ class SyncDaemon:
         "last synced X ago" without polling the cloud directly. The
         record happens under `_stats_lock` so an RPC reader thread
         sees a consistent snapshot.
+
+        Side effect: bumps `_consecutive_failures` if pull or push
+        reports a transport error; resets to 0 on a clean tick. Used
+        by `_loop` to compute the next sleep interval.
         """
         # Lazy-import to avoid pulling library.py into this module's
         # cold-start path when the daemon isn't used (e.g. local-only
@@ -151,6 +194,11 @@ class SyncDaemon:
                 self._client, library, logger=self._log
             )
             now_us = int(time.time() * 1_000_000)
+            tick_error = (
+                pull_result.transport_error
+                or push_result.transport_error
+                or ""
+            )
             with self._stats_lock:
                 self._stats = SyncStats(
                     last_pull_micros=now_us,
@@ -159,12 +207,12 @@ class SyncDaemon:
                     last_pull_applied=pull_result.applied_count
                     + pull_result.inserted_count,
                     last_push_pushed=push_result.pushed_count,
-                    last_tick_error=(
-                        pull_result.transport_error
-                        or push_result.transport_error
-                        or ""
-                    ),
+                    last_tick_error=tick_error,
                 )
+                if tick_error == "":
+                    self._consecutive_failures = 0
+                else:
+                    self._consecutive_failures += 1
         finally:
             library.close()
 
@@ -179,35 +227,54 @@ class SyncDaemon:
     def _loop(self) -> None:
         # Wait one tick BEFORE the first sync so we don't double up
         # with the bootstrap pull/push that already ran at startup.
-        while not self._stop.wait(self._tick):
+        while not self._stop.wait(self.next_wait_seconds()):
             try:
                 self.tick_once()
             except SyncError as exc:
                 # Transport-level failures are expected — flaky cloud
-                # is the whole reason this is async + retried.
+                # is the whole reason this is async + retried. Counts
+                # toward the exponential backoff so a sustained outage
+                # doesn't trigger a steady stream of useless retries.
                 self._log.warning(
                     "cloud sync: transport error during tick: %s", exc
                 )
+                with self._stats_lock:
+                    self._consecutive_failures += 1
             except sqlite3.Error as exc:
                 # Local-DB hiccup (lock contention with the main
                 # thread's writes, busy timeout, etc.). Recoverable —
-                # next tick re-opens the connection.
+                # next tick re-opens the connection. We back off too
+                # because a persistent lock contender (e.g. a long
+                # `add_tracks_from_directory` import) won't clear in
+                # 60s anyway.
                 self._log.warning(
                     "cloud sync: local DB error during tick: %s", exc
                 )
+                with self._stats_lock:
+                    self._consecutive_failures += 1
             except Exception as exc:  # noqa: BLE001
                 # Anything else is unexpected — log at ERROR so an
                 # operator tailing the log sees it. We still don't
                 # re-raise; killing the daemon thread would silently
                 # disable cloud sync for the rest of the process.
+                # Backs off too — an unexpected error every 60s is
+                # better surfaced as "every 10 minutes" with a
+                # noticeable gap than a steady spam.
                 self._log.error(
                     "cloud sync: unexpected daemon tick error: %s",
                     exc,
                     exc_info=exc,
                 )
+                with self._stats_lock:
+                    self._consecutive_failures += 1
             # Light sleep avoids a tight error-loop on a misbehaving
             # client; the `Event.wait` above is the main pacing wait.
             time.sleep(0)
 
 
-__all__ = ["DEFAULT_TICK_SECONDS", "SyncDaemon", "SyncStats"]
+__all__ = [
+    "DEFAULT_TICK_SECONDS",
+    "MAX_BACKOFF_SECONDS",
+    "SyncDaemon",
+    "SyncStats",
+]
