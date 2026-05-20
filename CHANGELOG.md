@@ -150,6 +150,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `library.sync_now`, `library.list_pending_push`,
   `library.requeue_all_pending`) plus the stems-status aggregate
   (`library.stems_status`) (#200).
+- Refreshed `docs/cloud-sync.md` + `docs/known-limitations.md`:
+  added `requeue_all_pending` to the "What ships" RPC list,
+  surfaced the AboutPanel "queue all" + "Pending sync" filter +
+  countdown affordances in "Verifying the wire-up", added an "Ops
+  monitoring" section pointing at `make cloud-sync-status`, and
+  dropped the "(future)" qualifier from the pre-v10 enqueue
+  workaround now that `library.requeue_all_pending` shipped
+  (#202).
+- New **`docs/adr/ADR-010-cloud-library-sync.md`** — formal
+  architecture decision record covering storage choice (Supabase
+  + LWW schema), transport (PostgREST + stdlib urllib), conflict
+  resolution (LWW on `updated_at_micros` + accepted lost-edit
+  trade-off), outbound queue rationale, daemon contract
+  (`wake_now` overwrite semantics, `_loop` owns
+  `next_sync_micros`), alternatives considered (`supabase-py` SDK
+  / direct `psycopg` / CRDT / LISTEN/NOTIFY), and consequences
+  positive + negative (#203).
 
 ## [0.1.0] — 2026-05-19
 
