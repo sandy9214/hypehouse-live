@@ -3,6 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup,
+  fireEvent,
   render,
   screen,
   waitFor,
@@ -196,6 +197,100 @@ describe("AboutPanel", () => {
     render(<AboutPanel client={makeClient()} />);
     const text = screen.getByTestId("about-last-sync").textContent ?? "";
     expect(text.includes("supabase: HTTP 503")).toBe(true);
+  });
+
+  it("renders 'sync now' button by default and fires sync_now RPC on click", async () => {
+    const call = vi.fn(async (method: string) => {
+      if (method === "engine.session_info") {
+        return {
+          version: "0.1.0",
+          output_device_substring: "",
+          features: {
+            midi_clock_in: false,
+            midi_clock_out: false,
+            ableton_link: false,
+            sentry_telemetry: false,
+            recording_enabled: true,
+            rate_limit_disabled: false,
+            shared_ci_runner: false,
+          },
+        };
+      }
+      if (method === "library.sync_now") {
+        return {
+          pending_push_count: 0,
+          library_track_count: 7,
+          last_pull_micros: Date.now() * 1000,
+          last_push_micros: Date.now() * 1000,
+          last_pull_fetched: 1,
+          last_pull_applied: 1,
+          last_push_pushed: 0,
+          last_tick_error: "",
+        };
+      }
+      return {
+        pending_push_count: 0,
+        library_track_count: 0,
+        last_pull_micros: 0,
+        last_push_micros: 0,
+        last_pull_fetched: 0,
+        last_pull_applied: 0,
+        last_push_pushed: 0,
+        last_tick_error: "",
+      };
+    });
+    render(<AboutPanel client={makeClient(call)} />);
+    const btn = screen.getByTestId("about-sync-now");
+    expect(btn.textContent).toBe("sync now");
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(call).toHaveBeenCalledWith("library.sync_now");
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("about-library-count").textContent).toBe(
+        "7 tracks",
+      );
+    });
+  });
+
+  it("surfaces sync_now errors inline", async () => {
+    const call = vi.fn(async (method: string) => {
+      if (method === "engine.session_info") {
+        return {
+          version: "0.1.0",
+          output_device_substring: "",
+          features: {
+            midi_clock_in: false,
+            midi_clock_out: false,
+            ableton_link: false,
+            sentry_telemetry: false,
+            recording_enabled: true,
+            rate_limit_disabled: false,
+            shared_ci_runner: false,
+          },
+        };
+      }
+      if (method === "library.sync_now") {
+        throw new Error("cloud sync not configured");
+      }
+      return {
+        pending_push_count: 0,
+        library_track_count: 0,
+        last_pull_micros: 0,
+        last_push_micros: 0,
+        last_pull_fetched: 0,
+        last_pull_applied: 0,
+        last_push_pushed: 0,
+        last_tick_error: "",
+      };
+    });
+    render(<AboutPanel client={makeClient(call)} />);
+    fireEvent.click(screen.getByTestId("about-sync-now"));
+    await waitFor(() => {
+      expect(screen.getByTestId("about-sync-error").textContent).toBe(
+        "cloud sync not configured",
+      );
+    });
   });
 
   it("renders all 7 feature flags", () => {

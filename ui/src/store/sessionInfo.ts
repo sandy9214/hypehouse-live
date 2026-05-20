@@ -216,6 +216,20 @@ export const fetchSyncStatus = async (
 };
 
 /**
+ * Operator-driven force sync. Fires the `library.sync_now` RPC,
+ * folds the post-tick status into the store, and bubbles up the
+ * resolved status so the caller can show a toast. Errors (e.g.
+ * cloud-sync not configured) propagate; the store keeps the prior
+ * snapshot in that case so the badge doesn't flicker to "never".
+ */
+export const syncNow = async (client: JsonRpcWS): Promise<SyncStatus> => {
+  const result = await client.call<unknown>("library.sync_now");
+  const next = normaliseSyncStatus(result);
+  __setSyncStatus(next);
+  return next;
+};
+
+/**
  * Format a wall-clock micros timestamp as a relative "X ago" string.
  * `0` → "never". Otherwise "Xs ago" / "Xm ago" / "Xh ago" / "Xd ago"
  * depending on the magnitude — same convention as GitHub timestamps.

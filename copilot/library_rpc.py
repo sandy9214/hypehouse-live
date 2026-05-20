@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import sqlite3
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -206,6 +207,7 @@ class LibraryRpcHandler:
         "compute_stems",
         "get_stems",
         "sync_status",
+        "sync_now",
     )
     # ``key_match.compute_offset`` lives in a sibling namespace but
     # needs read access to the same library, so we dispatch it through
@@ -302,6 +304,8 @@ class LibraryRpcHandler:
             return self._get_stems(params)
         if method == "library.sync_status":
             return self._sync_status(params)
+        if method == "library.sync_now":
+            return self._sync_now(params)
         if method == "key_match.compute_offset":
             return self._key_match_compute_offset(params)
         if method == "streaming.search":
@@ -311,6 +315,48 @@ class LibraryRpcHandler:
         raise RpcError(-32601, f"method not found: {method}")
 
     # --- handlers -----------------------------------------------------
+
+    def _sync_now(self, _params: dict[str, Any]) -> dict[str, Any]:
+        """Fire a single out-of-band sync tick and return fresh status.
+
+        Used by the AboutPanel "Sync now" button so an operator can
+        force a pull/push without waiting for the daemon's next
+        scheduled tick. The daemon's `tick_once` is the same method
+        the loop calls — same locking, same stats-update path. We
+        catch the same exception classes the daemon loop swallows so
+        that a transient cloud failure surfaces as a useful RPC error
+        instead of crashing the WS handler.
+
+        Returns the post-tick `sync_status` payload (same shape as
+        `library.sync_status`) so the UI can update without a second
+        round trip.
+
+        Raises ``-32000`` when the daemon isn't wired (local-only
+        mode); the UI hides the button in that case but the explicit
+        error is the right contract for any other caller.
+        """
+        if self._sync_daemon is None:
+            raise RpcError(
+                JSONRPC_FEATURE_NOT_INSTALLED,
+                "cloud sync not configured",
+            )
+        # Lazy-imports to avoid pulling cloud_sync into the cold-start
+        # path of test fixtures that don't exercise sync.
+        from .cloud_sync.client import SyncError as _SyncError
+
+        try:
+            self._sync_daemon.tick_once()  # type: ignore[attr-defined]
+        except _SyncError as exc:
+            raise RpcError(
+                JSONRPC_INTERNAL_ERROR,
+                f"cloud sync transport error: {exc}",
+            ) from exc
+        except sqlite3.Error as exc:
+            raise RpcError(
+                JSONRPC_INTERNAL_ERROR,
+                f"cloud sync local DB error: {exc}",
+            ) from exc
+        return self._sync_status(_params)
 
     def _sync_status(self, _params: dict[str, Any]) -> dict[str, Any]:
         """Cloud library sync status snapshot (#102 follow-up).

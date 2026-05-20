@@ -590,3 +590,93 @@ def test_handler_handles_sync_status(library: TrackLibrary):
     assert handler.handles("library.sync_status") is True
 
 
+# ---- sync_now (operator-driven force tick) ----------------------------
+
+
+def test_handler_handles_sync_now(library: TrackLibrary):
+    handler = LibraryRpcHandler(library)
+    assert handler.handles("library.sync_now") is True
+
+
+@_asyncio
+async def test_sync_now_without_daemon_raises(library: TrackLibrary):
+    handler = LibraryRpcHandler(library)
+    with pytest.raises(RpcError) as ei:
+        await handler.dispatch("library.sync_now", {})
+    # ``-32000`` (feature-not-installed) matches every other "cloud
+    # feature isn't wired" arm of this handler, so the UI can render
+    # the same toast for all of them.
+    assert ei.value.code == -32000
+
+
+@_asyncio
+async def test_sync_now_calls_daemon_tick_once_and_returns_status(
+    library: TrackLibrary,
+):
+    from copilot.cloud_sync import SyncStats
+
+    class StubDaemon:
+        def __init__(self) -> None:
+            self.tick_calls = 0
+            self._stats = SyncStats()
+
+        def tick_once(self) -> None:
+            self.tick_calls += 1
+            # Mutate stats so the post-tick status reflects the tick.
+            self._stats = SyncStats(
+                last_pull_micros=1_700_000_000_000_000,
+                last_push_micros=1_700_000_000_000_000,
+                last_pull_fetched=4,
+                last_pull_applied=4,
+                last_push_pushed=2,
+                last_tick_error="",
+            )
+
+        def stats(self) -> SyncStats:
+            return self._stats
+
+    daemon = StubDaemon()
+    handler = LibraryRpcHandler(library, sync_daemon=daemon)
+    result = await handler.dispatch("library.sync_now", {})
+    assert daemon.tick_calls == 1
+    assert result["last_pull_micros"] == 1_700_000_000_000_000
+    assert result["last_pull_fetched"] == 4
+    assert result["last_push_pushed"] == 2
+    assert result["last_tick_error"] == ""
+
+
+@_asyncio
+async def test_sync_now_wraps_transport_error_as_rpc_error(
+    library: TrackLibrary,
+):
+    from copilot.cloud_sync.client import SyncError
+
+    class FlakyDaemon:
+        def tick_once(self) -> None:
+            raise SyncError("HTTP 503")
+
+    handler = LibraryRpcHandler(library, sync_daemon=FlakyDaemon())
+    with pytest.raises(RpcError) as ei:
+        await handler.dispatch("library.sync_now", {})
+    # Internal error — the surface is "we tried, the cloud said no".
+    assert ei.value.code == -32603
+    assert "HTTP 503" in str(ei.value)
+
+
+@_asyncio
+async def test_sync_now_wraps_sqlite_error_as_rpc_error(
+    library: TrackLibrary,
+):
+    import sqlite3 as _sqlite3
+
+    class LockedDaemon:
+        def tick_once(self) -> None:
+            raise _sqlite3.OperationalError("database is locked")
+
+    handler = LibraryRpcHandler(library, sync_daemon=LockedDaemon())
+    with pytest.raises(RpcError) as ei:
+        await handler.dispatch("library.sync_now", {})
+    assert ei.value.code == -32603
+    assert "database is locked" in str(ei.value)
+
+
