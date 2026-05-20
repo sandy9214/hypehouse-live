@@ -217,6 +217,44 @@ describe("JsonRpcWS", () => {
     c.close();
   });
 
+  it("reconnectNow() short-circuits backoff and opens immediately", () => {
+    const factory = makeFactory();
+    const c = new JsonRpcWS({
+      url: "ws://test/ws",
+      factory,
+      initialBackoffMs: 30_000,
+    });
+    c.connect();
+    MockWS.instances[0]!.open();
+    MockWS.instances[0]!.close();
+    expect(MockWS.instances.length).toBe(1);
+    c.reconnectNow();
+    expect(MockWS.instances.length).toBe(2);
+    c.close();
+  });
+
+  it("reconnectNow() resets backoff state for next failure cycle", () => {
+    const factory = makeFactory();
+    const c = new JsonRpcWS({
+      url: "ws://test/ws",
+      factory,
+      initialBackoffMs: 100,
+      maxBackoffMs: 30_000,
+    });
+    c.connect();
+    MockWS.instances[0]!.open();
+    MockWS.instances[0]!.close();
+    vi.advanceTimersByTime(100);
+    c.reconnectNow();
+    MockWS.instances[MockWS.instances.length - 1]!.open();
+    MockWS.instances[MockWS.instances.length - 1]!.close();
+    vi.advanceTimersByTime(99);
+    const before = MockWS.instances.length;
+    vi.advanceTimersByTime(2);
+    expect(MockWS.instances.length).toBe(before + 1);
+    c.close();
+  });
+
   it("onClose subscribers fire on server-side drop AND on user close", () => {
     const factory = makeFactory();
     const c = new JsonRpcWS({

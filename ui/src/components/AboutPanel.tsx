@@ -217,6 +217,7 @@ export const AboutPanel = ({ client }: AboutPanelProps): JSX.Element => {
             v{versionLabel}
           </span>
           {conn === "closed" ? (
+            <>
             <span
               data-testid="about-engine-offline"
               title="WebSocket disconnected — reconnecting…"
@@ -232,7 +233,33 @@ export const AboutPanel = ({ client }: AboutPanelProps): JSX.Element => {
             >
               offline
             </span>
-          ) : null}
+            <button
+              type="button"
+              data-testid="about-reconnect-now"
+              onClick={(): void => {
+                const rc = (
+                  client as { reconnectNow?: () => void }
+                ).reconnectNow;
+                if (typeof rc === "function") rc.call(client);
+              }}
+              aria-label="Reconnect now"
+              title="Short-circuit the reconnect backoff and try immediately"
+              style={{
+                background: "#1a2a3a",
+                color: "#9cd0e0",
+                border: "1px solid #2a3f55",
+                borderRadius: 3,
+                padding: "0 6px",
+                fontSize: "0.7rem",
+                cursor: "pointer",
+                fontFamily: "inherit",
+                marginLeft: "0.3rem",
+              }}
+            >
+              reconnect
+            </button>
+          </>
+        ) : null}
         </span>
       </div>
       <div style={rowStyle}>

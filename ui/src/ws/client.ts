@@ -230,6 +230,23 @@ export class JsonRpcWS {
     return this.socket?.readyState === READY_OPEN;
   }
 
+  /**
+   * Short-circuit the reconnect backoff and try to open the socket
+   * immediately. Used by the AboutPanel offline-chip's "Reconnect"
+   * button. If a pending reconnect timer is armed, it's cleared
+   * first so we don't open twice when the timer fires. Backoff
+   * state is reset so the next failure starts at the initial
+   * cadence (matches the post-clean-tick reset in the sync daemon).
+   */
+  public reconnectNow(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.backoffMs = this.initialBackoffMs;
+    this.connect();
+  }
+
   private allocId(): JsonRpcId {
     const id = this.nextId;
     this.nextId += 1;
