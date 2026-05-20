@@ -1045,6 +1045,117 @@ covers BOTH tracks whose `tracks.stems_status` is NULL and tracks
 whose status is an unknown future enum value (defensive bucket —
 unknown values never silently disappear).
 
+### `presets.list` (co-pilot)
+
+List every saved scene preset. Lightweight projection — returns
+`id` + `name` + `created_at` only; the full deck blob is fetched
+on demand via `presets.load`.
+
+**Params**: none (`{}`).
+
+**Result**:
+
+```json
+{
+  "presets": [
+    { "id": 1, "name": "warm-up", "created_at": "2026-05-17T22:00:00Z" },
+    { "id": 2, "name": "peak",    "created_at": "2026-05-17T22:14:00Z" }
+  ]
+}
+```
+
+**Client caching**: the preset set is session-static under a single
+WS lifetime but can drift across reconnects (a second window
+saved / deleted / renamed; cloud sync landed). Clients SHOULD
+cache for the WebSocket lifetime but MUST re-fetch on every
+reconnect. The in-repo TS client wires this via
+`JsonRpcWS.onOpen(cb)` + `refetchPresets(client)` — see
+`ui/src/store/presets.ts`. Mutations (`presets.save`,
+`presets.delete`) bump a generation counter so a stale list
+response that arrives mid-flight is dropped instead of clobbering
+optimistic updates (Codex #231 R1).
+
+### `presets.save` (co-pilot)
+
+Persist a new scene preset. The `name` column has a UNIQUE
+constraint — saving with an existing name fails fast.
+
+**Params**:
+
+```json
+{
+  "name": "warm-up",
+  "deck_a": { /* PresetDeckState — see below */ },
+  "deck_b": { /* PresetDeckState */ },
+  "crossfader_curve": "Linear"
+}
+```
+
+* `crossfader_curve` is one of `"Linear"`, `"Dipped"`, `"Sharp"`,
+  `"Scratch"` (matches `engine::state::CrossfaderCurve`).
+
+`PresetDeckState` wire shape:
+
+```json
+{
+  "effects": [
+    { "effect_id": 1, "params": { "cutoff_hz": 8000 }, "wet_dry": 0.4, "enabled": true }
+  ],
+  "eq_low_db": 0.0,
+  "eq_mid_db": 0.0,
+  "eq_high_db": 0.0,
+  "pitch_semitones": 0.0,
+  "tempo_ratio": 1.0
+}
+```
+
+**Result**:
+
+```json
+{
+  "preset_id": 1,
+  "preset": {
+    "id": 1,
+    "name": "warm-up",
+    "created_at": "2026-05-17T22:00:00Z",
+    "deck_a": { /* ... */ },
+    "deck_b": { /* ... */ },
+    "crossfader_curve": "Linear"
+  }
+}
+```
+
+**Errors**:
+
+| Code     | Reason                                                              |
+|----------|---------------------------------------------------------------------|
+| `-32602` | `name` missing / wrong type; `deck_a` or `deck_b` not an object.    |
+| `-32602` | `crossfader_curve` not in the allowed enum.                         |
+| `-32602` | `name` duplicates an existing preset (UNIQUE constraint).           |
+| `-32603` | Underlying SQL / store failure.                                     |
+
+### `presets.load` (co-pilot)
+
+Fetch one preset's full body by id.
+
+**Params**: `{ "id": <positive int> }`.
+
+**Result**: `{ "preset": <same shape as in presets.save's result> }`.
+
+**Errors**: `-32602` on missing / non-positive id or not-found id.
+
+### `presets.delete` (co-pilot)
+
+Delete a preset by id. Idempotent — deleting a missing id returns
+`deleted: false` rather than erroring (operator-friendly).
+
+**Params**: `{ "id": <positive int> }`.
+
+**Result**: `{ "ok": true, "deleted": <bool> }`.
+
+**Errors**: `-32602` on missing / non-positive id; `-32603` on
+store failure.
+
 ## Server-pushed notifications
 
 Notifications have no `id` and expect no response.
