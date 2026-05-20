@@ -293,6 +293,72 @@ describe("AboutPanel", () => {
     });
   });
 
+  it("hides sync counts row when all tick counters are zero", () => {
+    __setSyncStatus({
+      library_track_count: 5,
+      pending_push_count: 0,
+      last_pull_micros: Date.now() * 1000,
+      last_push_micros: 0,
+      last_pull_fetched: 0,
+      last_pull_applied: 0,
+      last_push_pushed: 0,
+      last_tick_error: "",
+    });
+    render(<AboutPanel client={makeClient()} />);
+    expect(screen.queryByTestId("about-sync-counts")).toBeNull();
+  });
+
+  it("shows fetched-only count when applied=0 and pushed=0", () => {
+    __setSyncStatus({
+      library_track_count: 5,
+      pending_push_count: 0,
+      last_pull_micros: Date.now() * 1000,
+      last_push_micros: 0,
+      last_pull_fetched: 3,
+      last_pull_applied: 0,
+      last_push_pushed: 0,
+      last_tick_error: "",
+    });
+    render(<AboutPanel client={makeClient()} />);
+    expect(screen.getByTestId("about-sync-counts").textContent).toBe(
+      "↓ 3 fetched",
+    );
+  });
+
+  it("shows fetched + applied + pushed when all non-zero", () => {
+    __setSyncStatus({
+      library_track_count: 5,
+      pending_push_count: 0,
+      last_pull_micros: Date.now() * 1000,
+      last_push_micros: Date.now() * 1000,
+      last_pull_fetched: 7,
+      last_pull_applied: 5,
+      last_push_pushed: 2,
+      last_tick_error: "",
+    });
+    render(<AboutPanel client={makeClient()} />);
+    expect(screen.getByTestId("about-sync-counts").textContent).toBe(
+      "↓ 7 fetched · 5 applied · ↑ 2 pushed",
+    );
+  });
+
+  it("shows push-only when pushed>0 and pull counts=0", () => {
+    __setSyncStatus({
+      library_track_count: 5,
+      pending_push_count: 0,
+      last_pull_micros: 0,
+      last_push_micros: Date.now() * 1000,
+      last_pull_fetched: 0,
+      last_pull_applied: 0,
+      last_push_pushed: 4,
+      last_tick_error: "",
+    });
+    render(<AboutPanel client={makeClient()} />);
+    expect(screen.getByTestId("about-sync-counts").textContent).toBe(
+      "↓ 0 fetched · ↑ 4 pushed",
+    );
+  });
+
   it("renders all 7 feature flags", () => {
     __setSessionInfo({
       version: "0.1.0",
