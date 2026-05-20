@@ -116,6 +116,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now sees the new device in the dropdown without a page reload.
   New `outputDevices.test.ts` covers cache / refetch /
   failed-refetch-clears-stale (3 cases). #210.
+- **WS connection-state "offline" badge in AboutPanel** — new
+  `JsonRpcWS.onClose(cb)` + `isOpen()` public methods, new
+  `ui/src/store/connection.ts` + `useConnection(client)` hook.
+  AboutPanel renders an inline `offline` chip on the Engine row
+  whenever the WS connection drops; auto-hides when reconnect
+  lands. The hook initializes from `client.isOpen()` in BOTH
+  directions on mount so the global singleton doesn't carry stale
+  state across remount (Codex #213 R1 note) (#213).
 
 ### Added — Tooling / scripts
 - **`scripts/cloud_sync_status.py`** — stdlib-only ops-monitoring
