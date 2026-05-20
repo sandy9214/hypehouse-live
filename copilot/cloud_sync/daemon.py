@@ -49,12 +49,15 @@ class SyncStats:
     last_pull_applied: int = 0
     last_push_pushed: int = 0
     last_tick_error: str = ""
-    # Planned wall-clock time of the next scheduled tick. Set to
-    # `now + next_wait_seconds * 1_000_000` after each tick + each
-    # caught exception in the loop. `0` before the first tick (UI
-    # renders "—" then). With backoff (#169) the value drifts out
-    # exponentially under sustained failures — surfacing it lets
-    # operators see *when* the next try will actually happen.
+    # Planned wall-clock time of the next scheduled tick. Owned by
+    # `SyncDaemon._loop`, which calls `_stamp_next_sync(wait)` once
+    # per iteration immediately before `_stop.wait(wait)`. Out-of-
+    # band callers (`tick_once` via `library.sync_now`) deliberately
+    # do NOT touch this field — otherwise the UI would advertise a
+    # deadline that conflicts with the daemon thread's still-pending
+    # `_stop.wait(...)`. `0` before the first stamp (UI renders "—").
+    # With backoff (#169) the value drifts out exponentially under
+    # sustained failures so the displayed deadline tracks reality.
     next_sync_micros: int = 0
 
 DEFAULT_TICK_SECONDS = 60.0
