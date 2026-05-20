@@ -197,6 +197,26 @@ describe("JsonRpcWS", () => {
     c.close();
   });
 
+  it("pending call() rejects on server-side socket close (Codex #207 R1)", async () => {
+    // Regression for the "fetchInFlight latches on after disconnect"
+    // bug Codex caught on #207 R1. The store-level in-flight guard
+    // (sessionInfo.fetchInFlight) only clears in the `finally` block
+    // of the await chain — if handleClose() doesn't reject pending
+    // calls, that finally never runs and future reconnects can't
+    // refetch.
+    const factory = makeFactory();
+    const c = new JsonRpcWS({ url: "ws://test/ws", factory });
+    c.connect();
+    MockWS.instances[0]!.open();
+    // Fire a call(), don't wait for response — the test forces a
+    // server-side close before any reply lands.
+    const inFlight = c.call("engine.session_info");
+    MockWS.instances[0]!.close();
+    // The promise must reject — otherwise the awaiter hangs forever.
+    await expect(inFlight).rejects.toThrow(/connection closed/);
+    c.close();
+  });
+
   it("onOpen subscriber exception doesn't disrupt auth flow", () => {
     // Suppress the expected console.error spam from the throwing
     // listener so the test output stays clean.

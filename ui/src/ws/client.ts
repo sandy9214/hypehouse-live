@@ -274,6 +274,16 @@ export class JsonRpcWS {
 
   private handleClose(): void {
     this.socket = null;
+    // Reject any pending calls — the socket is dead, the server's
+    // never going to deliver a response. Without this, a caller
+    // awaiting `client.call(...)` when the engine restarts hangs
+    // forever, AND store-level "in flight" guards
+    // (`sessionInfo.fetchInFlight`) latch on, blocking future
+    // refetches even after reconnect (Codex #207 R1 P1 finding).
+    for (const p of this.pending.values()) {
+      p.reject(new Error("connection closed"));
+    }
+    this.pending.clear();
     if (this.closedByUser) return;
     // Schedule reconnect with exponential backoff capped at maxBackoffMs.
     const delay = Math.min(this.backoffMs, this.maxBackoffMs);
