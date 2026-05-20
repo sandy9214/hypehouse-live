@@ -211,19 +211,16 @@ class SyncDaemon:
                     self._consecutive_failures = 0
                 else:
                     self._consecutive_failures += 1
-                # Compute next_sync_micros inside the same critical
-                # section that just updated _consecutive_failures so
-                # the schedule the UI sees is internally consistent.
-                # Inline `next_wait_seconds` math to avoid re-entering
-                # the lock.
-                if self._consecutive_failures <= 0:
-                    next_wait = self._tick
-                else:
-                    exponent = min(self._consecutive_failures, 16)
-                    next_wait = min(
-                        self._tick * (2 ** exponent), MAX_BACKOFF_SECONDS
-                    )
-                next_us = now_us + int(next_wait * 1_000_000)
+                # `next_sync_micros` is OWNED BY `_loop` (see comment
+                # there). `tick_once` deliberately preserves the prior
+                # value — out-of-band callers (`library.sync_now`)
+                # don't change the daemon's automatic wake deadline,
+                # so the UI countdown must keep reflecting that
+                # deadline. Without this, sync_now would briefly
+                # advertise a "next in 60s" countdown while the
+                # daemon thread is still blocked in an unaltered
+                # backoff `_stop.wait(...)`.
+                prior_next = self._stats.next_sync_micros
                 self._stats = SyncStats(
                     last_pull_micros=now_us,
                     last_push_micros=now_us,
@@ -232,7 +229,7 @@ class SyncDaemon:
                     + pull_result.inserted_count,
                     last_push_pushed=push_result.pushed_count,
                     last_tick_error=tick_error,
-                    next_sync_micros=next_us,
+                    next_sync_micros=prior_next,
                 )
         finally:
             library.close()
@@ -246,20 +243,26 @@ class SyncDaemon:
             return self._stats
 
     def _record_failure(self) -> None:
-        """Bump `_consecutive_failures` and refresh `next_sync_micros`
-        in the stats snapshot. Used by the loop's exception arms when
-        `tick_once` raises before its own stats-update can run, so the
-        UI still sees the new backoff window.
+        """Bump `_consecutive_failures` for the loop's exception arms
+        when `tick_once` raises before its own bookkeeping can run.
+        `next_sync_micros` is intentionally NOT touched here; `_loop`
+        re-stamps it before each `_stop.wait` so the UI countdown
+        always reflects the daemon's actual upcoming wake.
         """
         with self._stats_lock:
             self._consecutive_failures += 1
-            # Recompute next_wait without re-entering the public
-            # method (avoids a recursive lock acquisition).
-            exponent = min(self._consecutive_failures, 16)
-            next_wait = min(
-                self._tick * (2 ** exponent), MAX_BACKOFF_SECONDS
-            )
-            now_us = int(time.time() * 1_000_000)
+
+    def _stamp_next_sync(self, wait_seconds: float) -> None:
+        """Record the wall-clock instant at which `_loop` will next
+        wake. Called from `_loop` only — owning the field here keeps
+        the UI countdown honest even when `library.sync_now` runs an
+        out-of-band tick that doesn't change the daemon's
+        already-scheduled wake.
+        """
+        deadline = int(time.time() * 1_000_000) + int(
+            wait_seconds * 1_000_000
+        )
+        with self._stats_lock:
             prior = self._stats
             self._stats = SyncStats(
                 last_pull_micros=prior.last_pull_micros,
@@ -268,13 +271,20 @@ class SyncDaemon:
                 last_pull_applied=prior.last_pull_applied,
                 last_push_pushed=prior.last_push_pushed,
                 last_tick_error=prior.last_tick_error,
-                next_sync_micros=now_us + int(next_wait * 1_000_000),
+                next_sync_micros=deadline,
             )
 
     def _loop(self) -> None:
         # Wait one tick BEFORE the first sync so we don't double up
         # with the bootstrap pull/push that already ran at startup.
-        while not self._stop.wait(self.next_wait_seconds()):
+        # Stamp the wake deadline atomically with the wait so the
+        # `library.sync_status` reader sees a value consistent with
+        # the actual `_stop.wait` argument.
+        while True:
+            wait = self.next_wait_seconds()
+            self._stamp_next_sync(wait)
+            if self._stop.wait(wait):
+                break
             try:
                 self.tick_once()
             except SyncError as exc:

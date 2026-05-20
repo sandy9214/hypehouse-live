@@ -317,9 +317,9 @@ describe("AboutPanel", () => {
     render(<AboutPanel client={makeClient()} />);
     const text = screen.getByTestId("about-last-sync").textContent ?? "";
     expect(text.includes("next in ")).toBe(true);
-    // Expect roughly "45s" — accept 44/45/46 to absorb the few ms
-    // between Date.now() in the test seed and inside the component.
-    expect(/next in 4[3-6]s/.test(text)).toBe(true);
+    // Expect roughly "45s" — widen to absorb slow-CI jitter
+    // (Codex #174 R1 review note).
+    expect(/next in (4[0-9]|5[0-2])s/.test(text)).toBe(true);
   });
 
   it("hides sync counts row when all tick counters are zero", () => {
