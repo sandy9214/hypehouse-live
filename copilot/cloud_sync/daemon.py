@@ -81,8 +81,11 @@ class SyncDaemon:
         self._stats = SyncStats()
         # Exponential-backoff state. Bumped on any tick that records a
         # transport-error in pull or push; reset to zero on the first
-        # clean tick. Reading/writing happens only from the daemon
-        # thread inside `_loop`, so no lock needed.
+        # clean tick. Reads/writes are protected by `_stats_lock`
+        # because `library.sync_now` (#161) calls `tick_once` from the
+        # RPC handler thread, while the daemon loop calls it from its
+        # own thread — without the lock a concurrent
+        # increment+reset can lose either signal.
         self._consecutive_failures = 0
 
     @classmethod
@@ -151,13 +154,18 @@ class SyncDaemon:
 
         Public method (rather than a private `_next_wait`) so tests
         can assert the schedule directly without monkey-patching.
+        Reads `_consecutive_failures` under `_stats_lock` since the
+        counter is mutated from both the daemon thread and the RPC
+        handler thread (via `sync_now` → `tick_once`).
         """
-        if self._consecutive_failures <= 0:
+        with self._stats_lock:
+            failures = self._consecutive_failures
+        if failures <= 0:
             return self._tick
         # Clamp the exponent to avoid integer overflow at very high
         # failure counts (Python ints are arbitrary precision but
         # 2**100 * 60 is still nonsense).
-        exponent = min(self._consecutive_failures, 16)
+        exponent = min(failures, 16)
         return min(self._tick * (2 ** exponent), MAX_BACKOFF_SECONDS)
 
     def tick_once(self) -> None:
@@ -201,10 +209,10 @@ class SyncDaemon:
                     last_push_pushed=push_result.pushed_count,
                     last_tick_error=tick_error,
                 )
-            if tick_error == "":
-                self._consecutive_failures = 0
-            else:
-                self._consecutive_failures += 1
+                if tick_error == "":
+                    self._consecutive_failures = 0
+                else:
+                    self._consecutive_failures += 1
         finally:
             library.close()
 
@@ -230,7 +238,8 @@ class SyncDaemon:
                 self._log.warning(
                     "cloud sync: transport error during tick: %s", exc
                 )
-                self._consecutive_failures += 1
+                with self._stats_lock:
+                    self._consecutive_failures += 1
             except sqlite3.Error as exc:
                 # Local-DB hiccup (lock contention with the main
                 # thread's writes, busy timeout, etc.). Recoverable —
@@ -241,7 +250,8 @@ class SyncDaemon:
                 self._log.warning(
                     "cloud sync: local DB error during tick: %s", exc
                 )
-                self._consecutive_failures += 1
+                with self._stats_lock:
+                    self._consecutive_failures += 1
             except Exception as exc:  # noqa: BLE001
                 # Anything else is unexpected — log at ERROR so an
                 # operator tailing the log sees it. We still don't
@@ -255,7 +265,8 @@ class SyncDaemon:
                     exc,
                     exc_info=exc,
                 )
-                self._consecutive_failures += 1
+                with self._stats_lock:
+                    self._consecutive_failures += 1
             # Light sleep avoids a tight error-loop on a misbehaving
             # client; the `Event.wait` above is the main pacing wait.
             time.sleep(0)

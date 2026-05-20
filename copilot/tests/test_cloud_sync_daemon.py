@@ -329,6 +329,57 @@ def test_tick_once_resets_consecutive_failures_on_success(
     assert daemon._consecutive_failures == 0  # noqa: SLF001
 
 
+def test_consecutive_failures_mutation_is_lock_protected(
+    tmp_path: Path,
+) -> None:
+    """Two threads incrementing _consecutive_failures via tick_once
+    must never lose an increment to a torn read-modify-write.
+    `sync_now` (via the RPC handler thread) + the daemon `_loop`
+    (its own thread) exercise this in production.
+    """
+    import threading
+
+    class FlakyPullClient:
+        """Same shape as the test below — every tick records a
+        transport_error so the counter bumps."""
+
+        def list_tracks(self, *, since_micros=0):  # noqa: ARG002
+            from copilot.cloud_sync.client import SyncError
+
+            raise SyncError("HTTP 503")
+
+        def get_track(self, _id):
+            return None
+
+        def upsert_track(self, _t):
+            return None
+
+        def delete_track(self, _id):
+            return False
+
+    daemon = SyncDaemon(
+        FlakyPullClient(), tmp_path / "lib.db", tick_seconds=60.0
+    )
+    N_PER_THREAD = 50
+    barrier = threading.Barrier(2)
+
+    def worker() -> None:
+        barrier.wait()
+        for _ in range(N_PER_THREAD):
+            daemon.tick_once()
+
+    t1 = threading.Thread(target=worker)
+    t2 = threading.Thread(target=worker)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10.0)
+    t2.join(timeout=10.0)
+    # 100 ticks all errored → counter must be exactly 100. Without
+    # locking the read-modify-write, lost updates would land here as
+    # a value < 100.
+    assert daemon._consecutive_failures == 2 * N_PER_THREAD  # noqa: SLF001
+
+
 def test_tick_once_bumps_failures_on_transport_error(
     tmp_path: Path,
 ) -> None:
