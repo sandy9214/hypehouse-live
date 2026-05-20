@@ -8,6 +8,7 @@ import {
   deletePreset,
   fetchPresets,
   loadPreset,
+  refetchPresets,
   savePreset,
   type Preset,
 } from "./presets";
@@ -140,6 +141,41 @@ describe("presets store", () => {
     const client = { call } as unknown as JsonRpcWS;
     const result = await loadPreset(client, 999);
     expect(result).toBeNull();
+  });
+
+  it("fetchPresets short-circuits when already loaded (no refetch on remount)", async (): Promise<void> => {
+    const { client, call } = makeClient({
+      "presets.list": {
+        presets: [{ id: 1, name: "a", created_at: "2026-05-17T10:00:00Z" }],
+      },
+    });
+    await fetchPresets(client);
+    await fetchPresets(client);
+    await fetchPresets(client);
+    expect(call).toHaveBeenCalledTimes(1);
+  });
+
+  it("refetchPresets forces a fresh presets.list call even when loaded", async (): Promise<void> => {
+    let nthCall = 0;
+    const call = vi.fn(async (): Promise<unknown> => {
+      nthCall += 1;
+      return {
+        presets:
+          nthCall === 1
+            ? [{ id: 1, name: "a", created_at: "2026-05-17T10:00:00Z" }]
+            : [
+                { id: 1, name: "a", created_at: "2026-05-17T10:00:00Z" },
+                { id: 2, name: "b-renamed", created_at: "2026-05-17T11:00:00Z" },
+              ],
+      };
+    });
+    const client = { call } as unknown as JsonRpcWS;
+    const first = await fetchPresets(client);
+    expect(first.presets).toHaveLength(1);
+    const second = await refetchPresets(client);
+    expect(second.presets).toHaveLength(2);
+    expect(second.presets[1]?.name).toBe("b-renamed");
+    expect(call).toHaveBeenCalledTimes(2);
   });
 
   it("deletePreset removes the row from the local cache", async (): Promise<void> => {

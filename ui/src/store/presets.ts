@@ -124,11 +124,18 @@ const isPreset = (v: unknown): v is Preset => {
  * Fetch the full list from `presets.list`. Dedup'd via `loading` flag.
  * Returns the post-call state so callers (the panel mount effect) can
  * react inline without a second hook tick.
+ *
+ * `opts.force = true` is reserved for the reconnect-refetch path —
+ * see `refetchPresets`. It bypasses the `loaded` check (which lets
+ * cached state stay) but still respects the `loading` dedupe so a
+ * reconnect that fires mid-flight doesn't double-call.
  */
 export const fetchPresets = async (
   client: JsonRpcWS,
+  opts: { force?: boolean } = {},
 ): Promise<PresetsStoreState> => {
   if (current.loading) return current;
+  if (!opts.force && current.loaded) return current;
   current = { ...current, loading: true };
   notify();
   try {
@@ -165,6 +172,17 @@ export const fetchPresets = async (
   notify();
   return current;
 };
+
+/**
+ * Force-refresh the cached preset list, bypassing the `loaded` guard.
+ * Used by the WS reconnect subscriber: server-side presets may have
+ * been added / deleted / renamed via another client (cloud sync, a
+ * second window) during the gap, so the cache is stale-by-default
+ * after a reconnect.
+ */
+export const refetchPresets = (
+  client: JsonRpcWS,
+): Promise<PresetsStoreState> => fetchPresets(client, { force: true });
 
 /**
  * Save a new preset. On success the cache is refreshed in-place so the
@@ -261,13 +279,37 @@ export const deletePreset = async (
   }
 };
 
+// Module-level WeakSet of clients we've already wired an onOpen
+// subscriber for. Mirrors the pattern in `sessions.ts` (PR #224 R1
+// fix) so a reconnect that fires while the presets panel is hidden
+// still triggers a fresh `presets.list` against the new socket. The
+// WeakSet doesn't pin the client — runtime GC reclaims both
+// together.
+const presetsClientsSubscribed: WeakSet<JsonRpcWS> = new WeakSet();
+
+const ensurePresetsOpenSubscribed = (client: JsonRpcWS): void => {
+  if (presetsClientsSubscribed.has(client)) return;
+  const ow = (
+    client as { onOpen?: (cb: () => void) => () => void }
+  ).onOpen;
+  if (typeof ow !== "function") return;
+  presetsClientsSubscribed.add(client);
+  ow.call(client, (): void => {
+    void refetchPresets(client);
+  });
+};
+
 /**
  * React hook returning the cached preset list. Auto-fetches on first
- * mount when the cache is empty and not yet in flight.
+ * mount when the cache is empty and not yet in flight. Idempotently
+ * wires a module-level WS-reconnect subscriber so the cache
+ * self-refreshes after a socket bounce even while the panel is
+ * unmounted.
  */
 export const usePresets = (client: JsonRpcWS): PresetsStoreState => {
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   useEffect((): void => {
+    ensurePresetsOpenSubscribed(client);
     if (!snapshot.loaded && !snapshot.loading) {
       void fetchPresets(client);
     }
