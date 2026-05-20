@@ -30,8 +30,7 @@ Env vars:
 | `SUPABASE_URL` | — | Cloud library sync project URL. Unset = local-only (InMemory fallback). See [`docs/cloud-sync.md`](../docs/cloud-sync.md). |
 | `SUPABASE_ANON_KEY` | — | Cloud sync anon key. Required alongside `SUPABASE_URL`. |
 | `HYPEHOUSE_SYNC_TICK_SECONDS` | `60` | Background sync daemon cadence in seconds. Non-positive / non-numeric values silently fall back to the default. Daemon backs off exponentially on consecutive failures, capped at 10 min. |
-| `HYPEHOUSE_RECORDING_DISABLED` | `0` | Set to `1` to disable session recording (no `master.wav` written). |
-| `HYPEHOUSE_TELEMETRY_ENABLED` | `0` | Set to `1` to opt-in to Sentry telemetry. |
+| `HYPEHOUSE_TELEMETRY_ENABLED` | `0` | Set to `1` to opt-in to Sentry telemetry (read by `copilot.telemetry.init_telemetry`). |
 
 ## Cloud library sync (#102)
 
