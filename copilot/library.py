@@ -1030,6 +1030,43 @@ class TrackLibrary:
         r = self._conn.execute("SELECT COUNT(*) AS n FROM tracks").fetchone()
         return int(r["n"]) if r else 0
 
+    def count_stems_by_status(self) -> dict[str, int]:
+        """Aggregate stems-status counts across the catalog.
+
+        Returns a dict keyed by the four reportable buckets:
+        ``"ready"`` / ``"pending"`` / ``"failed"`` / ``"none"`` (no
+        row in `tracks.stems_status` — never requested). Always
+        includes all four keys with ``0`` defaults so the UI can
+        render the row without branching on missing buckets.
+
+        Used by ``library.stems_status`` so the AboutPanel can
+        surface "Stems: 3 ready · 1 pending · 12 none" without
+        round-tripping the per-track surface.
+        """
+        out: dict[str, int] = {
+            STEMS_STATUS_READY: 0,
+            STEMS_STATUS_PENDING: 0,
+            STEMS_STATUS_FAILED: 0,
+            "none": 0,
+        }
+        # SQLite's COALESCE flattens NULL → 'none' so the GROUP BY
+        # produces one row per reportable bucket. Avoids two queries
+        # + the cost of a separate NULL count.
+        rows = self._conn.execute(
+            "SELECT COALESCE(stems_status, 'none') AS bucket, "
+            "COUNT(*) AS n FROM tracks GROUP BY bucket",
+        ).fetchall()
+        for r in rows:
+            bucket = r["bucket"]
+            if bucket in out:
+                out[bucket] = int(r["n"])
+            else:
+                # Defensive: any future status value the DB ends up
+                # with (e.g. a manual SQL write) gets lumped into
+                # "none" instead of silently disappearing.
+                out["none"] += int(r["n"])
+        return out
+
     def list_tracks(
         self, *, limit: int = 100, offset: int = 0
     ) -> list[TrackRef]:

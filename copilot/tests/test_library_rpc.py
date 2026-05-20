@@ -867,3 +867,60 @@ async def test_sync_now_wraps_sqlite_error_as_rpc_error(
     assert "database is locked" in str(ei.value)
 
 
+# ---- stems_status --------------------------------------------------
+
+
+def test_handler_handles_stems_status(library: TrackLibrary):
+    handler = LibraryRpcHandler(library)
+    assert handler.handles("library.stems_status") is True
+
+
+@_asyncio
+async def test_stems_status_empty_library(library: TrackLibrary):
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.stems_status", {})
+    assert result == {"ready": 0, "pending": 0, "failed": 0, "none": 0}
+
+
+@_asyncio
+async def test_stems_status_aggregates_all_buckets(
+    library: TrackLibrary,
+):
+    """Mix of all 4 bucket states must produce the right per-bucket
+    counts."""
+    _seed(library)  # 5 tracks: alpha bravo charlie delta echo
+    # Stamp each track with a different stems_status value.
+    library.set_stems("alpha", status="ready", stems_dir="/s/alpha")
+    library.set_stems("bravo", status="ready", stems_dir="/s/bravo")
+    library.set_stems("charlie", status="pending", stems_dir=None)
+    library.set_stems("delta", status="failed", stems_dir=None)
+    # `echo` left untouched → bucket "none".
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.stems_status", {})
+    assert result == {"ready": 2, "pending": 1, "failed": 1, "none": 1}
+
+
+@_asyncio
+async def test_stems_status_unknown_value_buckets_to_none(
+    library: TrackLibrary,
+):
+    """Defensive bucket: a manual SQL write of an unexpected status
+    value must NOT silently disappear from the totals."""
+    _seed(library)
+    # Direct SQL write — simulates an external migration or manual edit.
+    library._conn.execute(  # noqa: SLF001
+        "UPDATE tracks SET stems_status = ? WHERE track_id = ?",
+        ("weird-future-state", "alpha"),
+    )
+    library._conn.commit()  # noqa: SLF001
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.stems_status", {})
+    # 1 row with the surprising status lumped into "none" (per the
+    # defensive default in count_stems_by_status), + 4 rows truly
+    # without a status.
+    assert result["none"] == 5
+    assert result["ready"] == 0
+    assert result["pending"] == 0
+    assert result["failed"] == 0
+
+
