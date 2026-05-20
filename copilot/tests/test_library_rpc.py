@@ -762,6 +762,87 @@ async def test_list_pending_push_after_partial_clear(
     assert sorted(result["ids"]) == ["bravo", "charlie", "echo"]
 
 
+# ---- requeue_all_pending --------------------------------------------
+
+
+def test_handler_handles_requeue_all_pending(library: TrackLibrary):
+    handler = LibraryRpcHandler(library)
+    assert handler.handles("library.requeue_all_pending") is True
+
+
+@_asyncio
+async def test_requeue_all_pending_empty_library(library: TrackLibrary):
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.requeue_all_pending", {})
+    assert result == {"queued": 0}
+
+
+@_asyncio
+async def test_requeue_all_pending_calls_wake_now_when_daemon_wired(
+    library: TrackLibrary,
+):
+    """Mirror of test_sync_now_calls_wake_now_after_tick — the
+    operator's expectation is that the daemon starts draining the
+    freshly filled queue right away, not after the pending backoff
+    wait expires (Codex #179 R1)."""
+    from copilot.cloud_sync import SyncStats
+
+    class StubDaemon:
+        def __init__(self) -> None:
+            self.wake_calls = 0
+
+        def wake_now(self) -> None:
+            self.wake_calls += 1
+
+        def stats(self) -> SyncStats:
+            return SyncStats()
+
+    _seed(library)
+    daemon = StubDaemon()
+    handler = LibraryRpcHandler(library, sync_daemon=daemon)
+    await handler.dispatch("library.requeue_all_pending", {})
+    assert daemon.wake_calls == 1, (
+        "requeue_all_pending must call wake_now so the daemon starts "
+        "draining the freshly filled queue"
+    )
+
+
+@_asyncio
+async def test_requeue_all_pending_runs_without_daemon(
+    library: TrackLibrary,
+):
+    """No daemon wired (test path / local-only mode): RPC must still
+    enqueue without raising. Symmetric with sync_now's tolerance for
+    missing-wake-now (in-place upgrade safety)."""
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.requeue_all_pending", {})
+    assert result == {"queued": 5}
+
+
+@_asyncio
+async def test_requeue_all_pending_seeds_pre_cloud_sync_library(
+    library: TrackLibrary,
+):
+    """Operator escape hatch — after a pre-cloud-sync upgrade the
+    local library has tracks but no pending_push rows. The RPC must
+    enqueue everything."""
+    _seed(library)  # 5 adds → 5 auto-enqueued rows
+    for tid in ["alpha", "bravo", "charlie", "delta", "echo"]:
+        library.clear_pending_push(tid)
+    assert library.pending_push_ids() == []
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.requeue_all_pending", {})
+    assert result == {"queued": 5}
+    assert sorted(library.pending_push_ids()) == [
+        "alpha",
+        "bravo",
+        "charlie",
+        "delta",
+        "echo",
+    ]
+
+
 @_asyncio
 async def test_sync_now_wraps_sqlite_error_as_rpc_error(
     library: TrackLibrary,
