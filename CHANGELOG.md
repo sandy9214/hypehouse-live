@@ -132,6 +132,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing socket is in `CONNECTING` (0) OR `OPEN` (1) so a rapid
   second click can't spawn a second socket and break the
   single-socket invariant (Codex #216 R1 P1 finding) (#216).
+- **Effects manifest refetch on WS reconnect** — third store to get
+  the #207 / #210 `onOpen` + `refetch*` pattern. New
+  `refetchEffectsManifest(client)` helper; `useEffectsManifest`
+  subscribes to `client.onOpen` (typeof-tolerant). Engine restart
+  / dev rebuild now refreshes the effects dropdown without a page
+  reload (#223).
+- **Sessions list refetch on WS reconnect** — fourth + final
+  one-shot-cache store to get the reconnect-refetch pattern. Uses
+  the existing `fetchSessions(..., { force: true })` flag instead
+  of a new helper. **Codex caught a P1 race** in R1: the History
+  panel is conditionally mounted inside SecondaryPanel, so a
+  hook-local subscription would miss the open event while the
+  panel was hidden. R2 fix moves the `onOpen` subscription to a
+  module-level `WeakSet<JsonRpcWS>` so the subscription survives
+  mount/unmount of the History panel (#224).
 
 ### Added — Tooling / scripts
 - **`scripts/cloud_sync_status.py`** — stdlib-only ops-monitoring
@@ -216,6 +231,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `event_to_commands_with_errors` + mid-stream via
   `decode_drain.rs`). Codex R1 caught the missing mid-stream
   path; R2 fix covers both (#219).
+- Expanded `publish_decode_error` doc-comment in
+  `engine/src/bridge/rpc.rs` + `docs/api/ws-protocol.md`
+  `engine.decode_error` section to cover both open-time
+  (`DeckLoad` + `DeckLoadStems` via `DecodeService::open` /
+  `open_stems`) and mid-stream paths. Codex R1 + R2 each caught a
+  missing path; R3 final state mirrors across both surfaces (#220).
 
 ## [0.1.0] — 2026-05-19
 
