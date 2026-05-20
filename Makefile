@@ -8,7 +8,7 @@
 #   * node + npm (for the UI)
 #   * `cargo install tauri-cli@2` once per workstation for `dev-tauri` / `build-tauri`.
 
-.PHONY: help build-engine build-ui dev-tauri build-tauri test-engine test-tauri test-ui test-copilot clean bake-in bake-in-tests supabase-print cloud-sync-status
+.PHONY: help build-engine build-ui dev-tauri build-tauri test test-engine test-tauri test-ui test-copilot clean bake-in bake-in-tests supabase-print cloud-sync-status
 
 # v0.2 bake-in defaults — 25-minute sanity run. Bump DURATION_MIN=240
 # for the four-hour soak the release checklist demands.
@@ -28,6 +28,7 @@ help:
 	@echo "  make test-tauri     — cargo test --all-targets on tauri/"
 	@echo "  make test-ui        — npm run test on ui/"
 	@echo "  make test-copilot   — pytest copilot/tests/ (Python copilot service)"
+	@echo "  make test           — run all four test-* suites in sequence"
 	@echo "  make bake-in        — full synthetic bake-in (default 25 min)"
 	@echo "  make bake-in DURATION_MIN=240   — full 4-hour soak"
 	@echo "  make bake-in-tests  — pytest the bake-in harness scripts only"
@@ -66,6 +67,11 @@ test-ui:
 # guaranteed-clean subset.
 test-copilot:
 	PYTHONPATH=. $(PYTHON) -m pytest copilot/tests/ -q
+
+# Aggregate target: runs every test-* sub-suite in sequence. Fast-fail
+# on the first non-zero exit (Make default). Wire into CI's
+# `pre-merge.yml` job in lieu of repeating each sub-target.
+test: test-engine test-ui test-tauri test-copilot
 
 clean:
 	cd engine && cargo clean
