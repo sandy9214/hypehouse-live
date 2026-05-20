@@ -86,6 +86,13 @@ class SyncDaemon:
         self._tick = max(0.01, float(tick_seconds))
         self._log = logger or logging.getLogger("copilot.cloud_sync.daemon")
         self._stop = threading.Event()
+        # Independent event that lets `library.sync_now` (RPC thread)
+        # short-circuit the daemon's `_stop.wait(...)` after running
+        # an out-of-band `tick_once`. Without this, an operator
+        # clicking "Sync now" mid-backoff would still wait the full
+        # remaining backoff window for the next automatic tick — even
+        # though `_consecutive_failures` was reset by the manual tick.
+        self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._stats_lock = threading.Lock()
         self._stats = SyncStats()
@@ -134,6 +141,7 @@ class SyncDaemon:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
+        self._wake.clear()
         self._thread = threading.Thread(
             target=self._loop,
             name="copilot-cloud-sync",
@@ -146,9 +154,20 @@ class SyncDaemon:
             self._library_path,
         )
 
+    def wake_now(self) -> None:
+        """Wake the daemon thread early, so its next iteration runs
+        as soon as possible. Used by `library.sync_now` after an
+        out-of-band `tick_once` to refresh the daemon's schedule —
+        otherwise the loop would still finish its already-scheduled
+        backoff wait before the next automatic tick fires.
+        """
+        self._wake.set()
+
     def stop(self, *, join_timeout_s: float = 5.0) -> None:
         """Signal stop and join. Idempotent."""
         self._stop.set()
+        # Also unblock any pending `_wake.wait(...)` inside the loop.
+        self._wake.set()
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=join_timeout_s)
@@ -282,11 +301,19 @@ class SyncDaemon:
         # with the bootstrap pull/push that already ran at startup.
         # Stamp the wake deadline atomically with the wait so the
         # `library.sync_status` reader sees a value consistent with
-        # the actual `_stop.wait` argument.
+        # the actual `_wake.wait` argument.
+        #
+        # The wait is on `_wake` (not `_stop`) so an out-of-band
+        # `wake_now()` from `library.sync_now` short-circuits a long
+        # backoff sleep. `_stop` is checked separately each iteration
+        # — `stop()` sets both events so this path also unwinds on
+        # shutdown.
         while True:
             wait = self.next_wait_seconds()
             self._stamp_next_sync(wait)
-            if self._stop.wait(wait):
+            self._wake.wait(wait)
+            self._wake.clear()
+            if self._stop.is_set():
                 break
             try:
                 self.tick_once()
