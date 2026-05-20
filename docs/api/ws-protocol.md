@@ -891,6 +891,113 @@ paths once stem separation has completed.
 
 **Errors**: `-32602` if `track_id` is missing / empty.
 
+### `library.sync_status` (co-pilot)
+
+Snapshot of cloud-sync state (see [docs/cloud-sync.md](../cloud-sync.md)
+for the operator guide). Cheap — reads cached daemon counters under a
+lock; never round-trips the cloud.
+
+**Params**: none.
+
+**Result**:
+
+```json
+{
+  "pending_push_count":  4,
+  "library_track_count": 137,
+  "last_pull_micros":    1700000060000000,
+  "last_push_micros":    1700000060000000,
+  "last_pull_fetched":   2,
+  "last_pull_applied":   2,
+  "last_push_pushed":    1,
+  "last_tick_error":     "",
+  "next_sync_micros":    1700000120000000
+}
+```
+
+All `*_micros` fields are wall-clock micros (UNIX epoch). `0` before
+the daemon's first tick. `next_sync_micros` is owned by the daemon's
+loop and reflects the actual scheduled wake — out-of-band callers
+don't move it (intentionally — see #174 / #176 design notes).
+
+Daemon-less mode (no Supabase env vars) returns the two counts with
+all stats fields zeroed.
+
+### `library.sync_now` (co-pilot)
+
+Operator-driven force tick. Runs an out-of-band pull+push and wakes
+the daemon thread so its next automatic tick fires at the reset
+cadence rather than waiting out the prior backoff window.
+
+**Params**: none.
+
+**Result**: identical shape to `library.sync_status`, reflecting the
+post-tick state.
+
+**Errors**:
+- `-32000 cloud sync not configured` — no `SyncDaemon` wired
+  (Supabase env vars absent).
+- `-32603 cloud sync transport error: <msg>` — Supabase / network
+  failure during the tick.
+- `-32603 cloud sync local DB error: <msg>` — SQLite hiccup
+  (lock contention, malformed schema, etc.).
+
+### `library.list_pending_push` (co-pilot)
+
+Returns the set of track IDs awaiting cloud push. Backs the UI's
+per-row "⟳ pending" chip + "Pending sync only" filter.
+
+**Params**: none.
+
+**Result**:
+
+```json
+{ "ids": ["kanye-stronger", "rkfd-keys-of-life"] }
+```
+
+Returned as a list (JSON has no native set type); UI builds a Set
+client-side for O(1) membership checks.
+
+### `library.requeue_all_pending` (co-pilot)
+
+Operator escape hatch — enqueues every local track for cloud push.
+Used after a pre-cloud-sync upgrade to seed a fresh Supabase project
+from an existing local library. Idempotent: tracks already in the
+queue keep their original `queued_at_micros` ordering.
+
+Wakes the daemon with `skip_next_tick=False` so the freshly enqueued
+rows drain on the next iteration rather than sitting through the
+prior backoff window.
+
+**Params**: none.
+
+**Result**:
+
+```json
+{ "queued": 137 }
+```
+
+`queued` is the **total** pending-push count after the call, not the
+number of newly added rows.
+
+### `library.stems_status` (co-pilot)
+
+Aggregate counts of tracks by demucs stems-status. Backs the
+AboutPanel "Stems" row.
+
+**Params**: none.
+
+**Result**:
+
+```json
+{ "ready": 8, "pending": 1, "failed": 0, "none": 128 }
+```
+
+All four buckets are always present (zeros when empty). `"none"`
+covers BOTH tracks whose `tracks.stems_status` is NULL and tracks
+whose status is an unknown future enum value (defensive bucket —
+unknown values never silently disappear).
+
 ## Server-pushed notifications
 
 Notifications have no `id` and expect no response.
