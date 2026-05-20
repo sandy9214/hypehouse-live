@@ -126,6 +126,7 @@ describe("AboutPanel", () => {
       last_pull_applied: 0,
       last_push_pushed: 0,
       last_tick_error: "",
+      next_sync_micros: 0,
     });
     render(<AboutPanel client={makeClient()} />);
     expect(screen.getByTestId("about-library-count").textContent).toBe(
@@ -143,6 +144,7 @@ describe("AboutPanel", () => {
       last_pull_applied: 0,
       last_push_pushed: 0,
       last_tick_error: "",
+      next_sync_micros: 0,
     });
     render(<AboutPanel client={makeClient()} />);
     expect(screen.getByTestId("about-library-count").textContent).toBe(
@@ -160,6 +162,7 @@ describe("AboutPanel", () => {
       last_pull_applied: 0,
       last_push_pushed: 0,
       last_tick_error: "",
+      next_sync_micros: 0,
     });
     render(<AboutPanel client={makeClient()} />);
     expect(screen.getByTestId("about-last-sync").textContent).toBe("never");
@@ -176,6 +179,7 @@ describe("AboutPanel", () => {
       last_pull_applied: 0,
       last_push_pushed: 0,
       last_tick_error: "",
+      next_sync_micros: 0,
     });
     render(<AboutPanel client={makeClient()} />);
     const text = screen.getByTestId("about-last-sync").textContent ?? "";
@@ -193,6 +197,7 @@ describe("AboutPanel", () => {
       last_pull_applied: 0,
       last_push_pushed: 0,
       last_tick_error: "supabase: HTTP 503",
+      next_sync_micros: 0,
     });
     render(<AboutPanel client={makeClient()} />);
     const text = screen.getByTestId("about-last-sync").textContent ?? "";
@@ -226,6 +231,7 @@ describe("AboutPanel", () => {
           last_pull_applied: 1,
           last_push_pushed: 0,
           last_tick_error: "",
+      next_sync_micros: 0,
         };
       }
       return {
@@ -237,6 +243,7 @@ describe("AboutPanel", () => {
         last_pull_applied: 0,
         last_push_pushed: 0,
         last_tick_error: "",
+      next_sync_micros: 0,
       };
     });
     render(<AboutPanel client={makeClient(call)} />);
@@ -282,6 +289,7 @@ describe("AboutPanel", () => {
         last_pull_applied: 0,
         last_push_pushed: 0,
         last_tick_error: "",
+      next_sync_micros: 0,
       };
     });
     render(<AboutPanel client={makeClient(call)} />);
@@ -291,6 +299,27 @@ describe("AboutPanel", () => {
         "cloud sync not configured",
       );
     });
+  });
+
+  it("renders 'next in Xs' countdown when next_sync_micros set", () => {
+    const nowMs = Date.now();
+    __setSyncStatus({
+      library_track_count: 5,
+      pending_push_count: 0,
+      last_pull_micros: (nowMs - 3_000) * 1000,
+      last_push_micros: 0,
+      last_pull_fetched: 0,
+      last_pull_applied: 0,
+      last_push_pushed: 0,
+      last_tick_error: "",
+      next_sync_micros: (nowMs + 45_000) * 1000,
+    });
+    render(<AboutPanel client={makeClient()} />);
+    const text = screen.getByTestId("about-last-sync").textContent ?? "";
+    expect(text.includes("next in ")).toBe(true);
+    // Expect roughly "45s" — widen to absorb slow-CI jitter
+    // (Codex #174 R1 review note).
+    expect(/next in (4[0-9]|5[0-2])s/.test(text)).toBe(true);
   });
 
   it("hides sync counts row when all tick counters are zero", () => {
@@ -303,6 +332,7 @@ describe("AboutPanel", () => {
       last_pull_applied: 0,
       last_push_pushed: 0,
       last_tick_error: "",
+      next_sync_micros: 0,
     });
     render(<AboutPanel client={makeClient()} />);
     expect(screen.queryByTestId("about-sync-counts")).toBeNull();
@@ -318,6 +348,7 @@ describe("AboutPanel", () => {
       last_pull_applied: 0,
       last_push_pushed: 0,
       last_tick_error: "",
+      next_sync_micros: 0,
     });
     render(<AboutPanel client={makeClient()} />);
     expect(screen.getByTestId("about-sync-counts").textContent).toBe(
@@ -335,6 +366,7 @@ describe("AboutPanel", () => {
       last_pull_applied: 5,
       last_push_pushed: 2,
       last_tick_error: "",
+      next_sync_micros: 0,
     });
     render(<AboutPanel client={makeClient()} />);
     expect(screen.getByTestId("about-sync-counts").textContent).toBe(
@@ -352,6 +384,7 @@ describe("AboutPanel", () => {
       last_pull_applied: 0,
       last_push_pushed: 4,
       last_tick_error: "",
+      next_sync_micros: 0,
     });
     render(<AboutPanel client={makeClient()} />);
     expect(screen.getByTestId("about-sync-counts").textContent).toBe(

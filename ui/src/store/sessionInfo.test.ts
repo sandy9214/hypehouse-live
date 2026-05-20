@@ -5,7 +5,10 @@
 // changes to micros precision don't silently break the UI label.
 
 import { describe, expect, it } from "vitest";
-import { formatRelativeMicros } from "./sessionInfo";
+import {
+  formatCountdownMicros,
+  formatRelativeMicros,
+} from "./sessionInfo";
 
 const MS = 1_000;
 const MICROS_PER_MS = 1_000;
@@ -63,7 +66,7 @@ describe("formatRelativeMicros", () => {
     ).toBe("23h ago");
   });
 
-  it("rolls over to days at 24h+", () => {
+  it("rolls over to days at 24h+ for relative formatter", () => {
     const now = 10_000_000 * MS;
     expect(
       formatRelativeMicros(
@@ -77,5 +80,52 @@ describe("formatRelativeMicros", () => {
         now,
       ),
     ).toBe("9d ago");
+  });
+});
+
+describe("formatCountdownMicros", () => {
+  it("returns empty string for the daemon's pre-tick sentinel (0)", () => {
+    expect(formatCountdownMicros(0)).toBe("");
+  });
+
+  it("returns empty string for negative or non-finite values", () => {
+    expect(formatCountdownMicros(-1)).toBe("");
+    expect(formatCountdownMicros(Number.NaN)).toBe("");
+    expect(formatCountdownMicros(Number.POSITIVE_INFINITY)).toBe("");
+  });
+
+  it("returns 'due' when the schedule has slipped into the past", () => {
+    const now = 10_000_000 * MS;
+    expect(
+      formatCountdownMicros((now - 3 * MS) * MICROS_PER_MS, now),
+    ).toBe("due");
+  });
+
+  it("formats sub-minute waits as seconds", () => {
+    const now = 10_000_000 * MS;
+    expect(
+      formatCountdownMicros((now + 12_000) * MICROS_PER_MS, now),
+    ).toBe("12s");
+    expect(
+      formatCountdownMicros((now + 1_000) * MICROS_PER_MS, now),
+    ).toBe("1s");
+  });
+
+  it("formats minute-scale waits as 'Xm Ys'", () => {
+    const now = 10_000_000 * MS;
+    expect(
+      formatCountdownMicros((now + 75_000) * MICROS_PER_MS, now),
+    ).toBe("1m 15s");
+    expect(
+      formatCountdownMicros((now + 120_000) * MICROS_PER_MS, now),
+    ).toBe("2m");
+  });
+
+  it("handles the 10-minute backoff cap", () => {
+    const now = 10_000_000 * MS;
+    // 600s exact → "10m"
+    expect(
+      formatCountdownMicros((now + 600_000) * MICROS_PER_MS, now),
+    ).toBe("10m");
   });
 });

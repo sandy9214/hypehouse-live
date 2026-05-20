@@ -49,6 +49,16 @@ class SyncStats:
     last_pull_applied: int = 0
     last_push_pushed: int = 0
     last_tick_error: str = ""
+    # Planned wall-clock time of the next scheduled tick. Owned by
+    # `SyncDaemon._loop`, which calls `_stamp_next_sync(wait)` once
+    # per iteration immediately before `_stop.wait(wait)`. Out-of-
+    # band callers (`tick_once` via `library.sync_now`) deliberately
+    # do NOT touch this field — otherwise the UI would advertise a
+    # deadline that conflicts with the daemon thread's still-pending
+    # `_stop.wait(...)`. `0` before the first stamp (UI renders "—").
+    # With backoff (#169) the value drifts out exponentially under
+    # sustained failures so the displayed deadline tracks reality.
+    next_sync_micros: int = 0
 
 DEFAULT_TICK_SECONDS = 60.0
 
@@ -200,6 +210,20 @@ class SyncDaemon:
                 or ""
             )
             with self._stats_lock:
+                if tick_error == "":
+                    self._consecutive_failures = 0
+                else:
+                    self._consecutive_failures += 1
+                # `next_sync_micros` is OWNED BY `_loop` (see comment
+                # there). `tick_once` deliberately preserves the prior
+                # value — out-of-band callers (`library.sync_now`)
+                # don't change the daemon's automatic wake deadline,
+                # so the UI countdown must keep reflecting that
+                # deadline. Without this, sync_now would briefly
+                # advertise a "next in 60s" countdown while the
+                # daemon thread is still blocked in an unaltered
+                # backoff `_stop.wait(...)`.
+                prior_next = self._stats.next_sync_micros
                 self._stats = SyncStats(
                     last_pull_micros=now_us,
                     last_push_micros=now_us,
@@ -208,11 +232,8 @@ class SyncDaemon:
                     + pull_result.inserted_count,
                     last_push_pushed=push_result.pushed_count,
                     last_tick_error=tick_error,
+                    next_sync_micros=prior_next,
                 )
-                if tick_error == "":
-                    self._consecutive_failures = 0
-                else:
-                    self._consecutive_failures += 1
         finally:
             library.close()
 
@@ -224,10 +245,49 @@ class SyncDaemon:
         with self._stats_lock:
             return self._stats
 
+    def _record_failure(self) -> None:
+        """Bump `_consecutive_failures` for the loop's exception arms
+        when `tick_once` raises before its own bookkeeping can run.
+        `next_sync_micros` is intentionally NOT touched here; `_loop`
+        re-stamps it before each `_stop.wait` so the UI countdown
+        always reflects the daemon's actual upcoming wake.
+        """
+        with self._stats_lock:
+            self._consecutive_failures += 1
+
+    def _stamp_next_sync(self, wait_seconds: float) -> None:
+        """Record the wall-clock instant at which `_loop` will next
+        wake. Called from `_loop` only — owning the field here keeps
+        the UI countdown honest even when `library.sync_now` runs an
+        out-of-band tick that doesn't change the daemon's
+        already-scheduled wake.
+        """
+        deadline = int(time.time() * 1_000_000) + int(
+            wait_seconds * 1_000_000
+        )
+        with self._stats_lock:
+            prior = self._stats
+            self._stats = SyncStats(
+                last_pull_micros=prior.last_pull_micros,
+                last_push_micros=prior.last_push_micros,
+                last_pull_fetched=prior.last_pull_fetched,
+                last_pull_applied=prior.last_pull_applied,
+                last_push_pushed=prior.last_push_pushed,
+                last_tick_error=prior.last_tick_error,
+                next_sync_micros=deadline,
+            )
+
     def _loop(self) -> None:
         # Wait one tick BEFORE the first sync so we don't double up
         # with the bootstrap pull/push that already ran at startup.
-        while not self._stop.wait(self.next_wait_seconds()):
+        # Stamp the wake deadline atomically with the wait so the
+        # `library.sync_status` reader sees a value consistent with
+        # the actual `_stop.wait` argument.
+        while True:
+            wait = self.next_wait_seconds()
+            self._stamp_next_sync(wait)
+            if self._stop.wait(wait):
+                break
             try:
                 self.tick_once()
             except SyncError as exc:
@@ -238,8 +298,7 @@ class SyncDaemon:
                 self._log.warning(
                     "cloud sync: transport error during tick: %s", exc
                 )
-                with self._stats_lock:
-                    self._consecutive_failures += 1
+                self._record_failure()
             except sqlite3.Error as exc:
                 # Local-DB hiccup (lock contention with the main
                 # thread's writes, busy timeout, etc.). Recoverable —
@@ -250,8 +309,7 @@ class SyncDaemon:
                 self._log.warning(
                     "cloud sync: local DB error during tick: %s", exc
                 )
-                with self._stats_lock:
-                    self._consecutive_failures += 1
+                self._record_failure()
             except Exception as exc:  # noqa: BLE001
                 # Anything else is unexpected — log at ERROR so an
                 # operator tailing the log sees it. We still don't
@@ -265,8 +323,7 @@ class SyncDaemon:
                     exc,
                     exc_info=exc,
                 )
-                with self._stats_lock:
-                    self._consecutive_failures += 1
+                self._record_failure()
             # Light sleep avoids a tight error-loop on a misbehaving
             # client; the `Event.wait` above is the main pacing wait.
             time.sleep(0)

@@ -10,9 +10,15 @@
 //   picked up by the engine (otherwise the dropdown's persisted choice
 //   silently doesn't apply).
 
-import { useState, type CSSProperties, type JSX } from "react";
+import {
+  useEffect,
+  useState,
+  type CSSProperties,
+  type JSX,
+} from "react";
 import type { JsonRpcWS } from "../ws/client";
 import {
+  formatCountdownMicros,
   formatRelativeMicros,
   syncNow,
   useSessionInfo,
@@ -136,6 +142,15 @@ export const AboutPanel = ({ client }: AboutPanelProps): JSX.Element => {
   const sync = useSyncStatus(client);
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string>("");
+  // Re-render once per second so the countdown ticks down without
+  // refetching the RPC. The store still polls every 5s for absolute
+  // status updates; this just animates the relative-time string.
+  const [, setTick] = useState(0);
+  useEffect((): (() => void) => {
+    const id = window.setInterval((): void => setTick((n) => n + 1), 1000);
+    return (): void => window.clearInterval(id);
+  }, []);
+  const countdown = formatCountdownMicros(sync.next_sync_micros);
   const onSyncNow = async (): Promise<void> => {
     if (syncing) return;
     setSyncing(true);
@@ -188,6 +203,7 @@ export const AboutPanel = ({ client }: AboutPanelProps): JSX.Element => {
         >
           <span style={valueStyle} data-testid="about-last-sync">
             {formatRelativeMicros(sync.last_pull_micros)}
+            {countdown !== "" ? ` · next in ${countdown}` : ""}
             {sync.last_tick_error !== ""
               ? ` · ${sync.last_tick_error}`
               : ""}

@@ -11,6 +11,7 @@ from copilot.cloud_sync import (
     InMemorySyncClient,
     RemoteTrack,
     SyncDaemon,
+    SyncStats,
 )
 from copilot.library import TrackLibrary, TrackRef
 
@@ -327,6 +328,98 @@ def test_tick_once_resets_consecutive_failures_on_success(
     daemon._consecutive_failures = 3  # noqa: SLF001
     daemon.tick_once()
     assert daemon._consecutive_failures == 0  # noqa: SLF001
+
+
+def test_tick_once_preserves_next_sync_micros(tmp_path: Path) -> None:
+    """`tick_once` must not touch `next_sync_micros` — only `_loop`
+    owns scheduling. An out-of-band `library.sync_now` would
+    otherwise advertise a deadline that conflicts with the daemon
+    thread's still-pending `_stop.wait(...)`. (Codex #174 R1.)
+    """
+    daemon = SyncDaemon(
+        InMemorySyncClient(), tmp_path / "lib.db", tick_seconds=60.0
+    )
+    sentinel = 9_876_543_210_000_000
+    # Stamp a fake deadline as if `_loop` had set it.
+    daemon._stamp_next_sync(60.0)  # noqa: SLF001
+    with daemon._stats_lock:  # noqa: SLF001
+        s0 = daemon._stats  # noqa: SLF001
+        daemon._stats = SyncStats(  # noqa: SLF001
+            last_pull_micros=s0.last_pull_micros,
+            last_push_micros=s0.last_push_micros,
+            last_pull_fetched=s0.last_pull_fetched,
+            last_pull_applied=s0.last_pull_applied,
+            last_push_pushed=s0.last_push_pushed,
+            last_tick_error=s0.last_tick_error,
+            next_sync_micros=sentinel,
+        )
+    daemon.tick_once()
+    assert daemon.stats().next_sync_micros == sentinel
+
+
+def test_loop_stamps_next_sync_before_wait(tmp_path: Path) -> None:
+    """`_loop` stamps `next_sync_micros` right before `_stop.wait` so
+    the field reflects the actual upcoming wake."""
+    db = tmp_path / "lib.db"
+    daemon = SyncDaemon(
+        InMemorySyncClient(), db, tick_seconds=60.0
+    )
+    before = int(time.time() * 1_000_000)
+    daemon._stamp_next_sync(daemon.next_wait_seconds())  # noqa: SLF001
+    after = int(time.time() * 1_000_000)
+    s = daemon.stats()
+    # Clean state → schedule = now + 60s. Wide slop tolerates clock
+    # readings on either side of the stamp.
+    expected_min = before + 59_900_000
+    expected_max = after + 60_100_000
+    assert expected_min <= s.next_sync_micros <= expected_max
+
+
+def test_sync_now_does_not_clobber_pending_wake_deadline(
+    tmp_path: Path,
+) -> None:
+    """Regression: Codex's #174 R1 finding.
+
+    Scenario: daemon was in a long backoff wait (e.g. 5 prior
+    failures → 1920s capped to 600s). Operator clicks "Sync now"
+    via `library.sync_now`, which runs `tick_once` out-of-band.
+    `tick_once` must NOT advertise a fresh "next in 60s" deadline
+    because the daemon thread is still blocked on the old wait;
+    only `_loop` (re-stamping before its next `_stop.wait`) gets to
+    move the deadline.
+    """
+    daemon = SyncDaemon(
+        InMemorySyncClient(), tmp_path / "lib.db", tick_seconds=60.0
+    )
+    # Pretend the loop just stamped a 10-minute deadline based on 5
+    # prior failures (capped at MAX_BACKOFF_SECONDS).
+    daemon._consecutive_failures = 5  # noqa: SLF001
+    daemon._stamp_next_sync(daemon.next_wait_seconds())  # noqa: SLF001
+    deadline_before = daemon.stats().next_sync_micros
+
+    # Operator clicks "Sync now" — runs an out-of-band tick that
+    # succeeds. This resets _consecutive_failures (good) but MUST
+    # leave next_sync_micros alone (loop owns it).
+    daemon.tick_once()
+    deadline_after = daemon.stats().next_sync_micros
+    assert deadline_after == deadline_before, (
+        "tick_once must not move next_sync_micros — only _loop does"
+    )
+    # _consecutive_failures still got reset by the clean tick — the
+    # next `_loop` iteration will re-stamp at 60s when it wakes.
+    assert daemon._consecutive_failures == 0  # noqa: SLF001
+
+
+def test_stamp_next_sync_grows_under_failures(tmp_path: Path) -> None:
+    daemon = SyncDaemon(
+        InMemorySyncClient(), tmp_path / "lib.db", tick_seconds=60.0
+    )
+    daemon._consecutive_failures = 2  # noqa: SLF001
+    daemon._stamp_next_sync(daemon.next_wait_seconds())  # noqa: SLF001
+    s = daemon.stats()
+    delta = s.next_sync_micros - int(time.time() * 1_000_000)
+    # 2 failures → 60 * 4 = 240s.
+    assert 239_000_000 <= delta <= 241_000_000
 
 
 def test_consecutive_failures_mutation_is_lock_protected(
