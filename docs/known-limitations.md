@@ -54,9 +54,9 @@ guide. Key v0.x caveats:
 - Daemon backs off exponentially on consecutive errors, capped at
   10 minutes. The AboutPanel "next in Xs" countdown reflects the
   real schedule.
-- Pre-v10 local rows aren't auto-enqueued for first push. Re-add or
-  use the (future) `library.requeue_all_pending` RPC to seed the
-  cloud from an existing local library.
+- Pre-v10 local rows aren't auto-enqueued for first push. Click the
+  AboutPanel "queue all" button (or call `library.requeue_all_pending`
+  directly) to seed the cloud from an existing local library.
 
 ## UI
 

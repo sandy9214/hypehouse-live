@@ -42,13 +42,33 @@ exponentially on consecutive transport errors (cap = 10 min).
 
 ## Verifying the wire-up
 
-- `AboutPanel` → "Last sync" row shows `Xs ago` after the first tick.
+- `AboutPanel` → "Last sync" row shows `Xs ago · next in Xs` after
+  the first tick.
 - After importing a track, the same row shows `· N pending sync`
   briefly, then drops to zero once the next tick drains the queue.
 - Track rows in the Library panel show a `⟳ pending` chip while the
-  push is queued.
-- `library.sync_now` RPC (button in AboutPanel) forces an immediate
-  tick — useful for quick verification without waiting 60s.
+  push is queued. The Library filter checkbox **"Pending sync only"**
+  narrows the visible rows to just the pending set.
+- AboutPanel **"sync now"** button → immediate `library.sync_now`
+  tick. The daemon also wakes so the next automatic tick fires at
+  the reset cadence.
+- AboutPanel **"queue all"** button → fires
+  `library.requeue_all_pending` (operator escape hatch after a
+  pre-cloud-sync upgrade — seeds the cloud from an existing local
+  library).
+
+## Ops monitoring
+
+For headless monitoring (cron / launchd) without the UI:
+
+```sh
+make cloud-sync-status            # human: "12 tracks, 3 pending push"
+make cloud-sync-status DB=...     # override path
+python scripts/cloud_sync_status.py --json   # machine output
+```
+
+Exit 0 / 2 (DB missing) / 3 (sqlite error). See
+`scripts/cloud_sync_status.py` for the full surface.
 
 ## Things to know
 
