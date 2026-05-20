@@ -88,6 +88,11 @@ export class JsonRpcWS {
   private nextId: JsonRpcId = 1;
   private readonly pending = new Map<JsonRpcId, Pending>();
   private readonly subscribers = new Set<NotificationHandler>();
+  // Callbacks fired AFTER `auth.hello` is sent on each fresh socket
+  // (both the first connect and any reconnect). Lets caller modules
+  // re-fetch session-static data the engine might have changed on
+  // restart (e.g. `engine.session_info` feature flags).
+  private readonly openListeners = new Set<() => void>();
   private backoffMs: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private closedByUser = false;
@@ -166,6 +171,23 @@ export class JsonRpcWS {
     };
   }
 
+  /**
+   * Register a callback to fire after every socket open + auth
+   * handshake (both the initial connect and any reconnect). The
+   * intended use is re-fetching session-static state the engine
+   * might have changed on restart — `engine.session_info` flags,
+   * `engine.list_output_devices`, etc.
+   *
+   * Caller exceptions are caught + logged but don't disrupt other
+   * listeners or the auth flow.
+   */
+  public onOpen(cb: () => void): Unsubscribe {
+    this.openListeners.add(cb);
+    return (): void => {
+      this.openListeners.delete(cb);
+    };
+  }
+
   private allocId(): JsonRpcId {
     const id = this.nextId;
     this.nextId += 1;
@@ -202,6 +224,18 @@ export class JsonRpcWS {
     });
     if (this.socket) {
       this.socket.send(JSON.stringify(auth));
+    }
+    // Fire reconnect listeners AFTER the auth send. Caller exceptions
+    // don't disrupt other listeners or the connect flow — each is
+    // wrapped in try/catch with a console.error so a misbehaving
+    // subscriber can't silently kill the dispatch.
+    for (const cb of this.openListeners) {
+      try {
+        cb();
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error("JsonRpcWS onOpen listener threw:", err);
+      }
     }
   }
 
@@ -240,6 +274,16 @@ export class JsonRpcWS {
 
   private handleClose(): void {
     this.socket = null;
+    // Reject any pending calls — the socket is dead, the server's
+    // never going to deliver a response. Without this, a caller
+    // awaiting `client.call(...)` when the engine restarts hangs
+    // forever, AND store-level "in flight" guards
+    // (`sessionInfo.fetchInFlight`) latch on, blocking future
+    // refetches even after reconnect (Codex #207 R1 P1 finding).
+    for (const p of this.pending.values()) {
+      p.reject(new Error("connection closed"));
+    }
+    this.pending.clear();
     if (this.closedByUser) return;
     // Schedule reconnect with exponential backoff capped at maxBackoffMs.
     const delay = Math.min(this.backoffMs, this.maxBackoffMs);

@@ -167,4 +167,75 @@ describe("JsonRpcWS", () => {
     vi.advanceTimersByTime(60_000);
     expect(MockWS.instances.length).toBe(2);
   });
+
+  it("onOpen subscribers fire on initial connect AND on reconnect", () => {
+    const factory = makeFactory();
+    const c = new JsonRpcWS({
+      url: "ws://test/ws",
+      factory,
+      initialBackoffMs: 100,
+    });
+    let callCount = 0;
+    const unsub = c.onOpen((): void => {
+      callCount += 1;
+    });
+    c.connect();
+    MockWS.instances[0]!.open();
+    expect(callCount).toBe(1);
+
+    MockWS.instances[0]!.close();
+    vi.advanceTimersByTime(150);
+    MockWS.instances[1]!.open();
+    expect(callCount).toBe(2);
+
+    unsub();
+    MockWS.instances[1]!.close();
+    vi.advanceTimersByTime(300);
+    MockWS.instances[2]!.open();
+    expect(callCount).toBe(2);
+
+    c.close();
+  });
+
+  it("pending call() rejects on server-side socket close (Codex #207 R1)", async () => {
+    // Regression for the "fetchInFlight latches on after disconnect"
+    // bug Codex caught on #207 R1. The store-level in-flight guard
+    // (sessionInfo.fetchInFlight) only clears in the `finally` block
+    // of the await chain — if handleClose() doesn't reject pending
+    // calls, that finally never runs and future reconnects can't
+    // refetch.
+    const factory = makeFactory();
+    const c = new JsonRpcWS({ url: "ws://test/ws", factory });
+    c.connect();
+    MockWS.instances[0]!.open();
+    // Fire a call(), don't wait for response — the test forces a
+    // server-side close before any reply lands.
+    const inFlight = c.call("engine.session_info");
+    MockWS.instances[0]!.close();
+    // The promise must reject — otherwise the awaiter hangs forever.
+    await expect(inFlight).rejects.toThrow(/connection closed/);
+    c.close();
+  });
+
+  it("onOpen subscriber exception doesn't disrupt auth flow", () => {
+    // Suppress the expected console.error spam from the throwing
+    // listener so the test output stays clean.
+    const errSpy = vi.spyOn(console, "error").mockImplementation((): void => {});
+    const factory = makeFactory();
+    const c = new JsonRpcWS({ url: "ws://test/ws", factory });
+    c.onOpen((): void => {
+      throw new Error("flaky listener");
+    });
+    let second = 0;
+    c.onOpen((): void => {
+      second += 1;
+    });
+    c.connect();
+    MockWS.instances[0]!.open();
+    expect(second).toBe(1);
+    const sent = JSON.parse(MockWS.instances[0]!.sent[0]!);
+    expect(sent.method).toBe("auth.hello");
+    c.close();
+    errSpy.mockRestore();
+  });
 });
