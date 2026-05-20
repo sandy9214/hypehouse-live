@@ -457,7 +457,11 @@ def test_wake_now_short_circuits_long_backoff_wait(tmp_path: Path) -> None:
         )
 
         start = time.time()
-        daemon.wake_now()
+        # `skip_next_tick=False` keeps the original test contract —
+        # we want this test to assert the wake-from-backoff
+        # behavior, not the skip-redundant-tick path (which has its
+        # own dedicated test below).
+        daemon.wake_now(skip_next_tick=False)
         # Daemon should now wake, run the tick, and push the seeded
         # track to the InMemory client. Without wake_now, this would
         # take ~5s; with it, sub-second.
@@ -474,6 +478,78 @@ def test_wake_now_short_circuits_long_backoff_wait(tmp_path: Path) -> None:
         # 1.5s for thread + RPC latency on slow CI runners).
         assert elapsed < 1.5, (
             f"daemon woke too slowly: {elapsed:.2f}s — wake_now ineffective"
+        )
+    finally:
+        daemon.stop()
+
+
+def test_wake_now_default_skips_redundant_auto_tick(
+    tmp_path: Path,
+) -> None:
+    """`library.sync_now` runs an out-of-band `tick_once` then calls
+    `wake_now()`. The daemon's very next iteration would duplicate
+    the pull+push (Codex review note on #176). With the default
+    `skip_next_tick=True`, the daemon must instead consume the flag
+    and skip exactly one iteration's work, then run the iteration
+    after that normally.
+
+    The test uses a long `tick_seconds=60.0` so iterations don't
+    fire on their own — only the explicit `wake_now` calls drive
+    the daemon. That keeps the assertion deterministic.
+    """
+
+    class CountingClient:
+        def __init__(self) -> None:
+            self.list_tracks_calls = 0
+
+        def list_tracks(self, *, since_micros=0):  # noqa: ARG002
+            self.list_tracks_calls += 1
+            return []
+
+        def get_track(self, _id):
+            return None
+
+        def upsert_track(self, _t):
+            return None
+
+        def delete_track(self, _id):
+            return False
+
+    client = CountingClient()
+    daemon = SyncDaemon(client, tmp_path / "lib.db", tick_seconds=60.0)
+    daemon.start()
+    try:
+        # Settle: wait for the daemon to enter its first
+        # _wake.wait(60s).
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            if daemon.stats().next_sync_micros > 0:
+                break
+            time.sleep(0.01)
+        baseline = client.list_tracks_calls  # 0
+
+        # First wake: force a real tick (no skip). Counter should
+        # increment by 1.
+        daemon.wake_now(skip_next_tick=False)
+        # Give the daemon a moment to run the tick and re-enter
+        # _wake.wait.
+        for _ in range(50):
+            if client.list_tracks_calls > baseline:
+                break
+            time.sleep(0.02)
+        after_first = client.list_tracks_calls
+        assert after_first == baseline + 1
+
+        # Second wake: default skip_next_tick=True. The daemon
+        # should wake, see the flag, and skip the tick. Counter
+        # must NOT increment.
+        daemon.wake_now()
+        # Wait a window that's plenty long for a tick if one were
+        # to fire (it shouldn't), but well under the 60s cadence.
+        time.sleep(0.3)
+        after_skip = client.list_tracks_calls
+        assert after_skip == after_first, (
+            f"skip flag failed: counter went {after_first} -> {after_skip}"
         )
     finally:
         daemon.stop()
