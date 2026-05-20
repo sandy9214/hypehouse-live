@@ -129,6 +129,10 @@ export interface SyncStatus {
   last_pull_applied: number;
   last_push_pushed: number;
   last_tick_error: string;
+  /** Wall-clock micros of the next scheduled tick. `0` before the
+   * first tick. With backoff active, drifts out exponentially under
+   * sustained failures so the UI countdown reflects the real wait. */
+  next_sync_micros: number;
 }
 
 const DEFAULT_SYNC_STATUS: SyncStatus = {
@@ -140,6 +144,7 @@ const DEFAULT_SYNC_STATUS: SyncStatus = {
   last_pull_applied: 0,
   last_push_pushed: 0,
   last_tick_error: "",
+  next_sync_micros: 0,
 };
 
 const isSyncStatus = (v: unknown): v is SyncStatus => {
@@ -171,7 +176,28 @@ const normaliseSyncStatus = (v: unknown): SyncStatus => {
     last_pull_applied: num("last_pull_applied"),
     last_push_pushed: num("last_push_pushed"),
     last_tick_error: str("last_tick_error"),
+    next_sync_micros: num("next_sync_micros"),
   };
+};
+
+/**
+ * Format a "next sync in Xs" countdown from the daemon's planned
+ * `next_sync_micros` timestamp. `0` → empty string (caller hides the
+ * row entirely). Negative deltas (overdue ticks — daemon thread is
+ * lagging) render as "due" rather than a meaningless negative count.
+ */
+export const formatCountdownMicros = (
+  nextMicros: number,
+  nowMs: number = Date.now(),
+): string => {
+  if (!Number.isFinite(nextMicros) || nextMicros <= 0) return "";
+  const deltaMs = nextMicros / 1000 - nowMs;
+  if (deltaMs <= 0) return "due";
+  const s = Math.ceil(deltaMs / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const sRem = s % 60;
+  return sRem === 0 ? `${m}m` : `${m}m ${sRem}s`;
 };
 
 type SyncStatusListener = () => void;

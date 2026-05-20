@@ -49,6 +49,13 @@ class SyncStats:
     last_pull_applied: int = 0
     last_push_pushed: int = 0
     last_tick_error: str = ""
+    # Planned wall-clock time of the next scheduled tick. Set to
+    # `now + next_wait_seconds * 1_000_000` after each tick + each
+    # caught exception in the loop. `0` before the first tick (UI
+    # renders "—" then). With backoff (#169) the value drifts out
+    # exponentially under sustained failures — surfacing it lets
+    # operators see *when* the next try will actually happen.
+    next_sync_micros: int = 0
 
 DEFAULT_TICK_SECONDS = 60.0
 
@@ -200,6 +207,23 @@ class SyncDaemon:
                 or ""
             )
             with self._stats_lock:
+                if tick_error == "":
+                    self._consecutive_failures = 0
+                else:
+                    self._consecutive_failures += 1
+                # Compute next_sync_micros inside the same critical
+                # section that just updated _consecutive_failures so
+                # the schedule the UI sees is internally consistent.
+                # Inline `next_wait_seconds` math to avoid re-entering
+                # the lock.
+                if self._consecutive_failures <= 0:
+                    next_wait = self._tick
+                else:
+                    exponent = min(self._consecutive_failures, 16)
+                    next_wait = min(
+                        self._tick * (2 ** exponent), MAX_BACKOFF_SECONDS
+                    )
+                next_us = now_us + int(next_wait * 1_000_000)
                 self._stats = SyncStats(
                     last_pull_micros=now_us,
                     last_push_micros=now_us,
@@ -208,11 +232,8 @@ class SyncDaemon:
                     + pull_result.inserted_count,
                     last_push_pushed=push_result.pushed_count,
                     last_tick_error=tick_error,
+                    next_sync_micros=next_us,
                 )
-                if tick_error == "":
-                    self._consecutive_failures = 0
-                else:
-                    self._consecutive_failures += 1
         finally:
             library.close()
 
@@ -223,6 +244,32 @@ class SyncDaemon:
         """
         with self._stats_lock:
             return self._stats
+
+    def _record_failure(self) -> None:
+        """Bump `_consecutive_failures` and refresh `next_sync_micros`
+        in the stats snapshot. Used by the loop's exception arms when
+        `tick_once` raises before its own stats-update can run, so the
+        UI still sees the new backoff window.
+        """
+        with self._stats_lock:
+            self._consecutive_failures += 1
+            # Recompute next_wait without re-entering the public
+            # method (avoids a recursive lock acquisition).
+            exponent = min(self._consecutive_failures, 16)
+            next_wait = min(
+                self._tick * (2 ** exponent), MAX_BACKOFF_SECONDS
+            )
+            now_us = int(time.time() * 1_000_000)
+            prior = self._stats
+            self._stats = SyncStats(
+                last_pull_micros=prior.last_pull_micros,
+                last_push_micros=prior.last_push_micros,
+                last_pull_fetched=prior.last_pull_fetched,
+                last_pull_applied=prior.last_pull_applied,
+                last_push_pushed=prior.last_push_pushed,
+                last_tick_error=prior.last_tick_error,
+                next_sync_micros=now_us + int(next_wait * 1_000_000),
+            )
 
     def _loop(self) -> None:
         # Wait one tick BEFORE the first sync so we don't double up
@@ -238,8 +285,7 @@ class SyncDaemon:
                 self._log.warning(
                     "cloud sync: transport error during tick: %s", exc
                 )
-                with self._stats_lock:
-                    self._consecutive_failures += 1
+                self._record_failure()
             except sqlite3.Error as exc:
                 # Local-DB hiccup (lock contention with the main
                 # thread's writes, busy timeout, etc.). Recoverable —
@@ -250,8 +296,7 @@ class SyncDaemon:
                 self._log.warning(
                     "cloud sync: local DB error during tick: %s", exc
                 )
-                with self._stats_lock:
-                    self._consecutive_failures += 1
+                self._record_failure()
             except Exception as exc:  # noqa: BLE001
                 # Anything else is unexpected — log at ERROR so an
                 # operator tailing the log sees it. We still don't
@@ -265,8 +310,7 @@ class SyncDaemon:
                     exc,
                     exc_info=exc,
                 )
-                with self._stats_lock:
-                    self._consecutive_failures += 1
+                self._record_failure()
             # Light sleep avoids a tight error-loop on a misbehaving
             # client; the `Event.wait` above is the main pacing wait.
             time.sleep(0)

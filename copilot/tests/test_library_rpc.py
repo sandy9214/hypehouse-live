@@ -534,6 +534,7 @@ async def test_sync_status_empty_library(library: TrackLibrary):
     assert result["last_pull_micros"] == 0
     assert result["last_push_micros"] == 0
     assert result["last_tick_error"] == ""
+    assert result["next_sync_micros"] == 0
 
 
 @_asyncio
@@ -554,6 +555,7 @@ async def test_sync_status_includes_daemon_stats_when_wired(
                 last_pull_applied=5,
                 last_push_pushed=3,
                 last_tick_error="",
+                next_sync_micros=1_700_000_060_000_000,
             )
 
     handler = LibraryRpcHandler(library, sync_daemon=StubDaemon())
@@ -563,6 +565,7 @@ async def test_sync_status_includes_daemon_stats_when_wired(
     assert result["last_pull_applied"] == 5
     assert result["last_push_pushed"] == 3
     assert result["last_tick_error"] == ""
+    assert result["next_sync_micros"] == 1_700_000_060_000_000
 
 
 @_asyncio

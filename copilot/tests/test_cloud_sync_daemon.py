@@ -329,6 +329,59 @@ def test_tick_once_resets_consecutive_failures_on_success(
     assert daemon._consecutive_failures == 0  # noqa: SLF001
 
 
+def test_tick_once_sets_next_sync_micros_to_now_plus_base_tick(
+    tmp_path: Path,
+) -> None:
+    daemon = SyncDaemon(
+        InMemorySyncClient(), tmp_path / "lib.db", tick_seconds=60.0
+    )
+    before = int(time.time() * 1_000_000)
+    daemon.tick_once()
+    after = int(time.time() * 1_000_000)
+    s = daemon.stats()
+    # Clean tick → schedule = now + 60s. Wide slop tolerates wall-clock
+    # readings on either side of the tick.
+    expected_min = before + 59_900_000
+    expected_max = after + 60_100_000
+    assert expected_min <= s.next_sync_micros <= expected_max
+
+
+def test_tick_once_with_failures_pushes_next_sync_out(
+    tmp_path: Path,
+) -> None:
+    class FlakyPullClient:
+        def list_tracks(self, *, since_micros=0):  # noqa: ARG002
+            from copilot.cloud_sync.client import SyncError
+
+            raise SyncError("HTTP 503")
+
+        def get_track(self, _id):
+            return None
+
+        def upsert_track(self, _t):
+            return None
+
+        def delete_track(self, _id):
+            return False
+
+    daemon = SyncDaemon(
+        FlakyPullClient(), tmp_path / "lib.db", tick_seconds=60.0
+    )
+    daemon.tick_once()
+    s1 = daemon.stats()
+    now1 = int(time.time() * 1_000_000)
+    delta1 = s1.next_sync_micros - now1
+    # 1 failure → next_wait = 60 * 2 = 120s.
+    assert 119_000_000 <= delta1 <= 121_000_000
+
+    daemon.tick_once()
+    s2 = daemon.stats()
+    now2 = int(time.time() * 1_000_000)
+    delta2 = s2.next_sync_micros - now2
+    # 2 failures → 60 * 4 = 240s.
+    assert 239_000_000 <= delta2 <= 241_000_000
+
+
 def test_consecutive_failures_mutation_is_lock_protected(
     tmp_path: Path,
 ) -> None:

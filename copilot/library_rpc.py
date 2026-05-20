@@ -399,6 +399,7 @@ class LibraryRpcHandler:
                     "last_pull_applied": int(stats.last_pull_applied),
                     "last_push_pushed": int(stats.last_push_pushed),
                     "last_tick_error": str(stats.last_tick_error),
+                    "next_sync_micros": int(stats.next_sync_micros),
                 }
             )
         else:
@@ -410,6 +411,7 @@ class LibraryRpcHandler:
                     "last_pull_applied": 0,
                     "last_push_pushed": 0,
                     "last_tick_error": "",
+                    "next_sync_micros": 0,
                 }
             )
         return out
