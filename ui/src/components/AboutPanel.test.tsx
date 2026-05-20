@@ -566,6 +566,32 @@ describe("AboutPanel", () => {
     expect(badge.textContent).toBe("offline");
   });
 
+  it("renders 'reconnect' button alongside offline badge", () => {
+    __setConnectionState("closed");
+    render(<AboutPanel client={makeClient()} />);
+    expect(screen.getByTestId("about-reconnect-now")).toBeTruthy();
+  });
+
+  it("clicking 'reconnect' calls client.reconnectNow() if exposed", () => {
+    __setConnectionState("closed");
+    const reconnectNow = vi.fn();
+    const client = {
+      call: vi.fn().mockResolvedValue({}),
+      reconnectNow,
+    } as unknown as JsonRpcWS;
+    render(<AboutPanel client={client} />);
+    fireEvent.click(screen.getByTestId("about-reconnect-now"));
+    expect(reconnectNow).toHaveBeenCalledTimes(1);
+  });
+
+  it("clicking 'reconnect' is a no-op when client lacks reconnectNow", () => {
+    __setConnectionState("closed");
+    render(<AboutPanel client={makeClient()} />);
+    expect((): void => {
+      fireEvent.click(screen.getByTestId("about-reconnect-now"));
+    }).not.toThrow();
+  });
+
   it("hides 'offline' badge when WS connection is open", () => {
     __setConnectionState("open");
     render(<AboutPanel client={makeClient()} />);

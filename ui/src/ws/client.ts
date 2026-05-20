@@ -71,6 +71,7 @@ interface Pending {
   reject: (err: Error) => void;
 }
 
+const READY_CONNECTING = 0;
 const READY_OPEN = 1;
 
 /**
@@ -117,7 +118,19 @@ export class JsonRpcWS {
   /** Open the socket; safe to call multiple times. */
   public connect(): void {
     this.closedByUser = false;
-    if (this.socket && this.socket.readyState === READY_OPEN) return;
+    // Short-circuit both OPEN and CONNECTING so a rapid second
+    // call (e.g. operator double-clicking the "reconnect" button)
+    // doesn't open a second socket and break the single-socket
+    // invariant — stale onopen/onclose handlers on the prior
+    // socket would otherwise mutate `this.socket` after the new
+    // socket landed (Codex #216 R1 P1 finding).
+    if (
+      this.socket &&
+      (this.socket.readyState === READY_OPEN ||
+        this.socket.readyState === READY_CONNECTING)
+    ) {
+      return;
+    }
     const ws = this.factory(this.url);
     this.socket = ws;
     ws.onopen = (): void => this.handleOpen();
@@ -228,6 +241,23 @@ export class JsonRpcWS {
    */
   public isOpen(): boolean {
     return this.socket?.readyState === READY_OPEN;
+  }
+
+  /**
+   * Short-circuit the reconnect backoff and try to open the socket
+   * immediately. Used by the AboutPanel offline-chip's "Reconnect"
+   * button. If a pending reconnect timer is armed, it's cleared
+   * first so we don't open twice when the timer fires. Backoff
+   * state is reset so the next failure starts at the initial
+   * cadence (matches the post-clean-tick reset in the sync daemon).
+   */
+  public reconnectNow(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.backoffMs = this.initialBackoffMs;
+    this.connect();
   }
 
   private allocId(): JsonRpcId {
