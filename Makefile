@@ -8,7 +8,7 @@
 #   * node + npm (for the UI)
 #   * `cargo install tauri-cli@2` once per workstation for `dev-tauri` / `build-tauri`.
 
-.PHONY: help build-engine build-ui dev-tauri build-tauri test-engine test-tauri test-ui clean bake-in bake-in-tests
+.PHONY: help build-engine build-ui dev-tauri build-tauri test-engine test-tauri test-ui clean bake-in bake-in-tests supabase-print
 
 # v0.2 bake-in defaults — 25-minute sanity run. Bump DURATION_MIN=240
 # for the four-hour soak the release checklist demands.
@@ -30,6 +30,7 @@ help:
 	@echo "  make bake-in        — full synthetic bake-in (default 25 min)"
 	@echo "  make bake-in DURATION_MIN=240   — full 4-hour soak"
 	@echo "  make bake-in-tests  — pytest the bake-in harness scripts only"
+	@echo "  make supabase-print — print cloud-sync schema migrations + setup steps"
 	@echo "  make clean          — clean cargo + node build artifacts"
 
 build-engine:
@@ -84,3 +85,10 @@ bake-in: build-engine
 # engine or run the bake itself. Fast (< 5 s) and safe to wire into CI.
 bake-in-tests:
 	$(PYTHON) -m pytest scripts/bake_in/tests -q
+
+# Print cloud-sync migrations + paste-ready setup instructions. Used
+# by operators who don't have the supabase CLI installed — pipe to
+# `pbcopy` (macOS) / `wl-copy` (Linux) then paste into the project's
+# SQL editor. See docs/cloud-sync.md for the full guide.
+supabase-print:
+	$(PYTHON) scripts/print_supabase_migrations.py
