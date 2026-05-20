@@ -554,15 +554,18 @@ class TrackLibrary:
         their original `queued_at_micros` ordering. Returns the new
         total count of queued rows (caller surfaces this to the UI).
         """
+        # SQLite's `cursor.rowcount` after INSERT OR IGNORE is
+        # platform-dependent (Python's `sqlite3` reports the number
+        # of rows the INSERT *would have* inserted, including
+        # ignored ones, on some versions). Read the canonical count
+        # off the table instead.
         now_us = _now_micros()
-        cur = self._conn.execute(
+        self._conn.execute(
             "INSERT OR IGNORE INTO pending_push (track_id, queued_at_micros) "
             "SELECT track_id, ? FROM tracks",
             (now_us,),
         )
         self._conn.commit()
-        _ = cur  # the rowcount post-INSERT-OR-IGNORE is platform-
-        # dependent under SQLite; read the canonical count instead.
         return self._conn.execute(
             "SELECT COUNT(*) FROM pending_push"
         ).fetchone()[0]

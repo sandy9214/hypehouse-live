@@ -334,10 +334,20 @@ class LibraryRpcHandler:
         single SQLite statement (`INSERT OR IGNORE` preserves any
         existing `queued_at_micros` order).
 
+        Also wakes the sync daemon (best-effort) so the freshly
+        filled queue starts draining immediately rather than sitting
+        until the daemon's prior `_stop.wait` — possibly a long
+        backoff window — expires. Matches the pattern used by
+        `library.sync_now`.
+
         Returns the resulting pending-push count so the UI can pop a
         confirmation toast ("N tracks queued for sync").
         """
         queued = self._library.requeue_all_for_push()
+        if self._sync_daemon is not None:
+            wake = getattr(self._sync_daemon, "wake_now", None)
+            if callable(wake):
+                wake()
         return {"queued": int(queued)}
 
     def _list_pending_push(

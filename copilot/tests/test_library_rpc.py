@@ -778,6 +778,49 @@ async def test_requeue_all_pending_empty_library(library: TrackLibrary):
 
 
 @_asyncio
+async def test_requeue_all_pending_calls_wake_now_when_daemon_wired(
+    library: TrackLibrary,
+):
+    """Mirror of test_sync_now_calls_wake_now_after_tick — the
+    operator's expectation is that the daemon starts draining the
+    freshly filled queue right away, not after the pending backoff
+    wait expires (Codex #179 R1)."""
+    from copilot.cloud_sync import SyncStats
+
+    class StubDaemon:
+        def __init__(self) -> None:
+            self.wake_calls = 0
+
+        def wake_now(self) -> None:
+            self.wake_calls += 1
+
+        def stats(self) -> SyncStats:
+            return SyncStats()
+
+    _seed(library)
+    daemon = StubDaemon()
+    handler = LibraryRpcHandler(library, sync_daemon=daemon)
+    await handler.dispatch("library.requeue_all_pending", {})
+    assert daemon.wake_calls == 1, (
+        "requeue_all_pending must call wake_now so the daemon starts "
+        "draining the freshly filled queue"
+    )
+
+
+@_asyncio
+async def test_requeue_all_pending_runs_without_daemon(
+    library: TrackLibrary,
+):
+    """No daemon wired (test path / local-only mode): RPC must still
+    enqueue without raising. Symmetric with sync_now's tolerance for
+    missing-wake-now (in-place upgrade safety)."""
+    _seed(library)
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.requeue_all_pending", {})
+    assert result == {"queued": 5}
+
+
+@_asyncio
 async def test_requeue_all_pending_seeds_pre_cloud_sync_library(
     library: TrackLibrary,
 ):
