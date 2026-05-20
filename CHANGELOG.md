@@ -83,6 +83,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `library.requeue_all_pending` and pops an auto-dismissing
   "N queued for sync" toast. Errors land in the shared
   `about-sync-error` region. Auto-dismiss after 4s (#181).
+- **"Pending sync only" filter chip in Library** — client-side
+  toggle that narrows visible rows to tracks in the polled
+  pending-push set. `LibraryFilters` gains the checkbox + chip,
+  `Library.tsx` post-filters via `usePendingPushIds`. Empty-state
+  renders the specific "No tracks are pending cloud sync." message
+  when the filter is on and the query is empty (#187).
+
+### Added — Tooling / scripts
+- **`scripts/cloud_sync_status.py`** — stdlib-only ops-monitoring
+  CLI. Opens the library SQLite DB read-only and prints
+  `library_track_count` + `pending_push_count` (`--json` for machine
+  output). Default path matches `copilot/main.py`
+  (`~/.hypehouse-live/library.db`, overridable via
+  `$HYPEHOUSE_LIBRARY_DB`). Tolerates pre-v11 schemas. New Makefile
+  target `cloud-sync-status` (accepts `DB=...` override). Useful for
+  cron / launchd alerts when the daemon stops draining (#189).
 
 ### Changed
 - `SyncDaemon` exception handling narrowed: `SyncError` /
@@ -105,6 +121,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replaces GH issue #93 as the source of truth. Covers Audio /
   Engine / Bridge / Co-pilot / Cloud sync / UI / Telemetry. README
   link updated; release notes link updated (#177).
+- Refreshed `copilot/cloud_sync/__init__.py` module docstring —
+  dropped the stale "Issue #102 scaffold (slice 1)" + "outbound
+  queue is stubbed" lines; folded in `SyncDaemon`,
+  `SupabaseSyncClient.from_env`, local-side schema mirror notes,
+  and the RLS / multi-user posture (#190).
 
 ## [0.1.0] — 2026-05-19
 
