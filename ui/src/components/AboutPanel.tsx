@@ -23,6 +23,7 @@ import {
   requeueAllPending,
   syncNow,
   useSessionInfo,
+  useStemsStatus,
   useSyncStatus,
   type SessionFeatures,
 } from "../store/sessionInfo";
@@ -141,6 +142,7 @@ const FEATURE_LABELS: ReadonlyArray<[keyof SessionFeatures, string]> = [
 export const AboutPanel = ({ client }: AboutPanelProps): JSX.Element => {
   const info = useSessionInfo(client);
   const sync = useSyncStatus(client);
+  const stems = useStemsStatus(client);
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string>("");
   // Re-render once per second so the countdown ticks down without
@@ -282,6 +284,16 @@ export const AboutPanel = ({ client }: AboutPanelProps): JSX.Element => {
           {sync.last_push_pushed > 0
             ? ` · ↑ ${sync.last_push_pushed} pushed`
             : ""}
+        </div>
+      ) : null}
+      {stems.ready + stems.pending + stems.failed > 0 ? (
+        <div style={rowStyle}>
+          <span style={labelStyle}>Stems</span>
+          <span style={valueStyle} data-testid="about-stems-status">
+            {stems.ready} ready
+            {stems.pending > 0 ? ` · ${stems.pending} pending` : ""}
+            {stems.failed > 0 ? ` · ${stems.failed} failed` : ""}
+          </span>
         </div>
       ) : null}
       <div style={flagsRowStyle} data-testid="about-flags">
