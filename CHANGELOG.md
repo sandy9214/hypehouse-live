@@ -137,6 +137,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queue is stubbed" lines; folded in `SyncDaemon`,
   `SupabaseSyncClient.from_env`, local-side schema mirror notes,
   and the RLS / multi-user posture (#190).
+- Refreshed **copilot/README.md** with the cloud-sync surface —
+  added env-var rows (`SUPABASE_URL` / `SUPABASE_ANON_KEY` /
+  `HYPEHOUSE_SYNC_TICK_SECONDS` / `HYPEHOUSE_TELEMETRY_ENABLED`)
+  and a new "Cloud library sync (#102)" section listing the 5 new
+  `library.*` RPC methods + cross-links to the operator setup
+  guide. Outdated "Library schema is minimal" limitation removed
+  (#199).
+- Cataloged the 5 new `library.*` methods in
+  **docs/api/ws-protocol.md** — full params / result / error
+  envelopes for the four cloud-sync RPCs (`library.sync_status`,
+  `library.sync_now`, `library.list_pending_push`,
+  `library.requeue_all_pending`) plus the stems-status aggregate
+  (`library.stems_status`) (#200).
 
 ## [0.1.0] — 2026-05-19
 
