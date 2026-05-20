@@ -100,6 +100,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `N ready · M pending · K failed` when any non-zero. Hidden in the
   steady "nothing computed yet" state to keep the panel quiet
   (#197).
+- **`engine.session_info` refetch on WS reconnect** — new
+  `JsonRpcWS.onOpen(cb)` subscriber hook fires after every
+  successful `auth.hello` (initial connect + every reconnect);
+  `useSessionInfo` uses it to call `refetchSessionInfo(client)` so
+  the AboutPanel feature-flag chips, engine version, and active
+  audio sink reflect the engine's *current* env after a restart.
+  Listener exceptions caught + logged so a flaky subscriber can't
+  break auth or other listeners. Tolerates older WS clients
+  lacking `onOpen` via the same typeof check as `wake_now` (#207).
 
 ### Added — Tooling / scripts
 - **`scripts/cloud_sync_status.py`** — stdlib-only ops-monitoring
@@ -122,6 +131,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `skip_next_tick=False` so its freshly filled queue gets drained
   on the daemon's next iteration. Flag overwrites on every call so
   the latest caller's intent wins (#184).
+
+### Fixed
+- **WS client: pending calls now reject on server-side socket
+  close.** `JsonRpcWS.handleClose()` previously only nulled the
+  socket; pending calls hung forever and store-level in-flight
+  guards latched on, blocking refetches even after reconnect.
+  `handleClose` now mirrors the user-initiated `close()` reject
+  path (Codex #207 R1 P1 finding).
 
 ### Docs
 - New **docs/cloud-sync.md** — operator setup, verification surface,
