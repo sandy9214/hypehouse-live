@@ -122,20 +122,56 @@ export const useSessionInfo = (client: JsonRpcWS): SessionInfo => {
 export interface SyncStatus {
   pending_push_count: number;
   library_track_count: number;
+  /** Wall-clock micros — `0` before the daemon's first successful tick. */
+  last_pull_micros: number;
+  last_push_micros: number;
+  last_pull_fetched: number;
+  last_pull_applied: number;
+  last_push_pushed: number;
+  last_tick_error: string;
 }
 
 const DEFAULT_SYNC_STATUS: SyncStatus = {
   pending_push_count: 0,
   library_track_count: 0,
+  last_pull_micros: 0,
+  last_push_micros: 0,
+  last_pull_fetched: 0,
+  last_pull_applied: 0,
+  last_push_pushed: 0,
+  last_tick_error: "",
 };
 
 const isSyncStatus = (v: unknown): v is SyncStatus => {
   if (!v || typeof v !== "object") return false;
   const o = v as Record<string, unknown>;
+  // Pre-stats-fold engines (#155-era) ship just the two counts;
+  // accept that shape and fill defaults so the UI doesn't break
+  // during an in-place upgrade. The full shape arrives once #157+
+  // copilot is deployed.
   return (
     typeof o.pending_push_count === "number" &&
     typeof o.library_track_count === "number"
   );
+};
+
+const normaliseSyncStatus = (v: unknown): SyncStatus => {
+  if (!isSyncStatus(v)) return DEFAULT_SYNC_STATUS;
+  const o = v as unknown as Record<string, unknown>;
+  const num = (k: string): number =>
+    typeof o[k] === "number" ? (o[k] as number) : 0;
+  const str = (k: string): string =>
+    typeof o[k] === "string" ? (o[k] as string) : "";
+  return {
+    pending_push_count: num("pending_push_count"),
+    library_track_count: num("library_track_count"),
+    last_pull_micros: num("last_pull_micros"),
+    last_push_micros: num("last_push_micros"),
+    last_pull_fetched: num("last_pull_fetched"),
+    last_pull_applied: num("last_pull_applied"),
+    last_push_pushed: num("last_push_pushed"),
+    last_tick_error: str("last_tick_error"),
+  };
 };
 
 type SyncStatusListener = () => void;
@@ -172,15 +208,34 @@ export const fetchSyncStatus = async (
 ): Promise<SyncStatus> => {
   try {
     const result = await client.call<unknown>("library.sync_status");
-    if (isSyncStatus(result)) {
-      __setSyncStatus(result);
-    } else {
-      __setSyncStatus(DEFAULT_SYNC_STATUS);
-    }
+    __setSyncStatus(normaliseSyncStatus(result));
   } catch {
     __setSyncStatus(DEFAULT_SYNC_STATUS);
   }
   return syncStatus;
+};
+
+/**
+ * Format a wall-clock micros timestamp as a relative "X ago" string.
+ * `0` → "never". Otherwise "Xs ago" / "Xm ago" / "Xh ago" / "Xd ago"
+ * depending on the magnitude — same convention as GitHub timestamps.
+ */
+export const formatRelativeMicros = (
+  micros: number,
+  nowMs: number = Date.now(),
+): string => {
+  if (!Number.isFinite(micros) || micros <= 0) return "never";
+  const deltaMs = nowMs - micros / 1000;
+  if (deltaMs < 0) return "just now"; // clock skew between engine + UI
+  const s = Math.floor(deltaMs / 1000);
+  if (s < 5) return "just now";
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  return `${d}d ago`;
 };
 
 /** Hook — fetches once on mount; polls every `refreshMs` while hooked. */

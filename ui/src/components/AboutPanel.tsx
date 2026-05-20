@@ -13,6 +13,7 @@
 import type { CSSProperties, JSX } from "react";
 import type { JsonRpcWS } from "../ws/client";
 import {
+  formatRelativeMicros,
   useSessionInfo,
   useSyncStatus,
   type SessionFeatures,
@@ -120,6 +121,15 @@ export const AboutPanel = ({ client }: AboutPanelProps): JSX.Element => {
           {sync.library_track_count} tracks
           {sync.pending_push_count > 0
             ? ` · ${sync.pending_push_count} pending sync`
+            : ""}
+        </span>
+      </div>
+      <div style={rowStyle}>
+        <span style={labelStyle}>Last sync</span>
+        <span style={valueStyle} data-testid="about-last-sync">
+          {formatRelativeMicros(sync.last_pull_micros)}
+          {sync.last_tick_error !== ""
+            ? ` · ${sync.last_tick_error}`
             : ""}
         </span>
       </div>
