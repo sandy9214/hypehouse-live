@@ -237,6 +237,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`DeckLoad` + `DeckLoadStems` via `DecodeService::open` /
   `open_stems`) and mid-stream paths. Codex R1 + R2 each caught a
   missing path; R3 final state mirrors across both surfaces (#220).
+- Added a **"Client caching" paragraph** to each of the four
+  session-static / process-static RPC sections in
+  `docs/api/ws-protocol.md` (`engine.session_info` /
+  `engine.list_output_devices` / `engine.list_effects` /
+  `engine.list_sessions`). External integrators now have explicit
+  guidance that the payload can change across engine restarts
+  (env flip, dev rebuild, USB plug, log retention pruning) and
+  that clients MUST refetch on every reconnect. Each section
+  cross-links the in-repo TS implementation as the canonical
+  pattern. Codex R1 caught an "append-only" overstatement on the
+  sessions section; R2 widened to cover retention-pruned removals
+  too (#226).
 
 ## [0.1.0] — 2026-05-19
 
