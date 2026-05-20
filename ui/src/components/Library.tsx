@@ -247,7 +247,9 @@ export const Library = ({
         )}
         {showNoMatches && (
           <div style={emptyBoxStyle} data-testid="library-no-matches">
-            No tracks match &quot;{query}&quot;.
+            {filters.pendingSyncOnly && query.trim() === ""
+              ? "No tracks are pending cloud sync."
+              : `No tracks match "${query}".`}
           </div>
         )}
         {visible.map(

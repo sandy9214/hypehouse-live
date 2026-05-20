@@ -244,6 +244,34 @@ describe("Library", () => {
     });
   });
 
+  it("pendingSyncOnly empty-state renders the specific message", async (): Promise<void> => {
+    const tracks = [makeTrack("alpha"), makeTrack("bravo")];
+    const client = { call: vi.fn<Call>(async (m: string) => {
+      if (m === "library.list_tracks") {
+        return { tracks, total: tracks.length, limit: 100, offset: 0 };
+      }
+      if (m === "library.list_pending_push") return { ids: [] };
+      return null;
+    }) } as unknown as JsonRpcWS;
+    render(<Library client={client} />);
+    await waitFor((): void => {
+      expect(screen.getByTestId("track-row-alpha")).toBeTruthy();
+    });
+    act((): void => {
+      __setPendingPushIds([]);
+      setLibraryFilters({
+        bpmMin: null,
+        bpmMax: null,
+        compatibleWithTrackId: null,
+        pendingSyncOnly: true,
+      });
+    });
+    await waitFor((): void => {
+      const empty = screen.getByTestId("library-no-matches");
+      expect(empty.textContent).toBe("No tracks are pending cloud sync.");
+    });
+  });
+
   it("pendingSyncOnly filter narrows visible rows to the pending set", async (): Promise<void> => {
     const tracks = [
       makeTrack("alpha"),
