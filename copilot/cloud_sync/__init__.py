@@ -21,8 +21,13 @@ Layers
   fixed cadence (``HYPEHOUSE_SYNC_TICK_SECONDS``, default 60s) with
   exponential backoff on consecutive failures, capped at
   :data:`MAX_BACKOFF_SECONDS` (10 min). ``wake_now`` lets RPC handlers
-  short-circuit a long backoff wait after an out-of-band tick (see
-  ``library.sync_now`` and ``library.requeue_all_pending``).
+  short-circuit a long backoff wait after manual sync work or newly
+  queued push work — ``library.sync_now`` (after its out-of-band
+  ``tick_once``) calls ``wake_now(skip_next_tick=True)`` so the
+  daemon skips a redundant duplicate tick, while
+  ``library.requeue_all_pending`` (no manual tick) calls
+  ``wake_now(skip_next_tick=False)`` so the daemon's next iteration
+  actually drains the freshly enqueued rows.
 
 Schema
 ------
