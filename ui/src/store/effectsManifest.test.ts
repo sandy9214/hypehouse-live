@@ -6,6 +6,7 @@ import type { JsonRpcWS } from "../ws/client";
 import {
   __resetEffectsManifest,
   fetchEffectsManifest,
+  refetchEffectsManifest,
 } from "./effectsManifest";
 
 describe("effectsManifest store", () => {
@@ -48,5 +49,29 @@ describe("effectsManifest store", () => {
     const client = { call } as unknown as JsonRpcWS;
     const m = await fetchEffectsManifest(client);
     expect(m).toEqual([]);
+  });
+
+  it("refetchEffectsManifest bypasses the cache (forces a fresh RPC)", async (): Promise<void> => {
+    let calls = 0;
+    const call = vi.fn(async (): Promise<unknown> => {
+      calls += 1;
+      // Match the real wire shape declared by EffectManifestEntry:
+      // `{ id, name, params }` (NOT `display_name`). A future
+      // stricter type guard would reject the wrong-shape variant.
+      return {
+        effects: calls === 1
+          ? [{ id: "lowpass", name: "Lowpass", params: [] }]
+          : [
+              { id: "lowpass", name: "Lowpass", params: [] },
+              { id: "reverb", name: "Reverb", params: [] },
+            ],
+      };
+    });
+    const client = { call } as unknown as JsonRpcWS;
+    const first = await fetchEffectsManifest(client);
+    expect(first).toHaveLength(1);
+    const second = await refetchEffectsManifest(client);
+    expect(second).toHaveLength(2);
+    expect(calls).toBe(2);
   });
 });
