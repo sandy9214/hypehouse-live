@@ -27,6 +27,7 @@ import {
   useSyncStatus,
   type SessionFeatures,
 } from "../store/sessionInfo";
+import { useConnection } from "../store/connection";
 
 export interface AboutPanelProps {
   readonly client: JsonRpcWS;
@@ -143,6 +144,7 @@ export const AboutPanel = ({ client }: AboutPanelProps): JSX.Element => {
   const info = useSessionInfo(client);
   const sync = useSyncStatus(client);
   const stems = useStemsStatus(client);
+  const conn = useConnection(client);
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string>("");
   // Re-render once per second so the countdown ticks down without
@@ -208,8 +210,29 @@ export const AboutPanel = ({ client }: AboutPanelProps): JSX.Element => {
     <div style={containerStyle} data-testid="about-panel">
       <div style={rowStyle}>
         <span style={labelStyle}>Engine</span>
-        <span style={valueStyle} data-testid="about-version">
-          v{versionLabel}
+        <span
+          style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}
+        >
+          <span style={valueStyle} data-testid="about-version">
+            v{versionLabel}
+          </span>
+          {conn === "closed" ? (
+            <span
+              data-testid="about-engine-offline"
+              title="WebSocket disconnected — reconnecting…"
+              style={{
+                background: "#3a1a1a",
+                color: "#f3c8c8",
+                border: "1px solid #5a2a2a",
+                borderRadius: 3,
+                padding: "0 6px",
+                fontSize: "0.7rem",
+                letterSpacing: 0.5,
+              }}
+            >
+              offline
+            </span>
+          ) : null}
         </span>
       </div>
       <div style={rowStyle}>

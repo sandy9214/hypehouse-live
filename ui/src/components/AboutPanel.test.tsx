@@ -11,6 +11,10 @@ import {
 } from "@testing-library/react";
 import { AboutPanel } from "./AboutPanel";
 import {
+  __resetConnectionState,
+  __setConnectionState,
+} from "../store/connection";
+import {
   __resetSessionInfo,
   __resetStemsStatus,
   __resetSyncStatus,
@@ -47,6 +51,7 @@ describe("AboutPanel", () => {
     __resetSessionInfo();
     __resetSyncStatus();
     __resetStemsStatus();
+    __resetConnectionState();
   });
   afterEach((): void => {
     cleanup();
@@ -552,6 +557,19 @@ describe("AboutPanel", () => {
     expect(screen.getByTestId("about-stems-status").textContent).toBe(
       "5 ready · 2 pending · 1 failed",
     );
+  });
+
+  it("renders 'offline' badge when WS connection is closed", () => {
+    __setConnectionState("closed");
+    render(<AboutPanel client={makeClient()} />);
+    const badge = screen.getByTestId("about-engine-offline");
+    expect(badge.textContent).toBe("offline");
+  });
+
+  it("hides 'offline' badge when WS connection is open", () => {
+    __setConnectionState("open");
+    render(<AboutPanel client={makeClient()} />);
+    expect(screen.queryByTestId("about-engine-offline")).toBeNull();
   });
 
   it("renders all 7 feature flags", () => {
