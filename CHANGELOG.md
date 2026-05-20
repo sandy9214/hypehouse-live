@@ -207,6 +207,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `next_sync_micros`), alternatives considered (`supabase-py` SDK
   / direct `psycopg` / CRDT / LISTEN/NOTIFY), and consequences
   positive + negative (#203).
+- Replaced literal `#TODO` placeholder in `copilot/stems.py`
+  module docstring with concrete cross-references to the shipped
+  stems RPC surface + AboutPanel row (#218).
+- Refreshed `ui/src/store/notifications.ts` header comment —
+  dropped the stale "PR #29 follow-up TODO" framing; now documents
+  both `engine.decode_error` emission paths (open-time via
+  `event_to_commands_with_errors` + mid-stream via
+  `decode_drain.rs`). Codex R1 caught the missing mid-stream
+  path; R2 fix covers both (#219).
 
 ## [0.1.0] — 2026-05-19
 
