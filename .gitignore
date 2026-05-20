@@ -9,6 +9,10 @@
 /ui/node_modules/
 /ui/dist/
 /ui/.vite/
+# Catch-all so any stray `npm install` (from the repo root, or
+# inside a subdir we haven't carved out) doesn't sneak deps into
+# the tree.
+**/node_modules/
 
 # Python (copilot service)
 /copilot/__pycache__/
@@ -27,8 +31,12 @@
 .env
 .env.local
 
-# Claude worktrees
+# Claude worktrees + per-directory `.claude/` artifacts (settings,
+# session checkpoints, agent caches). These are per-user / per-env
+# state — never want them tracked.
 .claude/worktrees/
+.claude/
+**/.claude/
 
 # Test artifacts
 *.log
