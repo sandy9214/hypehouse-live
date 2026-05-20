@@ -249,6 +249,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pattern. Codex R1 caught an "append-only" overstatement on the
   sessions section; R2 widened to cover retention-pruned removals
   too (#226).
+- **Makefile: `test-copilot` target** — `PYTHONPATH=. python3 -m
+  pytest copilot/tests/ -q`. Mirrors `test-engine` / `test-ui` /
+  `test-tauri` so the Python copilot service has the same
+  thin-wrapper Make entrypoint as the Rust + TypeScript subtrees.
+  Used as the last gate before opening any PR that touches
+  `copilot/` (#228).
+- **Makefile: aggregate `test` target** — runs `test-engine` →
+  `test-ui` → `test-tauri` → `test-copilot` in sequence with
+  fast-fail on first non-zero exit. Convenient pre-merge gate;
+  can replace the four per-suite calls in CI (#229).
 
 ## [0.1.0] — 2026-05-19
 
