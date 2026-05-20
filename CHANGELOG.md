@@ -124,6 +124,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lands. The hook initializes from `client.isOpen()` in BOTH
   directions on mount so the global singleton doesn't carry stale
   state across remount (Codex #213 R1 note) (#213).
+- **"Reconnect" button on the offline badge** — new
+  `JsonRpcWS.reconnectNow()` clears any pending reconnect timer,
+  resets backoff state to the initial cadence, and calls
+  `connect()`. AboutPanel offline chip gains a small `reconnect`
+  button next to it. `connect()` now short-circuits when an
+  existing socket is in `CONNECTING` (0) OR `OPEN` (1) so a rapid
+  second click can't spawn a second socket and break the
+  single-socket invariant (Codex #216 R1 P1 finding) (#216).
 
 ### Added — Tooling / scripts
 - **`scripts/cloud_sync_status.py`** — stdlib-only ops-monitoring
