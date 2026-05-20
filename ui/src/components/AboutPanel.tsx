@@ -170,6 +170,17 @@ export const AboutPanel = ({ client }: AboutPanelProps): JSX.Element => {
   };
   const [queueAllBusy, setQueueAllBusy] = useState(false);
   const [queueAllToast, setQueueAllToast] = useState<string>("");
+  // Auto-dismiss the success toast after a short window so a stale
+  // "N queued" message doesn't sit next to a fresh "last sync"
+  // value. Errors land in the persistent sync-error region instead.
+  useEffect((): (() => void) => {
+    if (queueAllToast === "") return (): void => {};
+    const id = window.setTimeout(
+      (): void => setQueueAllToast(""),
+      4000,
+    );
+    return (): void => window.clearTimeout(id);
+  }, [queueAllToast]);
   const onQueueAll = async (): Promise<void> => {
     if (queueAllBusy) return;
     setQueueAllBusy(true);
