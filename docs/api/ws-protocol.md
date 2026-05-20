@@ -1105,8 +1105,8 @@ to defaults.
 {
   "effects": [
     { "effect_id": 1, "params": { "cutoff_hz": 8000 }, "wet_dry": 0.4, "enabled": true },
-    { "effect_id": 0, "params": {}, "wet_dry": 0.0, "enabled": false },
-    { "effect_id": 0, "params": {}, "wet_dry": 0.0, "enabled": false }
+    { "effect_id": 0, "params": {}, "wet_dry": 0.5, "enabled": false },
+    { "effect_id": 0, "params": {}, "wet_dry": 0.5, "enabled": false }
   ],
   "eq_low_db": 0.0,
   "eq_mid_db": 0.0,
