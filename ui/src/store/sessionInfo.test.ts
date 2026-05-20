@@ -190,4 +190,24 @@ describe("fetchStemsStatus", () => {
     const status = await fetchStemsStatus(client);
     expect(status).toEqual({ ready: 0, pending: 0, failed: 0, none: 0 });
   });
+
+  it("a failed fetch clears prior known-good state to defaults", async () => {
+    __resetStemsStatus();
+    // Seed a known-good state via a successful fetch.
+    const okClient = makeClient(async () => ({
+      ready: 9,
+      pending: 1,
+      failed: 0,
+      none: 3,
+    }));
+    const first = await fetchStemsStatus(okClient);
+    expect(first.ready).toBe(9);
+    // Then fail. Stale state must NOT persist — fetch path is
+    // "always reflect the latest result, never serve a stale read."
+    const failClient = makeClient(async () => {
+      throw new Error("WS hangup");
+    });
+    const second = await fetchStemsStatus(failClient);
+    expect(second).toEqual({ ready: 0, pending: 0, failed: 0, none: 0 });
+  });
 });
