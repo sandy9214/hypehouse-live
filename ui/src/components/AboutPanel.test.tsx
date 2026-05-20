@@ -12,8 +12,10 @@ import {
 import { AboutPanel } from "./AboutPanel";
 import {
   __resetSessionInfo,
+  __resetStemsStatus,
   __resetSyncStatus,
   __setSessionInfo,
+  __setStemsStatus,
   __setSyncStatus,
   type SessionInfo,
 } from "../store/sessionInfo";
@@ -44,6 +46,7 @@ describe("AboutPanel", () => {
   beforeEach((): void => {
     __resetSessionInfo();
     __resetSyncStatus();
+    __resetStemsStatus();
   });
   afterEach((): void => {
     cleanup();
@@ -526,6 +529,28 @@ describe("AboutPanel", () => {
     render(<AboutPanel client={makeClient()} />);
     expect(screen.getByTestId("about-sync-counts").textContent).toBe(
       "↓ 0 fetched · ↑ 4 pushed",
+    );
+  });
+
+  it("hides the Stems row when ready+pending+failed are all zero", () => {
+    __setStemsStatus({ ready: 0, pending: 0, failed: 0, none: 12 });
+    render(<AboutPanel client={makeClient()} />);
+    expect(screen.queryByTestId("about-stems-status")).toBeNull();
+  });
+
+  it("renders Stems row with ready-only count when no pending/failed", () => {
+    __setStemsStatus({ ready: 3, pending: 0, failed: 0, none: 9 });
+    render(<AboutPanel client={makeClient()} />);
+    expect(screen.getByTestId("about-stems-status").textContent).toBe(
+      "3 ready",
+    );
+  });
+
+  it("renders Stems row with all three counts when populated", () => {
+    __setStemsStatus({ ready: 5, pending: 2, failed: 1, none: 4 });
+    render(<AboutPanel client={makeClient()} />);
+    expect(screen.getByTestId("about-stems-status").textContent).toBe(
+      "5 ready · 2 pending · 1 failed",
     );
   });
 

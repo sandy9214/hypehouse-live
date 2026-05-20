@@ -391,6 +391,100 @@ export const usePendingPushIds = (
   return snapshot;
 };
 
+// ---- Stems status (#194 follow-up) -------------------------------
+//
+// Aggregate counts by demucs stems-status bucket. Backed by the
+// `library.stems_status` RPC. Polls on the same cadence as the
+// other status hooks so the AboutPanel "Stems: N ready" row stays
+// fresh without per-track round trips.
+
+export interface StemsStatus {
+  readonly ready: number;
+  readonly pending: number;
+  readonly failed: number;
+  readonly none: number;
+}
+
+const DEFAULT_STEMS_STATUS: StemsStatus = {
+  ready: 0,
+  pending: 0,
+  failed: 0,
+  none: 0,
+};
+
+const isStemsStatus = (v: unknown): v is StemsStatus => {
+  if (!v || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  return (
+    typeof o.ready === "number" &&
+    typeof o.pending === "number" &&
+    typeof o.failed === "number" &&
+    typeof o.none === "number"
+  );
+};
+
+type StemsStatusListener = () => void;
+const stemsStatusListeners: Set<StemsStatusListener> = new Set();
+let stemsStatus: StemsStatus = DEFAULT_STEMS_STATUS;
+
+const notifyStems = (): void => {
+  for (const l of stemsStatusListeners) l();
+};
+const subscribeStems = (l: StemsStatusListener): (() => void) => {
+  stemsStatusListeners.add(l);
+  return () => {
+    stemsStatusListeners.delete(l);
+  };
+};
+const getStemsSnapshot = (): StemsStatus => stemsStatus;
+
+export const __setStemsStatus = (next: StemsStatus): void => {
+  stemsStatus = next;
+  notifyStems();
+};
+
+export const __resetStemsStatus = (): void => {
+  stemsStatus = DEFAULT_STEMS_STATUS;
+  notifyStems();
+};
+
+export const fetchStemsStatus = async (
+  client: JsonRpcWS,
+): Promise<StemsStatus> => {
+  try {
+    const result = await client.call<unknown>("library.stems_status");
+    if (isStemsStatus(result)) {
+      __setStemsStatus(result);
+    } else {
+      __setStemsStatus(DEFAULT_STEMS_STATUS);
+    }
+  } catch {
+    __setStemsStatus(DEFAULT_STEMS_STATUS);
+  }
+  return stemsStatus;
+};
+
+export const useStemsStatus = (
+  client: JsonRpcWS,
+  refreshMs = 15_000,
+): StemsStatus => {
+  // Stems counts change at human-import cadence, not by the second —
+  // 15s default is enough.
+  const snapshot = useSyncExternalStore(
+    subscribeStems,
+    getStemsSnapshot,
+    getStemsSnapshot,
+  );
+  useEffect(() => {
+    void fetchStemsStatus(client);
+    const id = window.setInterval(() => {
+      void fetchStemsStatus(client);
+    }, refreshMs);
+    return () => window.clearInterval(id);
+  }, [client, refreshMs]);
+  return snapshot;
+};
+
 /** Hook — fetches once on mount; polls every `refreshMs` while hooked. */
 export const useSyncStatus = (
   client: JsonRpcWS,
