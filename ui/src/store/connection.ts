@@ -51,13 +51,17 @@ export const __resetConnectionState = (): void => {
 export const useConnection = (client: JsonRpcWS): ConnectionState => {
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   useEffect(() => {
-    // Initialize from the client's current state — covers the case
-    // where the socket opened before the hook mounted.
+    // Initialize from the client's current state in BOTH
+    // directions — without this, the global singleton can carry
+    // stale "open" state across a remount (Codex #213 R1 note).
+    // If the client exposes `isOpen`, mirror it; otherwise leave
+    // the prior value (older clients without `isOpen` will get the
+    // first onOpen/onClose event to sync).
     const isOpen = (
       client as { isOpen?: () => boolean }
     ).isOpen;
-    if (typeof isOpen === "function" && isOpen.call(client)) {
-      __setConnectionState("open");
+    if (typeof isOpen === "function") {
+      __setConnectionState(isOpen.call(client) ? "open" : "closed");
     }
     const onOpen = (
       client as { onOpen?: (cb: () => void) => () => void }
