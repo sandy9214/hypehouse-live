@@ -663,6 +663,47 @@ async def test_sync_now_wraps_transport_error_as_rpc_error(
     assert "HTTP 503" in str(ei.value)
 
 
+# ---- list_pending_push --------------------------------------------
+
+
+def test_handler_handles_list_pending_push(library: TrackLibrary):
+    handler = LibraryRpcHandler(library)
+    assert handler.handles("library.list_pending_push") is True
+
+
+@_asyncio
+async def test_list_pending_push_empty(library: TrackLibrary):
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.list_pending_push", {})
+    assert result == {"ids": []}
+
+
+@_asyncio
+async def test_list_pending_push_after_adds(library: TrackLibrary):
+    _seed(library)  # 5 add_track calls → 5 pending push entries.
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.list_pending_push", {})
+    assert sorted(result["ids"]) == [
+        "alpha",
+        "bravo",
+        "charlie",
+        "delta",
+        "echo",
+    ]
+
+
+@_asyncio
+async def test_list_pending_push_after_partial_clear(
+    library: TrackLibrary,
+):
+    _seed(library)
+    library.clear_pending_push("alpha")
+    library.clear_pending_push("delta")
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.list_pending_push", {})
+    assert sorted(result["ids"]) == ["bravo", "charlie", "echo"]
+
+
 @_asyncio
 async def test_sync_now_wraps_sqlite_error_as_rpc_error(
     library: TrackLibrary,
