@@ -1091,15 +1091,22 @@ constraint — saving with an existing name fails fast.
 }
 ```
 
-* `crossfader_curve` is one of `"Linear"`, `"Dipped"`, `"Sharp"`,
+* `crossfader_curve` is **optional** — defaults to `"Linear"` when
+  omitted. Allowed values: `"Linear"`, `"Dipped"`, `"Sharp"`,
   `"Scratch"` (matches `engine::state::CrossfaderCurve`).
 
-`PresetDeckState` wire shape:
+`PresetDeckState` wire shape — note `effects` is always **exactly
+3 slots** in the response (saved-row read-back). On `save` input
+the handler is tolerant: shorter arrays right-pad with empty
+slots, longer arrays truncate to 3, and malformed entries coerce
+to defaults.
 
 ```json
 {
   "effects": [
-    { "effect_id": 1, "params": { "cutoff_hz": 8000 }, "wet_dry": 0.4, "enabled": true }
+    { "effect_id": 1, "params": { "cutoff_hz": 8000 }, "wet_dry": 0.4, "enabled": true },
+    { "effect_id": 0, "params": {}, "wet_dry": 0.0, "enabled": false },
+    { "effect_id": 0, "params": {}, "wet_dry": 0.0, "enabled": false }
   ],
   "eq_low_db": 0.0,
   "eq_mid_db": 0.0,
