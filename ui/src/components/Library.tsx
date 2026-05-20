@@ -161,9 +161,18 @@ export const Library = ({
   }, [query, client, searchDebounceMs, filters]);
 
   // What to actually render: search overlay if active, else the cache.
+  // After the server-side narrowing, the optional `pendingSyncOnly`
+  // chip post-filters client-side against the polled pending-push
+  // set — the search RPC has no knowledge of cloud-sync queue state.
   const visible = useMemo<ReadonlyArray<LibraryTrack>>(
-    (): ReadonlyArray<LibraryTrack> => searchResults ?? lib.tracks,
-    [searchResults, lib.tracks],
+    (): ReadonlyArray<LibraryTrack> => {
+      const base = searchResults ?? lib.tracks;
+      if (!filters.pendingSyncOnly) return base;
+      return base.filter((t: LibraryTrack): boolean =>
+        pendingPush.has(t.id),
+      );
+    },
+    [searchResults, lib.tracks, filters.pendingSyncOnly, pendingPush],
   );
 
   const filtersActive = hasActiveFilters(filters);
@@ -238,7 +247,9 @@ export const Library = ({
         )}
         {showNoMatches && (
           <div style={emptyBoxStyle} data-testid="library-no-matches">
-            No tracks match &quot;{query}&quot;.
+            {filters.pendingSyncOnly && query.trim() === ""
+              ? "No tracks are pending cloud sync."
+              : `No tracks match "${query}".`}
           </div>
         )}
         {visible.map(

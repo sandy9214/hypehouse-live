@@ -191,6 +191,28 @@ export const LibraryFilters = ({
         )}
       </div>
 
+      <div style={STYLE.group}>
+        <label
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 4,
+            cursor: "pointer",
+          }}
+        >
+          <input
+            type="checkbox"
+            data-testid="library-filter-pending-toggle"
+            aria-label="Show only tracks awaiting cloud sync"
+            checked={filters.pendingSyncOnly}
+            onChange={(e): void =>
+              update({ pendingSyncOnly: e.target.checked })
+            }
+          />
+          <span style={STYLE.label}>Pending sync</span>
+        </label>
+      </div>
+
       {hasActiveFilters(filters) && (
         <div data-testid="library-filter-chips" style={STYLE.chipsRow}>
           {(filters.bpmMin !== null || filters.bpmMax !== null) && (
@@ -215,6 +237,25 @@ export const LibraryFilters = ({
                 data-testid="library-filter-chip-compat-clear"
                 onClick={(): void =>
                   update({ compatibleWithTrackId: null })
+                }
+                style={STYLE.chipClose}
+              >
+                ×
+              </button>
+            </span>
+          )}
+          {filters.pendingSyncOnly && (
+            <span
+              style={STYLE.chip}
+              data-testid="library-filter-chip-pending"
+            >
+              pending sync only
+              <button
+                type="button"
+                aria-label="Remove pending-sync-only filter"
+                data-testid="library-filter-chip-pending-clear"
+                onClick={(): void =>
+                  update({ pendingSyncOnly: false })
                 }
                 style={STYLE.chipClose}
               >
