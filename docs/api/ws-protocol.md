@@ -442,6 +442,13 @@ Reserved `id` values:
 | 3  | reverb  | Schroeder 4-comb + 2-allpass |
 | 4  | gate    | beat-synced gate (master BPM x period_div) |
 
+**Client caching**: the catalogue is process-static (compiled into
+the engine) but a dev rebuild between engine restarts can add /
+remove entries. Clients SHOULD cache for the WebSocket lifetime
+but MUST re-fetch on every reconnect. The in-repo TS client wires
+this via `JsonRpcWS.onOpen(cb)` + `refetchEffectsManifest(client)`
+— see `ui/src/store/effectsManifest.ts`.
+
 ### `engine.list_output_devices`
 
 Enumerate cpal output device names so the UI can render a picker. Read-only;
@@ -471,6 +478,14 @@ host's current default output device (cpal canonical name match).
 
 Defunct devices (cpal `name()` returns Err) are skipped. Empty array is
 valid when the host has no audio sink (e.g. headless container).
+
+**Client caching**: the device list can change between engine
+restarts (operator plugs in a new USB interface mid-session, then
+bounces the engine). Clients SHOULD cache for the WebSocket
+lifetime but MUST re-fetch on every reconnect. The in-repo TS
+client wires this via `JsonRpcWS.onOpen(cb)` +
+`refetchOutputDevices(client)` — see
+`ui/src/store/outputDevices.ts`.
 
 ### `engine.session_info`
 
@@ -511,6 +526,13 @@ Field semantics:
   `HYPEHOUSE_RECORDING_DISABLED` is set.
 - `features.rate_limit_disabled` / `features.shared_ci_runner` —
   diagnostic exposures of the matching env vars.
+
+**Client caching**: this payload is session-static AT THE ENGINE
+process level — restarting the engine (env-var flip, dev rebuild)
+can change any field. Clients SHOULD cache the result for the
+WebSocket lifetime but MUST re-fetch on every reconnect. The
+in-repo TypeScript client wires this via `JsonRpcWS.onOpen(cb)` +
+`refetchSessionInfo(client)` — see `ui/src/store/sessionInfo.ts`.
 
 ### `engine.list_sessions`
 
@@ -561,6 +583,15 @@ directory exists.
   non-empty.
 * `recording_size_bytes` — `master.wav` size in bytes, or `null` when
   absent.
+
+**Client caching**: the on-disk log grows append-only across
+engine restarts. Clients SHOULD cache the list for the WebSocket
+lifetime but MUST re-fetch on every reconnect so newly closed
+sessions appear without a page reload. The in-repo TS client
+wires this via a module-level `WeakSet<JsonRpcWS>` subscription
+(Codex caught a P1 with the naive hook-local approach because the
+History panel is conditionally mounted) — see
+`ui/src/store/sessions.ts`.
 
 ### `engine.replay_session`
 
