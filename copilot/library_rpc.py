@@ -208,6 +208,7 @@ class LibraryRpcHandler:
         "get_stems",
         "sync_status",
         "sync_now",
+        "list_pending_push",
     )
     # ``key_match.compute_offset`` lives in a sibling namespace but
     # needs read access to the same library, so we dispatch it through
@@ -306,6 +307,8 @@ class LibraryRpcHandler:
             return self._sync_status(params)
         if method == "library.sync_now":
             return self._sync_now(params)
+        if method == "library.list_pending_push":
+            return self._list_pending_push(params)
         if method == "key_match.compute_offset":
             return self._key_match_compute_offset(params)
         if method == "streaming.search":
@@ -315,6 +318,19 @@ class LibraryRpcHandler:
         raise RpcError(-32601, f"method not found: {method}")
 
     # --- handlers -----------------------------------------------------
+
+    def _list_pending_push(
+        self, _params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Return the set of track IDs awaiting a cloud push.
+
+        Used by the UI library table to render a per-row "pending
+        sync" indicator. Cheap — `pending_push_ids()` is a single
+        SQLite SELECT against a primary-key index. Returned as a
+        list (JSON has no native set type) but the UI builds a Set
+        client-side for O(1) membership checks.
+        """
+        return {"ids": list(self._library.pending_push_ids())}
 
     def _sync_now(self, _params: dict[str, Any]) -> dict[str, Any]:
         """Fire a single out-of-band sync tick and return fresh status.
