@@ -285,6 +285,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the dedupe-on-same-args wording was inaccurate; R2 tightened it
   to "dedupe on cache state, not on (limit, offset) args"
   (#233).
+- Added a **"Client caching" paragraph** to the
+  `docs/api/ws-protocol.md` `library.list_tracks` section,
+  mirroring the four added by #226. Now-relevant after #233 wired
+  the WeakSet onOpen reconnect-refetch into `useLibrary` —
+  external integrators consuming `library.list_tracks` must adopt
+  the same cache-and-refetch-on-reconnect contract. Calls out the
+  single-page pagination caveat: non-default-offset callers must
+  pass `{ force: true }` to bypass the cache (#235).
 
 ## [0.1.0] — 2026-05-19
 
