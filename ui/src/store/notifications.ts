@@ -1,10 +1,12 @@
 // Notifications store — surface engine.decode_error toasts in the UI.
 //
-// The Rust engine fans out `engine.decode_error` JSON-RPC notifications
-// whenever `DecodeService::open` fails on a `DeckLoad` event (PR #29
-// follow-up TODO). This store buffers a small queue of recent errors,
-// exposes them via `useSyncExternalStore`, and auto-evicts after a
-// configurable window so the UI stays uncluttered.
+// The Rust engine fans out `engine.decode_error` JSON-RPC
+// notifications whenever the decode pipeline fails on a `DeckLoad`
+// event — emitted from `engine/src/main.rs` via
+// `event_to_commands_with_errors`. This store buffers a small queue
+// of recent errors, exposes them via `useSyncExternalStore`, and
+// auto-evicts after a configurable window so the UI stays
+// uncluttered.
 //
 // Why not roll the queue into `engine.ts`?
 //   * Decode errors are NOT part of the event-sourced state — they're
