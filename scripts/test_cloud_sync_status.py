@@ -98,6 +98,40 @@ def test_pre_v11_schema_treats_missing_table_as_zero(
     assert result.stdout.strip() == "7 tracks, 0 pending push"
 
 
+def test_other_operational_errors_exit_3(tmp_path: Path) -> None:
+    """Regression for Codex's #189 R1 P2: the OperationalError catch
+    must ONLY swallow `no such table: pending_push`. Other errors
+    (locked DB, schema corruption) must surface as exit-3 instead
+    of silently reporting 0 pending — otherwise the operator gets a
+    false healthy reading. We provoke a non-missing-table error by
+    creating a `pending_push` table with the wrong column shape, so
+    COUNT(*) succeeds but a later integrity check would fail. The
+    simpler reproducer here: drop the `tracks` table to force a
+    different OperationalError on the SECOND query."""
+    db = tmp_path / "lib.db"
+    conn = sqlite3.connect(db)
+    try:
+        # Build a pending_push table but no tracks table. The script
+        # will succeed on the pending_push SELECT, then fail on the
+        # tracks SELECT — that's an unrelated OperationalError, which
+        # must propagate via the outer `sqlite3.Error` handler →
+        # exit 3.
+        conn.execute(
+            "CREATE TABLE pending_push ("
+            "track_id TEXT PRIMARY KEY, queued_at_micros INTEGER)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), str(db)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 3
+    assert "sqlite error" in result.stderr
+
+
 def test_env_var_fallback(tmp_path: Path) -> None:
     db = tmp_path / "lib.db"
     _make_db(db, tracks=3, pending=1)

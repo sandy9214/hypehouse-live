@@ -98,8 +98,7 @@ supabase-print:
 # opens the library DB read-only. Use `--json` for machine output,
 # or pass an explicit path:
 #   make cloud-sync-status DB=/path/to/library.db
-# Default DB path matches the co-pilot launchd plist
-# (~/.config/hypehouse-live/library.db, overridable via
-# $HYPEHOUSE_LIBRARY_DB).
+# Default DB path matches `copilot/main.py` (~/.hypehouse-live/library.db,
+# overridable via $HYPEHOUSE_LIBRARY_DB).
 cloud-sync-status:
 	$(PYTHON) scripts/cloud_sync_status.py $(if $(DB),"$(DB)")

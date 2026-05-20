@@ -12,8 +12,8 @@ agents that want to alert when the queue stops draining (e.g. cloud
 outage) without round-tripping through the running co-pilot service.
 
 The DB path defaults to ``$HYPEHOUSE_LIBRARY_DB`` and falls back to
-``~/.config/hypehouse-live/library.db`` to match the co-pilot
-service's launchd plist.
+``~/.hypehouse-live/library.db`` to match
+``copilot/main.py`` + ``copilot/library.py``.
 """
 from __future__ import annotations
 
@@ -25,9 +25,7 @@ import sys
 from pathlib import Path
 
 
-DEFAULT_LIBRARY_DB = Path(
-    "~/.config/hypehouse-live/library.db"
-).expanduser()
+DEFAULT_LIBRARY_DB = Path("~/.hypehouse-live/library.db").expanduser()
 
 
 def resolve_db_path(arg: str | None) -> Path:
@@ -49,15 +47,21 @@ def read_status(db_path: Path) -> dict[str, int]:
     uri = f"file:{db_path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     try:
-        # `pending_push` may not exist on a pre-v11 schema; treat the
-        # missing-table case as an empty queue so the script keeps
-        # working on libraries that pre-date cloud sync.
+        # `pending_push` may not exist on a pre-v11 schema; treat ONLY
+        # the missing-table case as an empty queue so the script keeps
+        # working on libraries that pre-date cloud sync. Any other
+        # OperationalError (busy locks, corruption, malformed schema)
+        # re-raises so the operator gets exit-3 instead of a falsely
+        # healthy "0 pending" reading (Codex review note on #189 R1).
         try:
             pending = conn.execute(
                 "SELECT COUNT(*) FROM pending_push"
             ).fetchone()[0]
-        except sqlite3.OperationalError:
-            pending = 0
+        except sqlite3.OperationalError as exc:
+            if "no such table: pending_push" in str(exc):
+                pending = 0
+            else:
+                raise
         tracks = conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
         return {
             "library_track_count": int(tracks),
