@@ -155,6 +155,82 @@ describe("presets store", () => {
     expect(call).toHaveBeenCalledTimes(1);
   });
 
+  it("in-flight presets.list discards when a save lands first (no row erase)", async (): Promise<void> => {
+    // Race scenario from Codex #231 R1 P1: WS reconnect fires
+    // refetchPresets, the user saves a preset before the list
+    // response returns, the stale list arrives and would normally
+    // overwrite the cache and erase the just-saved row.
+    let resolveList: ((v: unknown) => void) | null = null;
+    const listPromise = new Promise<unknown>((res): void => {
+      resolveList = res;
+    });
+    const call = vi.fn((method: string, params?: unknown): Promise<unknown> => {
+      if (method === "presets.list") return listPromise;
+      if (method === "presets.save") {
+        const name = (params as { name: string }).name;
+        return Promise.resolve({
+          preset: {
+            id: 99,
+            name,
+            created_at: "2026-05-17T12:00:00Z",
+            deck_a: {
+              effects: [],
+              eq_low_db: 0,
+              eq_mid_db: 0,
+              eq_high_db: 0,
+              pitch_semitones: 0,
+              tempo_ratio: 1,
+            },
+            deck_b: {
+              effects: [],
+              eq_low_db: 0,
+              eq_mid_db: 0,
+              eq_high_db: 0,
+              pitch_semitones: 0,
+              tempo_ratio: 1,
+            },
+            crossfader_curve: "Linear",
+          },
+        });
+      }
+      return Promise.reject(new Error(`unmocked ${method}`));
+    });
+    const client = { call } as unknown as JsonRpcWS;
+
+    // Start the refetch (reconnect path) — RPC is pending.
+    const listInFlight = refetchPresets(client);
+    // User saves while the list is still pending.
+    await savePreset(client, {
+      name: "new",
+      deck_a: {
+        effects: [],
+        eq_low_db: 0,
+        eq_mid_db: 0,
+        eq_high_db: 0,
+        pitch_semitones: 0,
+        tempo_ratio: 1,
+      },
+      deck_b: {
+        effects: [],
+        eq_low_db: 0,
+        eq_mid_db: 0,
+        eq_high_db: 0,
+        pitch_semitones: 0,
+        tempo_ratio: 1,
+      },
+      crossfader_curve: "Linear",
+    });
+    expect(__getPresetsSnapshot().presets.map((p) => p.id)).toEqual([99]);
+    // Now the stale list response lands — must NOT erase id=99.
+    resolveList!({
+      presets: [{ id: 1, name: "stale", created_at: "2026-05-17T10:00:00Z" }],
+    });
+    await listInFlight;
+    const after = __getPresetsSnapshot();
+    expect(after.presets.map((p) => p.id)).toEqual([99]);
+    expect(after.loading).toBe(false);
+  });
+
   it("refetchPresets forces a fresh presets.list call even when loaded", async (): Promise<void> => {
     let nthCall = 0;
     const call = vi.fn(async (): Promise<unknown> => {
