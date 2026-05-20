@@ -242,6 +242,35 @@ export const fetchSyncStatus = async (
 };
 
 /**
+ * Operator-driven "queue all" — fires the
+ * `library.requeue_all_pending` RPC. Used after a pre-cloud-sync
+ * upgrade (or any time the operator wants to re-seed the cloud
+ * from the local library). Returns the post-call total queued
+ * count so the caller can render a toast.
+ */
+export const requeueAllPending = async (
+  client: JsonRpcWS,
+): Promise<number> => {
+  const result = await client.call<unknown>(
+    "library.requeue_all_pending",
+  );
+  if (
+    result &&
+    typeof result === "object" &&
+    typeof (result as { queued?: unknown }).queued === "number"
+  ) {
+    const queued = (result as { queued: number }).queued;
+    // The sync_status RPC fires on the next polling tick, but
+    // forcing it here keeps the AboutPanel pending count in step
+    // with the operator's just-clicked action.
+    void fetchSyncStatus(client);
+    void fetchPendingPushIds(client);
+    return queued;
+  }
+  return 0;
+};
+
+/**
  * Operator-driven force sync. Fires the `library.sync_now` RPC,
  * folds the post-tick status into the store, and bubbles up the
  * resolved status so the caller can show a toast. Errors (e.g.
