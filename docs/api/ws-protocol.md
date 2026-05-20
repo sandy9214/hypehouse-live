@@ -584,14 +584,18 @@ directory exists.
 * `recording_size_bytes` — `master.wav` size in bytes, or `null` when
   absent.
 
-**Client caching**: the on-disk log grows append-only across
-engine restarts. Clients SHOULD cache the list for the WebSocket
-lifetime but MUST re-fetch on every reconnect so newly closed
-sessions appear without a page reload. The in-repo TS client
-wires this via a module-level `WeakSet<JsonRpcWS>` subscription
-(Codex caught a P1 with the naive hook-local approach because the
-History panel is conditionally mounted) — see
-`ui/src/store/sessions.ts`.
+**Client caching**: the persisted session set can change across
+engine restarts in BOTH directions — new sessions are appended
+when prior runs end, AND boot-time retention pruning can shrink
+the list (configurable via `HYPEHOUSE_LOG_MAX_DAYS` /
+`HYPEHOUSE_LOG_MIN_KEEP`; see `docs/known-limitations.md`).
+Clients SHOULD cache the list for the WebSocket lifetime but MUST
+re-fetch on every reconnect so newly written entries AND
+retention-pruned removals are reflected without a page reload.
+The in-repo TS client wires this via a module-level
+`WeakSet<JsonRpcWS>` subscription (Codex caught a P1 with the
+naive hook-local approach because the History panel is
+conditionally mounted) — see `ui/src/store/sessions.ts`.
 
 ### `engine.replay_session`
 
