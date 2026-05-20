@@ -217,6 +217,31 @@ describe("JsonRpcWS", () => {
     c.close();
   });
 
+  it("onClose subscribers fire on server-side drop AND on user close", () => {
+    const factory = makeFactory();
+    const c = new JsonRpcWS({
+      url: "ws://test/ws",
+      factory,
+      initialBackoffMs: 100,
+    });
+    let closeCount = 0;
+    c.onClose((): void => {
+      closeCount += 1;
+    });
+    c.connect();
+    MockWS.instances[0]!.open();
+    expect(c.isOpen()).toBe(true);
+    // Server-side close → onClose fires.
+    MockWS.instances[0]!.close();
+    expect(closeCount).toBe(1);
+    expect(c.isOpen()).toBe(false);
+    // Reconnect then user-initiated close → onClose fires again.
+    vi.advanceTimersByTime(150);
+    MockWS.instances[1]!.open();
+    c.close();
+    expect(closeCount).toBe(2);
+  });
+
   it("onOpen subscriber exception doesn't disrupt auth flow", () => {
     // Suppress the expected console.error spam from the throwing
     // listener so the test output stays clean.

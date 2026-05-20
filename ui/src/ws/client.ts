@@ -93,6 +93,11 @@ export class JsonRpcWS {
   // re-fetch session-static data the engine might have changed on
   // restart (e.g. `engine.session_info` feature flags).
   private readonly openListeners = new Set<() => void>();
+  // Companion to `openListeners` — fires on every socket close
+  // (server-side drop OR user-initiated `close()`). Lets the UI
+  // render "engine offline" badges while the reconnect path runs
+  // its backoff loop. Same exception isolation as openListeners.
+  private readonly closeListeners = new Set<() => void>();
   private backoffMs: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private closedByUser = false;
@@ -139,6 +144,21 @@ export class JsonRpcWS {
       p.reject(new Error("connection closed"));
     }
     this.pending.clear();
+    // NOTE: closeListeners notification lives in `handleClose` (not
+    // here) because user-initiated close still triggers the
+    // socket's onclose → handleClose path. Firing here would
+    // double-notify subscribers.
+  }
+
+  private notifyCloseListeners(): void {
+    for (const cb of this.closeListeners) {
+      try {
+        cb();
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error("JsonRpcWS onClose listener threw:", err);
+      }
+    }
   }
 
   /**
@@ -186,6 +206,28 @@ export class JsonRpcWS {
     return (): void => {
       this.openListeners.delete(cb);
     };
+  }
+
+  /**
+   * Register a callback to fire on every socket close — server-side
+   * drop or user-initiated `close()`. Lets the UI render an "engine
+   * offline" badge while the reconnect path runs. Caller exceptions
+   * caught + logged, same isolation as `onOpen`.
+   */
+  public onClose(cb: () => void): Unsubscribe {
+    this.closeListeners.add(cb);
+    return (): void => {
+      this.closeListeners.delete(cb);
+    };
+  }
+
+  /**
+   * Instantaneous read of socket state — useful for initial render
+   * before any open/close event has fired. `true` only when the
+   * underlying socket is in `READY_OPEN`.
+   */
+  public isOpen(): boolean {
+    return this.socket?.readyState === READY_OPEN;
   }
 
   private allocId(): JsonRpcId {
@@ -284,6 +326,7 @@ export class JsonRpcWS {
       p.reject(new Error("connection closed"));
     }
     this.pending.clear();
+    this.notifyCloseListeners();
     if (this.closedByUser) return;
     // Schedule reconnect with exponential backoff capped at maxBackoffMs.
     const delay = Math.min(this.backoffMs, this.maxBackoffMs);
