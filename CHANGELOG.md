@@ -44,6 +44,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capped at `MAX_BACKOFF_SECONDS` (10 min). Resets on first clean
   tick. Lock-protected counter — safe under `sync_now` from the RPC
   thread + daemon loop from its own thread (#169).
+- **`SyncStats.next_sync_micros` + UI countdown** — daemon stamps the
+  next scheduled wake instant inside `_loop` right before
+  `_stop.wait`. RPC folds it through; AboutPanel renders
+  `· next in Xs` so operators know when the next auto-tick lands
+  (varies with backoff). Field owned solely by `_loop` —
+  out-of-band callers don't touch it (#174).
+- **`SyncDaemon.wake_now()` + `library.sync_now` integration** —
+  separate `_wake` event lets the RPC handler kick the daemon
+  thread out of a long backoff wait after an out-of-band tick, so
+  the next automatic tick fires at the reset cadence. `stop()` sets
+  both events; older daemon stubs lacking `wake_now` tolerated via
+  `getattr` (#176).
+- **`library.requeue_all_pending` RPC** — operator escape hatch for
+  pre-cloud-sync libraries. Single `INSERT OR IGNORE` against
+  `pending_push` from `tracks`; returns the new queued count.
+  Calls `wake_now` so the freshly filled queue starts draining
+  immediately (#179).
 
 ### Added — UI (TypeScript)
 - **AboutPanel "Library" row** — shows `N tracks · M pending sync`
@@ -62,6 +79,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `⟳ pending` chip next to titles whose IDs are in the pending-push
   set. Library.tsx joins via the new `usePendingPushIds` hook
   (#167).
+- **AboutPanel "queue all" button** — fires
+  `library.requeue_all_pending` and pops an auto-dismissing
+  "N queued for sync" toast. Errors land in the shared
+  `about-sync-error` region. Auto-dismiss after 4s (#181).
 
 ### Changed
 - `SyncDaemon` exception handling narrowed: `SyncError` /
@@ -73,6 +94,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RLS / anon-key caveats (#171).
 - New `make supabase-print` + `scripts/print_supabase_migrations.py`
   helper for operators without the supabase CLI (#171).
+- New **docs/known-limitations.md** — v0.x caveats reference,
+  replaces GH issue #93 as the source of truth. Covers Audio /
+  Engine / Bridge / Co-pilot / Cloud sync / UI / Telemetry. README
+  link updated; release notes link updated (#177).
 
 ## [0.1.0] — 2026-05-19
 
