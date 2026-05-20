@@ -3,11 +3,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { JsonRpcWS } from "../ws/client";
 import {
+  __getLibrarySnapshot,
   __resetLibraryStore,
   __setLibraryTracks,
   fetchLibrary,
   refetchLibrary,
   searchLibrary,
+  setHotCues,
   type LibraryTrack,
 } from "./library";
 
@@ -140,6 +142,78 @@ describe("library store", () => {
     await fetchLibrary(client);
     await fetchLibrary(client);
     expect(call).toHaveBeenCalledTimes(1);
+  });
+
+  it("setHotCues splices the updated row into the cache (closes #237)", async (): Promise<void> => {
+    __setLibraryTracks([makeTrack("t1"), makeTrack("t2")], 2);
+    const updated: LibraryTrack = {
+      ...makeTrack("t1"),
+      hot_cues: [0, 1500, 3000, null, null, null, null, null],
+    };
+    const call = vi.fn().mockResolvedValue({ track: updated });
+    const client = { call } as unknown as JsonRpcWS;
+    const result = await setHotCues(client, "t1", updated.hot_cues);
+    expect(result?.hot_cues).toEqual(updated.hot_cues);
+    const snap = __getLibrarySnapshot();
+    const t1 = snap.tracks.find((t) => t.id === "t1");
+    expect(t1?.hot_cues).toEqual(updated.hot_cues);
+    // t2 untouched.
+    const t2 = snap.tracks.find((t) => t.id === "t2");
+    expect(t2?.hot_cues).toEqual(makeTrack("t2").hot_cues);
+  });
+
+  it("in-flight list_tracks discards when setHotCues lands first (Codex #238 R1)", async (): Promise<void> => {
+    __setLibraryTracks([makeTrack("t1"), makeTrack("t2")], 2);
+    // The pending list_tracks would echo the OLD hot_cues (server
+    // queried before the setHotCues persist). It must NOT clobber
+    // the spliced row.
+    let resolveList: ((v: unknown) => void) | null = null;
+    const listPromise = new Promise<unknown>((res): void => {
+      resolveList = res;
+    });
+    const newCues: ReadonlyArray<number | null> = [
+      0, 1500, 3000, null, null, null, null, null,
+    ];
+    const updatedT1: LibraryTrack = { ...makeTrack("t1"), hot_cues: newCues };
+    const call = vi.fn((method: string): Promise<unknown> => {
+      if (method === "library.list_tracks") return listPromise;
+      if (method === "library.set_hot_cues") {
+        return Promise.resolve({ track: updatedT1 });
+      }
+      return Promise.reject(new Error(`unmocked ${method}`));
+    });
+    const client = { call } as unknown as JsonRpcWS;
+
+    // Start the refetch (reconnect path) — RPC pending.
+    const listInFlight = refetchLibrary(client);
+    // User edits hot cues while the list is still pending.
+    await setHotCues(client, "t1", newCues);
+    expect(__getLibrarySnapshot().tracks.find((t) => t.id === "t1")?.hot_cues)
+      .toEqual(newCues);
+    // Now the stale list response lands — must NOT erase the new cues.
+    resolveList!({
+      tracks: [makeTrack("t1"), makeTrack("t2")],
+      total: 2,
+    });
+    await listInFlight;
+    const after = __getLibrarySnapshot();
+    expect(after.tracks.find((t) => t.id === "t1")?.hot_cues).toEqual(newCues);
+    expect(after.loading).toBe(false);
+  });
+
+  it("setHotCues on a track not in the cache is a defensive no-op", async (): Promise<void> => {
+    __setLibraryTracks([makeTrack("t1")], 1);
+    const before = __getLibrarySnapshot();
+    const ghost: LibraryTrack = {
+      ...makeTrack("ghost"),
+      hot_cues: [0, null, null, null, null, null, null, null],
+    };
+    const call = vi.fn().mockResolvedValue({ track: ghost });
+    const client = { call } as unknown as JsonRpcWS;
+    const result = await setHotCues(client, "ghost", ghost.hot_cues);
+    expect(result?.id).toBe("ghost");
+    // Cache unchanged — ghost wasn't there, don't insert.
+    expect(__getLibrarySnapshot().tracks).toEqual(before.tracks);
   });
 
   it("refetchLibrary forces a fresh list_tracks call even when loaded", async (): Promise<void> => {
