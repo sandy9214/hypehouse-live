@@ -27,6 +27,31 @@ Env vars:
 | `HYPEHOUSE_LIBRARY_DB` | `~/.hypehouse-live/library.db` | SQLite library path. |
 | `HYPEHOUSE_COPILOT_LOG_LEVEL` | `INFO` | Log level. |
 | `HYPEHOUSE_COPILOT_HTTP_PORT` | `8766` | Bind port for the JSON-RPC HTTP server. |
+| `SUPABASE_URL` | — | Cloud library sync project URL. Unset = local-only (InMemory fallback). See [`docs/cloud-sync.md`](../docs/cloud-sync.md). |
+| `SUPABASE_ANON_KEY` | — | Cloud sync anon key. Required alongside `SUPABASE_URL`. |
+| `HYPEHOUSE_SYNC_TICK_SECONDS` | `60` | Background sync daemon cadence in seconds. Non-positive / non-numeric values silently fall back to the default. Daemon backs off exponentially on consecutive failures, capped at 10 min. |
+| `HYPEHOUSE_TELEMETRY_ENABLED` | `0` | Set to `1` to opt-in to Sentry telemetry (read by `copilot.telemetry.init_telemetry`). |
+
+## Cloud library sync (#102)
+
+When `SUPABASE_URL` + `SUPABASE_ANON_KEY` are set, the co-pilot
+spawns a `SyncDaemon` that pulls + pushes the `tracks` table on the
+`HYPEHOUSE_SYNC_TICK_SECONDS` cadence. Last-write-wins conflict
+resolution on `updated_at_micros`; exponential backoff capped at
+10 min.
+
+| Method | Purpose |
+|---|---|
+| `library.sync_status` | Snapshot of daemon stats — pending count, last pull/push micros, last error, next scheduled tick. |
+| `library.sync_now` | Operator-driven force tick. Runs an out-of-band pull+push and wakes the daemon so its next iteration fires at the reset cadence. |
+| `library.list_pending_push` | Returns `{"ids": [...]}` of tracks awaiting cloud push. UI uses this for the per-row chip + "pending sync only" filter. |
+| `library.requeue_all_pending` | Operator escape hatch — enqueues every local track for push (`INSERT OR IGNORE` against `pending_push`). Used after a pre-cloud-sync upgrade. |
+| `library.stems_status` | Aggregate counts by demucs stems-status: `{ready, pending, failed, none}`. |
+
+Operator setup + Supabase schema migration: see
+[`docs/cloud-sync.md`](../docs/cloud-sync.md). Ops monitoring via
+`make cloud-sync-status` or
+[`scripts/cloud_sync_status.py`](../scripts/cloud_sync_status.py).
 
 ## HTTP JSON-RPC server
 
@@ -87,13 +112,15 @@ Inbound:
 - `engine.state_changed` notification with `{ "state": <EngineState> }`
   payload — engine pushes after every reducer call.
 
-## v0.1 limitations (documented in PR body)
+## v0.1 limitations
 
 - `transition_plan` is stubbed: fixed 16-bar crossfade, no tempo/pitch
   matching, no stem-aware EQ swap.
 - `mashability_score` weights are heuristic; will be tuned against real
   session logs once we have any.
-- Library schema is minimal — analysis sidecars from v1 (downbeats,
-  segments, drop_times) aren't materialised yet.
 - Engine state-changed payload is a full snapshot per change; a delta
   protocol replaces this in v0.2.
+
+The full v0.x caveats list (covering audio / engine / bridge / co-pilot
+/ cloud-sync / UI / telemetry) lives in
+[`docs/known-limitations.md`](../docs/known-limitations.md).
