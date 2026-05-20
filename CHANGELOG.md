@@ -271,6 +271,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   R2 added a monotonic `cacheGeneration` counter that mutations
   bump and fetches snapshot, dropping their result on mismatch
   (#231).
+- **UI: library store refetches on WS reconnect** — third store in
+  the reconnect-refetch series. Same module-level
+  `WeakSet<JsonRpcWS>` pattern as sessions (#224) + presets (#231)
+  so a reconnect that lands while the Library panel is hidden
+  still syncs against the new socket. `fetchLibrary` gains a
+  `{ force }` option, `refetchLibrary` is the force-reload
+  entrypoint. NO `cacheGeneration` counter — unlike presets, the
+  library store has no mutation siblings that write
+  `current.tracks` directly (`setHotCues` returns the row without
+  writing the cache; `searchLibrary` is explicitly
+  presentation-only). R1 Codex flagged a non-blocking doc nit —
+  the dedupe-on-same-args wording was inaccurate; R2 tightened it
+  to "dedupe on cache state, not on (limit, offset) args"
+  (#233).
 
 ## [0.1.0] — 2026-05-19
 
