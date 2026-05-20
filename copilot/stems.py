@@ -8,10 +8,13 @@ for that pipeline: it shells out to Facebook's `demucs` model and writes
 ``vocals.wav`` / ``drums.wav`` / ``bass.wav`` / ``other.wav`` into a
 per-track cache directory.
 
-Wire-up vs. exposure: this PR adds the analyzer + library + RPC
-plumbing. The engine-side stem-deck integration and the UI controls
-that surface stem playback are tracked in separate PRs (see issue
-#TODO).
+Wire-up vs. exposure: this module ships the analyzer + library +
+RPC plumbing (`library.compute_stems`, `library.get_stems`,
+`library.stems_status`). The engine-side stem-deck audio path is
+the `DeckLoadStems` event in `docs/api/ws-protocol.md`. The UI
+AboutPanel "Stems" row (#197) surfaces aggregate ready/pending/
+failed counts; the per-deck stem-mode toggle is a future v0.2
+follow-up.
 
 Heavy dependency caveat
 -----------------------
