@@ -728,6 +728,18 @@ The `id` / `path` pair is wire-compatible with `state::TrackRef` so a
 returned row can be passed straight into a `DeckLoad` event's `track`
 field.
 
+**Client caching**: the catalog is session-static (a single WS lifetime
+won't see new rows unless an explicit `library.add_track` /
+`library.add_track_from_directory` lands or another window with the
+same DB writes one). Clients SHOULD cache for the WebSocket lifetime
+but MUST re-fetch on every reconnect — a copilot restart, a second
+window's scan, a stem compute, or a hot-cue edit can drift the
+catalog during a socket gap. The in-repo TS client wires this via
+`JsonRpcWS.onOpen(cb)` + `refetchLibrary(client)` — see
+`ui/src/store/library.ts`. Pagination is single-page (the cache
+holds the most recent `{limit, offset}` only); paged consumers must
+pass `{ force: true }` to bypass the cache for a non-default page.
+
 ### `library.search_tracks` (co-pilot)
 
 Substring + shorthand filter search. Shorthand tokens AND together with
