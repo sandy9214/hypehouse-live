@@ -53,8 +53,8 @@ ProDJ Link, vinyl mode, etc.). Different audience.
   honours `HYPEHOUSE_OUTPUT_DEVICE` env var (#113), but UI picker shipping
   in follow-up PR.
 
-See [known limitations issue #93](https://github.com/sandy9214/hypehouse-live/issues/93)
-for the full v0.x caveat list.
+See [docs/known-limitations.md](known-limitations.md) for the full
+v0.x caveat list.
 
 ## Install
 
