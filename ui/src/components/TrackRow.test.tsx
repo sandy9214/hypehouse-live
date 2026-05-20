@@ -310,4 +310,22 @@ describe("TrackRow hover preview", () => {
     fireEvent.mouseLeave(row);
     expect(screen.queryByTestId("track-row-preview-golf")).toBeNull();
   });
+
+  it("does not render the pending-sync chip by default", (): void => {
+    const track = makeTrack("hotel");
+    const { client } = makeClient();
+    render(<TrackRow track={track} client={client} />);
+    expect(screen.queryByTestId("track-row-pending-hotel")).toBeNull();
+  });
+
+  it("renders the pending-sync chip when pendingSync=true", (): void => {
+    const track = makeTrack("india");
+    const { client } = makeClient();
+    render(
+      <TrackRow track={track} client={client} pendingSync />,
+    );
+    const chip = screen.getByTestId("track-row-pending-india");
+    expect(chip.textContent).toBe("⟳ pending");
+    expect(chip.getAttribute("aria-label")).toBe("awaiting cloud push");
+  });
 });

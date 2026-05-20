@@ -252,6 +252,90 @@ export const formatRelativeMicros = (
   return `${d}d ago`;
 };
 
+// ---- Pending-push id set (#164 follow-up) -------------------------
+//
+// Separate store from `SyncStatus`. The status RPC returns counts +
+// last-tick stats, but rendering a per-row indicator needs the
+// actual ID set. We poll on the same cadence to stay cheap; the
+// PostgREST + library calls are independent so they overlap fine.
+
+type PendingPushSet = ReadonlySet<string>;
+
+const EMPTY_PENDING: PendingPushSet = new Set<string>();
+let pendingPushSet: PendingPushSet = EMPTY_PENDING;
+const pendingPushListeners: Set<() => void> = new Set();
+
+const notifyPendingPush = (): void => {
+  for (const l of pendingPushListeners) l();
+};
+const subscribePendingPush = (l: () => void): (() => void) => {
+  pendingPushListeners.add(l);
+  return () => {
+    pendingPushListeners.delete(l);
+  };
+};
+const getPendingPushSnapshot = (): PendingPushSet => pendingPushSet;
+
+/** Test seam. */
+export const __setPendingPushIds = (ids: Iterable<string>): void => {
+  pendingPushSet = new Set(ids);
+  notifyPendingPush();
+};
+
+/** Reset — test only. */
+export const __resetPendingPushIds = (): void => {
+  pendingPushSet = EMPTY_PENDING;
+  notifyPendingPush();
+};
+
+/**
+ * Fetch the current pending-push id set via the
+ * `library.list_pending_push` RPC and stash it in the store.
+ * Falls back to the empty set on transport error.
+ */
+export const fetchPendingPushIds = async (
+  client: JsonRpcWS,
+): Promise<PendingPushSet> => {
+  try {
+    const result = await client.call<unknown>("library.list_pending_push");
+    if (
+      result &&
+      typeof result === "object" &&
+      Array.isArray((result as { ids?: unknown }).ids)
+    ) {
+      const ids = (result as { ids: unknown[] }).ids.filter(
+        (id): id is string => typeof id === "string",
+      );
+      __setPendingPushIds(ids);
+    } else {
+      __setPendingPushIds([]);
+    }
+  } catch {
+    __setPendingPushIds([]);
+  }
+  return pendingPushSet;
+};
+
+/** Hook — fetches once + polls every `refreshMs`. */
+export const usePendingPushIds = (
+  client: JsonRpcWS,
+  refreshMs = 5_000,
+): PendingPushSet => {
+  const snapshot = useSyncExternalStore(
+    subscribePendingPush,
+    getPendingPushSnapshot,
+    getPendingPushSnapshot,
+  );
+  useEffect(() => {
+    void fetchPendingPushIds(client);
+    const id = window.setInterval(() => {
+      void fetchPendingPushIds(client);
+    }, refreshMs);
+    return () => window.clearInterval(id);
+  }, [client, refreshMs]);
+  return snapshot;
+};
+
 /** Hook — fetches once on mount; polls every `refreshMs` while hooked. */
 export const useSyncStatus = (
   client: JsonRpcWS,
