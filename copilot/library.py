@@ -92,6 +92,11 @@ LOUDNESS_TARGET_LUFS = -14.0
 STEMS_STATUS_PENDING = "pending"
 STEMS_STATUS_READY = "ready"
 STEMS_STATUS_FAILED = "failed"
+# Reportable bucket for tracks whose `stems_status` is NULL (never
+# requested) OR holds a value outside the three known states above
+# (e.g. a manual SQL write of a future enum the code doesn't know).
+# Part of the `library.stems_status` RPC wire contract.
+STEMS_STATUS_NONE = "none"
 
 # Number of hot-cue slots per deck — mirrors the engine's
 # ``Deck::hot_cues: [Option<u64>; 8]`` array in ``engine/src/state.rs``.
@@ -1034,10 +1039,17 @@ class TrackLibrary:
         """Aggregate stems-status counts across the catalog.
 
         Returns a dict keyed by the four reportable buckets:
-        ``"ready"`` / ``"pending"`` / ``"failed"`` / ``"none"`` (no
-        row in `tracks.stems_status` — never requested). Always
-        includes all four keys with ``0`` defaults so the UI can
-        render the row without branching on missing buckets.
+        ``STEMS_STATUS_READY`` / ``..._PENDING`` / ``..._FAILED`` /
+        ``..._NONE``. The ``"none"`` bucket covers BOTH tracks
+        whose ``tracks.stems_status`` is NULL (never requested) AND
+        tracks whose status holds an unrecognized value (e.g. a
+        manual SQL write of a future enum the code doesn't know
+        about) — both situations land in the same "unknown
+        readiness" bucket so the UI's closed-enum contract stays
+        intact.
+
+        Always includes all four keys with ``0`` defaults so the
+        UI can render the row without branching on missing buckets.
 
         Used by ``library.stems_status`` so the AboutPanel can
         surface "Stems: 3 ready · 1 pending · 12 none" without
@@ -1047,24 +1059,24 @@ class TrackLibrary:
             STEMS_STATUS_READY: 0,
             STEMS_STATUS_PENDING: 0,
             STEMS_STATUS_FAILED: 0,
-            "none": 0,
+            STEMS_STATUS_NONE: 0,
         }
-        # SQLite's COALESCE flattens NULL → 'none' so the GROUP BY
-        # produces one row per reportable bucket. Avoids two queries
-        # + the cost of a separate NULL count.
+        # SQLite's COALESCE flattens NULL → `STEMS_STATUS_NONE` so
+        # the GROUP BY produces one row per reportable bucket.
+        # Avoids two queries + the cost of a separate NULL count.
         rows = self._conn.execute(
-            "SELECT COALESCE(stems_status, 'none') AS bucket, "
+            "SELECT COALESCE(stems_status, ?) AS bucket, "
             "COUNT(*) AS n FROM tracks GROUP BY bucket",
+            (STEMS_STATUS_NONE,),
         ).fetchall()
         for r in rows:
             bucket = r["bucket"]
             if bucket in out:
                 out[bucket] = int(r["n"])
             else:
-                # Defensive: any future status value the DB ends up
-                # with (e.g. a manual SQL write) gets lumped into
-                # "none" instead of silently disappearing.
-                out["none"] += int(r["n"])
+                # Unknown status value (manual SQL / future enum) →
+                # NONE bucket; documented in the docstring above.
+                out[STEMS_STATUS_NONE] += int(r["n"])
         return out
 
     def list_tracks(
