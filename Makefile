@@ -8,7 +8,7 @@
 #   * node + npm (for the UI)
 #   * `cargo install tauri-cli@2` once per workstation for `dev-tauri` / `build-tauri`.
 
-.PHONY: help build-engine build-ui dev-tauri build-tauri test-engine test-tauri test-ui clean bake-in bake-in-tests supabase-print cloud-sync-status
+.PHONY: help build-engine build-ui dev-tauri build-tauri test-engine test-tauri test-ui test-copilot clean bake-in bake-in-tests supabase-print cloud-sync-status
 
 # v0.2 bake-in defaults — 25-minute sanity run. Bump DURATION_MIN=240
 # for the four-hour soak the release checklist demands.
@@ -27,6 +27,7 @@ help:
 	@echo "  make test-engine    — cargo test --all-targets on engine/"
 	@echo "  make test-tauri     — cargo test --all-targets on tauri/"
 	@echo "  make test-ui        — npm run test on ui/"
+	@echo "  make test-copilot   — pytest copilot/tests/ (Python copilot service)"
 	@echo "  make bake-in        — full synthetic bake-in (default 25 min)"
 	@echo "  make bake-in DURATION_MIN=240   — full 4-hour soak"
 	@echo "  make bake-in-tests  — pytest the bake-in harness scripts only"
@@ -56,6 +57,15 @@ test-tauri:
 
 test-ui:
 	cd ui && npm run test
+
+# Run pytest against the Python copilot package. Test set is small +
+# fast (<5s); useful as the last gate before opening a PR that
+# touches `copilot/`. Tests requiring optional deps (e.g. aiohttp
+# for `test_service_integration.py`) skip gracefully via pytest
+# collection-error handling — see `test-copilot-fast` for the
+# guaranteed-clean subset.
+test-copilot:
+	PYTHONPATH=. $(PYTHON) -m pytest copilot/tests/ -q
 
 clean:
 	cd engine && cargo clean
