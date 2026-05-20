@@ -66,11 +66,16 @@ The fix needed three properties:
   remote's micros are strictly greater than the local micros;
   otherwise the local wins and the syncer marks the row for
   outbound push.
-- Trade-off accepted: two machines editing the same track within
-  the same wall-clock micro lose one edit. Acceptable for v0.x —
-  the conflict surface is "I edited the same track on two
-  machines in the same second," which is rare for the target user
-  (one operator with multiple machines, not a collaborative team).
+- Trade-off accepted: any two machines that edit the same track
+  *independently* (before the daemon has synced one to the other)
+  will converge to whichever edit has the higher
+  `updated_at_micros`; the older edit is lost. Acceptable for
+  v0.x — the conflict surface is "I edited the same track on two
+  machines while offline," which is rare for the target user (one
+  operator with multiple machines, not a collaborative team). The
+  strict-equality tie case (same micro precisely) is just one
+  corner of this surface — the broader "older edit silently
+  loses" behavior is the load-bearing trade-off.
 
 ### Outbound queue: separate `pending_push` table
 
@@ -97,6 +102,12 @@ The fix needed three properties:
   `tick_once` after waking — `library.sync_now` passes True (RPC
   already ran a manual tick); `library.requeue_all_pending` passes
   False (no manual tick happened, daemon must actually drain).
+  **Every `wake_now` call overwrites the flag** (the implementation
+  is `_skip_next_auto_tick = bool(skip_next_tick)`, not a
+  conditional set) — so a later `wake_now(skip_next_tick=False)`
+  clears any pending skip from an earlier call and forces the next
+  daemon iteration to tick. This is the "latter caller wins"
+  contract Codex's #184 R2 review made concrete.
 - Counter mutations (`_consecutive_failures`,
   `_skip_next_auto_tick`) and stats snapshots are lock-protected
   (`_stats_lock`) because `library.sync_now` calls `tick_once`
@@ -125,10 +136,10 @@ The fix needed three properties:
 - **CRDT (e.g. Yjs) instead of LWW**. Real merge semantics, but
   too heavy for a v0.x where the conflict surface is rare and the
   data shape is flat.
-- **Polling instead of subscribing to Postgres LISTEN/NOTIFY**.
-  We poll. Notifications would be lower-latency but introduce
-  WebSocket lifecycle complexity — backoff, reconnect, multi-tab,
-  etc. The 60s poll is sufficient for a track-catalog sync.
+- **Postgres LISTEN/NOTIFY instead of polling**. We chose polling.
+  Notifications would be lower-latency but introduce WebSocket
+  lifecycle complexity — backoff, reconnect, multi-tab, etc. The
+  60s poll is sufficient for a track-catalog sync.
 
 ## Consequences
 
@@ -149,11 +160,12 @@ The fix needed three properties:
 
 ### Negative
 
-- LWW conflicts silently lose one edit when two machines write
-  the same track in the same wall-clock micro. Mitigation: the
-  pending-push queue is observable (`library.list_pending_push`
-  + UI chip + filter), so an operator who suspects a conflict
-  can manually verify.
+- LWW conflicts silently lose the older edit whenever two
+  machines edit the same track independently before syncing — the
+  higher `updated_at_micros` wins. Mitigation: the pending-push
+  queue is observable (`library.list_pending_push` + UI chip +
+  filter), so an operator who suspects a conflict can manually
+  verify which machine's edit ended up on the cloud.
 - Anon-key safety relies on RLS being on for multi-user mode —
   the v0.x default of RLS OFF is documented in
   `docs/known-limitations.md` and `001_tracks.sql` as a single-user
