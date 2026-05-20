@@ -6,6 +6,7 @@ import {
   __resetLibraryStore,
   __setLibraryTracks,
   fetchLibrary,
+  refetchLibrary,
   searchLibrary,
   type LibraryTrack,
 } from "./library";
@@ -127,5 +128,37 @@ describe("library store", () => {
     const client = { call } as unknown as JsonRpcWS;
     const result = await searchLibrary(client, "anything");
     expect(result).toEqual([]);
+  });
+
+  it("fetchLibrary short-circuits when already loaded (no remount thrash)", async (): Promise<void> => {
+    const call = vi.fn().mockResolvedValue({
+      tracks: [makeTrack("t1")],
+      total: 1,
+    });
+    const client = { call } as unknown as JsonRpcWS;
+    await fetchLibrary(client);
+    await fetchLibrary(client);
+    await fetchLibrary(client);
+    expect(call).toHaveBeenCalledTimes(1);
+  });
+
+  it("refetchLibrary forces a fresh list_tracks call even when loaded", async (): Promise<void> => {
+    let nthCall = 0;
+    const call = vi.fn(async (): Promise<unknown> => {
+      nthCall += 1;
+      return {
+        tracks:
+          nthCall === 1
+            ? [makeTrack("t1")]
+            : [makeTrack("t1"), makeTrack("t2")],
+        total: nthCall === 1 ? 1 : 2,
+      };
+    });
+    const client = { call } as unknown as JsonRpcWS;
+    const first = await fetchLibrary(client);
+    expect(first.tracks).toHaveLength(1);
+    const second = await refetchLibrary(client);
+    expect(second.tracks).toHaveLength(2);
+    expect(call).toHaveBeenCalledTimes(2);
   });
 });
