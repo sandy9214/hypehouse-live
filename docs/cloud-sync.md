@@ -11,7 +11,8 @@ exponentially on consecutive transport errors (cap = 10 min).
   urllib), `LibrarySyncer` (last-write-wins resolver), `SyncDaemon`
   (background tick loop)
 - `copilot/cloud_sync/migrations/001_tracks.sql` — Postgres schema
-- `library.sync_status` + `library.sync_now` + `library.list_pending_push`
+- `library.sync_status` + `library.sync_now` +
+  `library.list_pending_push` + `library.requeue_all_pending`
   JSON-RPC methods (UI consumes these via AboutPanel + TrackRow chip)
 - `make supabase-print` — convenience helper that emits the migration
   SQL with paste-ready setup instructions
@@ -47,8 +48,9 @@ exponentially on consecutive transport errors (cap = 10 min).
 - After importing a track, the same row shows `· N pending sync`
   briefly, then drops to zero once the next tick drains the queue.
 - Track rows in the Library panel show a `⟳ pending` chip while the
-  push is queued. The Library filter checkbox **"Pending sync only"**
-  narrows the visible rows to just the pending set.
+  push is queued. The **"Pending sync"** checkbox in the library
+  filter bar narrows the visible rows to just the pending set
+  (active filter renders a removable `pending sync only` chip).
 - AboutPanel **"sync now"** button → immediate `library.sync_now`
   tick. The daemon also wakes so the next automatic tick fires at
   the reset cadence.
