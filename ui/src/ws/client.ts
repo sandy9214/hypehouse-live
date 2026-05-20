@@ -71,6 +71,7 @@ interface Pending {
   reject: (err: Error) => void;
 }
 
+const READY_CONNECTING = 0;
 const READY_OPEN = 1;
 
 /**
@@ -117,7 +118,19 @@ export class JsonRpcWS {
   /** Open the socket; safe to call multiple times. */
   public connect(): void {
     this.closedByUser = false;
-    if (this.socket && this.socket.readyState === READY_OPEN) return;
+    // Short-circuit both OPEN and CONNECTING so a rapid second
+    // call (e.g. operator double-clicking the "reconnect" button)
+    // doesn't open a second socket and break the single-socket
+    // invariant — stale onopen/onclose handlers on the prior
+    // socket would otherwise mutate `this.socket` after the new
+    // socket landed (Codex #216 R1 P1 finding).
+    if (
+      this.socket &&
+      (this.socket.readyState === READY_OPEN ||
+        this.socket.readyState === READY_CONNECTING)
+    ) {
+      return;
+    }
     const ws = this.factory(this.url);
     this.socket = ws;
     ws.onopen = (): void => this.handleOpen();

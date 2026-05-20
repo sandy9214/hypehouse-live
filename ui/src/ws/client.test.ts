@@ -233,6 +233,31 @@ describe("JsonRpcWS", () => {
     c.close();
   });
 
+  it("reconnectNow() called twice rapidly does NOT create a second socket (Codex #216 R1 P1)", () => {
+    // Regression: connect() previously only short-circuited on
+    // READY_OPEN, so a second reconnectNow() while the new socket
+    // was still in CONNECTING (readyState=0) would open a second
+    // socket — breaking the single-socket invariant.
+    const factory = makeFactory();
+    const c = new JsonRpcWS({
+      url: "ws://test/ws",
+      factory,
+      initialBackoffMs: 30_000,
+    });
+    c.connect();
+    MockWS.instances[0]!.open();
+    MockWS.instances[0]!.close();
+    c.reconnectNow();
+    // Socket [1] is now CONNECTING (readyState=0, hasn't fired
+    // open yet). A second reconnectNow() must NOT spawn [2].
+    expect(MockWS.instances.length).toBe(2);
+    c.reconnectNow();
+    expect(MockWS.instances.length).toBe(2);
+    // After the new socket opens, things are normal.
+    MockWS.instances[1]!.open();
+    c.close();
+  });
+
   it("reconnectNow() resets backoff state for next failure cycle", () => {
     const factory = makeFactory();
     const c = new JsonRpcWS({
