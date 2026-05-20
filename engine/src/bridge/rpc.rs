@@ -552,7 +552,9 @@ impl EngineHandle {
     /// 1. **Open-time** — control thread fans out
     ///    `event_to_commands_with_errors` failures from
     ///    `engine/src/main.rs` whenever the translator's
-    ///    `DecodeService::open` errors on a `DeckLoad` event.
+    ///    `DecodeService::open` / `DecodeService::open_stems`
+    ///    errors on a `DeckLoad` or `DeckLoadStems` event (see
+    ///    `engine/src/audio/translator.rs`).
     /// 2. **Mid-stream** — the decode-drain side channel in
     ///    `engine/src/bridge/decode_drain.rs` calls this for
     ///    mid-stream `DecodeFailure` (`mid_stream_decode_failure`
