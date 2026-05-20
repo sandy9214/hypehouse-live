@@ -195,8 +195,15 @@ const isSearchResult = (v: unknown): v is LibrarySearchResult => {
 };
 
 /**
- * Fetch one page from `library.list_tracks` and cache it. Subsequent
- * calls with the same args are deduped via the ``loading`` flag.
+ * Fetch one page from `library.list_tracks` and cache it. While a
+ * fetch is in flight, concurrent callers no-op via the ``loading``
+ * flag. After the cache is populated, callers no-op via ``loaded``
+ * — pass ``{ force: true }`` (or use ``refetchLibrary``) to bypass.
+ *
+ * NOTE: dedupe is on cache state, NOT on (limit, offset) args. If a
+ * paged consumer mounts and a subsequent caller wants a different
+ * offset, that second caller must pass ``force: true`` — the cache
+ * is single-page and doesn't track which page is currently held.
  */
 export const fetchLibrary = async (
   client: JsonRpcWS,
