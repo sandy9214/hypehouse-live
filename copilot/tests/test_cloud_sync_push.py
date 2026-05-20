@@ -55,6 +55,59 @@ def test_upsert_from_remote_does_not_enqueue(tmp_path: Path) -> None:
         lib.close()
 
 
+def test_requeue_all_for_push_on_fresh_library_enqueues_everything(
+    tmp_path: Path,
+) -> None:
+    """Pre-cloud-sync upgrade path: tracks already exist with no
+    `pending_push` rows. `requeue_all_for_push` enqueues them all.
+    """
+    lib = TrackLibrary(tmp_path / "lib.db")
+    try:
+        lib.add_track(_make_track("t1"))
+        lib.add_track(_make_track("t2"))
+        lib.add_track(_make_track("t3"))
+        # Simulate the pre-upgrade state: drain the auto-enqueued
+        # rows from `add_track` and re-test that the helper repopulates.
+        for tid in ["t1", "t2", "t3"]:
+            lib.clear_pending_push(tid)
+        assert lib.pending_push_ids() == []
+
+        queued = lib.requeue_all_for_push()
+        assert queued == 3
+        assert set(lib.pending_push_ids()) == {"t1", "t2", "t3"}
+    finally:
+        lib.close()
+
+
+def test_requeue_all_for_push_is_idempotent(tmp_path: Path) -> None:
+    """Calling twice without intervening pushes returns the same
+    count and preserves the original `queued_at_micros` ordering."""
+    lib = TrackLibrary(tmp_path / "lib.db")
+    try:
+        lib.add_track(_make_track("alpha"))
+        lib.add_track(_make_track("bravo"))
+        first_order = lib.pending_push_ids()
+        first_count = lib.requeue_all_for_push()
+        second_count = lib.requeue_all_for_push()
+        assert first_count == 2
+        assert second_count == 2
+        # INSERT OR IGNORE → original ordering preserved.
+        assert lib.pending_push_ids() == first_order
+    finally:
+        lib.close()
+
+
+def test_requeue_all_for_push_on_empty_library_returns_zero(
+    tmp_path: Path,
+) -> None:
+    lib = TrackLibrary(tmp_path / "lib.db")
+    try:
+        assert lib.requeue_all_for_push() == 0
+        assert lib.pending_push_ids() == []
+    finally:
+        lib.close()
+
+
 def test_clear_pending_push(tmp_path: Path) -> None:
     lib = TrackLibrary(tmp_path / "lib.db")
     try:

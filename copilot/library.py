@@ -542,6 +542,31 @@ class TrackLibrary:
         )
         self._conn.commit()
 
+    def requeue_all_for_push(self) -> int:
+        """Enqueue every track in the local catalog for cloud push.
+
+        Used after a pre-cloud-sync upgrade to seed the remote from
+        an existing local library (the v10/v11 migrations don't
+        backfill the queue automatically — too aggressive for users
+        who only want incremental sync).
+
+        Uses `INSERT OR IGNORE` so tracks already in the queue keep
+        their original `queued_at_micros` ordering. Returns the new
+        total count of queued rows (caller surfaces this to the UI).
+        """
+        now_us = _now_micros()
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO pending_push (track_id, queued_at_micros) "
+            "SELECT track_id, ? FROM tracks",
+            (now_us,),
+        )
+        self._conn.commit()
+        _ = cur  # the rowcount post-INSERT-OR-IGNORE is platform-
+        # dependent under SQLite; read the canonical count instead.
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM pending_push"
+        ).fetchone()[0]
+
     def row_for_cloud_push(
         self, track_id: str
     ) -> tuple[str, float, str, float, float, list[int | None], int] | None:

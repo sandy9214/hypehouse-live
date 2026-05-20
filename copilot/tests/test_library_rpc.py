@@ -762,6 +762,44 @@ async def test_list_pending_push_after_partial_clear(
     assert sorted(result["ids"]) == ["bravo", "charlie", "echo"]
 
 
+# ---- requeue_all_pending --------------------------------------------
+
+
+def test_handler_handles_requeue_all_pending(library: TrackLibrary):
+    handler = LibraryRpcHandler(library)
+    assert handler.handles("library.requeue_all_pending") is True
+
+
+@_asyncio
+async def test_requeue_all_pending_empty_library(library: TrackLibrary):
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.requeue_all_pending", {})
+    assert result == {"queued": 0}
+
+
+@_asyncio
+async def test_requeue_all_pending_seeds_pre_cloud_sync_library(
+    library: TrackLibrary,
+):
+    """Operator escape hatch — after a pre-cloud-sync upgrade the
+    local library has tracks but no pending_push rows. The RPC must
+    enqueue everything."""
+    _seed(library)  # 5 adds → 5 auto-enqueued rows
+    for tid in ["alpha", "bravo", "charlie", "delta", "echo"]:
+        library.clear_pending_push(tid)
+    assert library.pending_push_ids() == []
+    handler = LibraryRpcHandler(library)
+    result = await handler.dispatch("library.requeue_all_pending", {})
+    assert result == {"queued": 5}
+    assert sorted(library.pending_push_ids()) == [
+        "alpha",
+        "bravo",
+        "charlie",
+        "delta",
+        "echo",
+    ]
+
+
 @_asyncio
 async def test_sync_now_wraps_sqlite_error_as_rpc_error(
     library: TrackLibrary,

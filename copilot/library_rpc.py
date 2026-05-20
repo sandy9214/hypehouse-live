@@ -209,6 +209,7 @@ class LibraryRpcHandler:
         "sync_status",
         "sync_now",
         "list_pending_push",
+        "requeue_all_pending",
     )
     # ``key_match.compute_offset`` lives in a sibling namespace but
     # needs read access to the same library, so we dispatch it through
@@ -309,6 +310,8 @@ class LibraryRpcHandler:
             return self._sync_now(params)
         if method == "library.list_pending_push":
             return self._list_pending_push(params)
+        if method == "library.requeue_all_pending":
+            return self._requeue_all_pending(params)
         if method == "key_match.compute_offset":
             return self._key_match_compute_offset(params)
         if method == "streaming.search":
@@ -318,6 +321,24 @@ class LibraryRpcHandler:
         raise RpcError(-32601, f"method not found: {method}")
 
     # --- handlers -----------------------------------------------------
+
+    def _requeue_all_pending(
+        self, _params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Re-enqueue every local track for cloud push.
+
+        Operator escape hatch: after a pre-cloud-sync upgrade the
+        existing local library has no `pending_push` rows, so the
+        cloud never sees these tracks until they're re-added one by
+        one. This RPC stamps the whole catalog as pending in a
+        single SQLite statement (`INSERT OR IGNORE` preserves any
+        existing `queued_at_micros` order).
+
+        Returns the resulting pending-push count so the UI can pop a
+        confirmation toast ("N tracks queued for sync").
+        """
+        queued = self._library.requeue_all_for_push()
+        return {"queued": int(queued)}
 
     def _list_pending_push(
         self, _params: dict[str, Any]
