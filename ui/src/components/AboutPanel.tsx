@@ -88,6 +88,14 @@ const syncErrorStyle: CSSProperties = {
   marginTop: "0.1rem",
 };
 
+const syncCountsStyle: CSSProperties = {
+  color: "#8a8a8a",
+  fontSize: "0.7rem",
+  marginTop: "0.1rem",
+  marginLeft: "0.4rem",
+  fontFamily: "monospace",
+};
+
 const flagsRowStyle: CSSProperties = {
   display: "flex",
   flexWrap: "wrap",
@@ -199,6 +207,20 @@ export const AboutPanel = ({ client }: AboutPanelProps): JSX.Element => {
       {syncError !== "" ? (
         <div style={syncErrorStyle} data-testid="about-sync-error">
           {syncError}
+        </div>
+      ) : null}
+      {sync.last_pull_fetched +
+        sync.last_pull_applied +
+        sync.last_push_pushed >
+      0 ? (
+        <div style={syncCountsStyle} data-testid="about-sync-counts">
+          ↓ {sync.last_pull_fetched} fetched
+          {sync.last_pull_applied > 0
+            ? ` · ${sync.last_pull_applied} applied`
+            : ""}
+          {sync.last_push_pushed > 0
+            ? ` · ↑ ${sync.last_push_pushed} pushed`
+            : ""}
         </div>
       ) : null}
       <div style={flagsRowStyle} data-testid="about-flags">
