@@ -649,6 +649,61 @@ async def test_sync_now_calls_daemon_tick_once_and_returns_status(
 
 
 @_asyncio
+async def test_sync_now_calls_wake_now_after_tick(library: TrackLibrary):
+    """After running an out-of-band tick, the RPC must kick the
+    daemon's `_wake` so its next automatic tick fires at the now-
+    reset cadence instead of finishing the prior backoff wait.
+    """
+    from copilot.cloud_sync import SyncStats
+
+    class StubDaemon:
+        def __init__(self) -> None:
+            self.tick_calls = 0
+            self.wake_calls = 0
+            self._stats = SyncStats()
+
+        def tick_once(self) -> None:
+            self.tick_calls += 1
+
+        def wake_now(self) -> None:
+            self.wake_calls += 1
+
+        def stats(self) -> SyncStats:
+            return self._stats
+
+    daemon = StubDaemon()
+    handler = LibraryRpcHandler(library, sync_daemon=daemon)
+    await handler.dispatch("library.sync_now", {})
+    assert daemon.tick_calls == 1
+    assert daemon.wake_calls == 1, (
+        "sync_now must call wake_now to refresh the daemon's schedule"
+    )
+
+
+@_asyncio
+async def test_sync_now_tolerates_daemon_without_wake_now(
+    library: TrackLibrary,
+):
+    """Older daemon stubs (and older deployed copilots during an
+    in-place upgrade) may not expose `wake_now`. The RPC must
+    tolerate that — `wake_now` is best-effort."""
+    from copilot.cloud_sync import SyncStats
+
+    class OldStubDaemon:
+        def tick_once(self) -> None:
+            pass
+
+        def stats(self) -> SyncStats:
+            return SyncStats()
+
+        # No wake_now method.
+
+    handler = LibraryRpcHandler(library, sync_daemon=OldStubDaemon())
+    # Must not raise AttributeError.
+    await handler.dispatch("library.sync_now", {})
+
+
+@_asyncio
 async def test_sync_now_wraps_transport_error_as_rpc_error(
     library: TrackLibrary,
 ):

@@ -422,6 +422,86 @@ def test_stamp_next_sync_grows_under_failures(tmp_path: Path) -> None:
     assert 239_000_000 <= delta <= 241_000_000
 
 
+# ----- wake_now -------------------------------------------------
+
+
+def test_wake_now_short_circuits_long_backoff_wait(tmp_path: Path) -> None:
+    """`wake_now` must unblock the daemon thread early so the next
+    automatic tick fires soon after a manual `sync_now`. Without
+    this, the daemon would finish its long backoff wait before its
+    next iteration despite `_consecutive_failures` having been
+    reset.
+    """
+    db = tmp_path / "lib.db"
+    lib = TrackLibrary(db)
+    lib.add_track(_make_track("t"))
+    lib.close()
+    client = InMemorySyncClient()
+
+    # Set a tick that's long enough that the test would hang on it
+    # without wake_now (and the test's 2s budget would still report
+    # the bug as a failure rather than a hang).
+    daemon = SyncDaemon(client, db, tick_seconds=5.0)
+    daemon.start()
+    try:
+        # Wait until the thread has parked in `_wake.wait(...)`; the
+        # initial iteration stamps `next_sync_micros` so we can use
+        # that as a readiness probe.
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            if daemon.stats().next_sync_micros > 0:
+                break
+            time.sleep(0.02)
+        assert daemon.stats().next_sync_micros > 0, (
+            "daemon never stamped its first wake deadline"
+        )
+
+        start = time.time()
+        daemon.wake_now()
+        # Daemon should now wake, run the tick, and push the seeded
+        # track to the InMemory client. Without wake_now, this would
+        # take ~5s; with it, sub-second.
+        budget_deadline = time.time() + 2.0
+        while time.time() < budget_deadline:
+            if client.get_track("t") is not None:
+                break
+            time.sleep(0.02)
+        assert client.get_track("t") is not None, (
+            "daemon never woke + ticked within 2s of wake_now"
+        )
+        elapsed = time.time() - start
+        # Should be well under the 5s tick_seconds (allow generous
+        # 1.5s for thread + RPC latency on slow CI runners).
+        assert elapsed < 1.5, (
+            f"daemon woke too slowly: {elapsed:.2f}s — wake_now ineffective"
+        )
+    finally:
+        daemon.stop()
+
+
+def test_stop_unblocks_wake_wait(tmp_path: Path) -> None:
+    """`stop()` must signal `_wake` too — otherwise the daemon thread
+    sits in `_wake.wait(tick)` until the timeout fires even after
+    the operator asks it to stop."""
+    daemon = SyncDaemon(
+        InMemorySyncClient(), tmp_path / "lib.db", tick_seconds=10.0
+    )
+    daemon.start()
+    # Wait for the daemon to enter its first wait.
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        if daemon.stats().next_sync_micros > 0:
+            break
+        time.sleep(0.02)
+    start = time.time()
+    daemon.stop(join_timeout_s=2.0)
+    elapsed = time.time() - start
+    # Must unblock fast — well under the 10s wait length.
+    assert elapsed < 1.5, (
+        f"stop() didn't break the wake-wait early: {elapsed:.2f}s"
+    )
+
+
 def test_consecutive_failures_mutation_is_lock_protected(
     tmp_path: Path,
 ) -> None:

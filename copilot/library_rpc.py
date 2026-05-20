@@ -372,6 +372,13 @@ class LibraryRpcHandler:
                 JSONRPC_INTERNAL_ERROR,
                 f"cloud sync local DB error: {exc}",
             ) from exc
+        # Wake the daemon thread so its next automatic tick fires at
+        # the now-reset cadence (post-clean-tick failures=0 → 60s),
+        # not after finishing the prior backoff wait. Optional —
+        # tolerate stub daemons in tests that don't expose `wake_now`.
+        wake = getattr(self._sync_daemon, "wake_now", None)
+        if callable(wake):
+            wake()
         return self._sync_status(_params)
 
     def _sync_status(self, _params: dict[str, Any]) -> dict[str, Any]:
