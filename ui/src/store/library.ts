@@ -195,14 +195,22 @@ const isSearchResult = (v: unknown): v is LibrarySearchResult => {
 };
 
 /**
- * Fetch one page from `library.list_tracks` and cache it. Subsequent
- * calls with the same args are deduped via the ``loading`` flag.
+ * Fetch one page from `library.list_tracks` and cache it. While a
+ * fetch is in flight, concurrent callers no-op via the ``loading``
+ * flag. After the cache is populated, callers no-op via ``loaded``
+ * — pass ``{ force: true }`` (or use ``refetchLibrary``) to bypass.
+ *
+ * NOTE: dedupe is on cache state, NOT on (limit, offset) args. If a
+ * paged consumer mounts and a subsequent caller wants a different
+ * offset, that second caller must pass ``force: true`` — the cache
+ * is single-page and doesn't track which page is currently held.
  */
 export const fetchLibrary = async (
   client: JsonRpcWS,
-  opts: { limit?: number; offset?: number } = {},
+  opts: { limit?: number; offset?: number; force?: boolean } = {},
 ): Promise<LibraryStoreState> => {
   if (current.loading) return current;
+  if (current.loaded && !opts.force) return current;
   current = { ...current, loading: true };
   notify();
   const limit = opts.limit ?? 100;
@@ -394,12 +402,47 @@ export const setHotCues = async (
 };
 
 /**
+ * Force-refresh the cached library snapshot, bypassing the `loaded`
+ * guard. Used by the WS-reconnect subscriber — the library can drift
+ * during a socket gap (a second window scanned a folder, a stem
+ * compute landed, hot-cues edited via another deck). Refetches with
+ * pagination defaults; offset-paged consumers should re-issue their
+ * own paged fetchLibrary call after this lands.
+ */
+export const refetchLibrary = (
+  client: JsonRpcWS,
+): Promise<LibraryStoreState> => fetchLibrary(client, { force: true });
+
+// Module-level WeakSet of clients we've wired an onOpen subscriber
+// for. Same conditional-mount race guard as the sessions store
+// (#224 R1) + the presets store (#231). The Library panel can be
+// hidden behind other tabs; we still want the cache to refresh on
+// reconnect.
+const libraryClientsSubscribed: WeakSet<JsonRpcWS> = new WeakSet();
+
+const ensureLibraryOpenSubscribed = (client: JsonRpcWS): void => {
+  if (libraryClientsSubscribed.has(client)) return;
+  const ow = (
+    client as { onOpen?: (cb: () => void) => () => void }
+  ).onOpen;
+  if (typeof ow !== "function") return;
+  libraryClientsSubscribed.add(client);
+  ow.call(client, (): void => {
+    void refetchLibrary(client);
+  });
+};
+
+/**
  * React hook returning the cached library snapshot. Pass a live
  * `JsonRpcWS`; on first mount it kicks off `library.list_tracks`.
+ * Idempotently wires a module-level WS-reconnect subscriber so the
+ * cache self-refreshes after a socket bounce even while the panel
+ * is unmounted.
  */
 export const useLibrary = (client: JsonRpcWS): LibraryStoreState => {
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   useEffect((): void => {
+    ensureLibraryOpenSubscribed(client);
     if (!snapshot.loaded && !snapshot.loading) {
       void fetchLibrary(client);
     }
