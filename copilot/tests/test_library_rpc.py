@@ -659,14 +659,14 @@ async def test_sync_now_calls_wake_now_after_tick(library: TrackLibrary):
     class StubDaemon:
         def __init__(self) -> None:
             self.tick_calls = 0
-            self.wake_calls = 0
+            self.wake_calls: list[bool] = []  # records skip_next_tick
             self._stats = SyncStats()
 
         def tick_once(self) -> None:
             self.tick_calls += 1
 
-        def wake_now(self) -> None:
-            self.wake_calls += 1
+        def wake_now(self, *, skip_next_tick: bool = True) -> None:
+            self.wake_calls.append(skip_next_tick)
 
         def stats(self) -> SyncStats:
             return self._stats
@@ -675,8 +675,9 @@ async def test_sync_now_calls_wake_now_after_tick(library: TrackLibrary):
     handler = LibraryRpcHandler(library, sync_daemon=daemon)
     await handler.dispatch("library.sync_now", {})
     assert daemon.tick_calls == 1
-    assert daemon.wake_calls == 1, (
-        "sync_now must call wake_now to refresh the daemon's schedule"
+    assert daemon.wake_calls == [True], (
+        "sync_now must call wake_now(skip_next_tick=True) so the "
+        "daemon doesn't duplicate the manual tick_once"
     )
 
 
@@ -789,10 +790,10 @@ async def test_requeue_all_pending_calls_wake_now_when_daemon_wired(
 
     class StubDaemon:
         def __init__(self) -> None:
-            self.wake_calls = 0
+            self.wake_calls: list[bool] = []  # records skip_next_tick
 
-        def wake_now(self) -> None:
-            self.wake_calls += 1
+        def wake_now(self, *, skip_next_tick: bool = True) -> None:
+            self.wake_calls.append(skip_next_tick)
 
         def stats(self) -> SyncStats:
             return SyncStats()
@@ -801,9 +802,15 @@ async def test_requeue_all_pending_calls_wake_now_when_daemon_wired(
     daemon = StubDaemon()
     handler = LibraryRpcHandler(library, sync_daemon=daemon)
     await handler.dispatch("library.requeue_all_pending", {})
-    assert daemon.wake_calls == 1, (
-        "requeue_all_pending must call wake_now so the daemon starts "
-        "draining the freshly filled queue"
+    # CRITICAL: requeue did NOT run an out-of-band tick_once — the
+    # daemon's NEXT iteration must actually drain the freshly filled
+    # queue, so we explicitly pass skip_next_tick=False. Without this,
+    # the default `True` would skip the very tick that should drain
+    # the queue (Codex review note on #184 regressing #179).
+    assert daemon.wake_calls == [False], (
+        "requeue_all_pending must call wake_now(skip_next_tick=False) "
+        "so the daemon ACTUALLY drains the freshly filled queue on "
+        "its next iteration"
     )
 
 

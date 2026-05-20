@@ -93,6 +93,15 @@ class SyncDaemon:
         # remaining backoff window for the next automatic tick — even
         # though `_consecutive_failures` was reset by the manual tick.
         self._wake = threading.Event()
+        # Companion flag: when `wake_now()` fires from an RPC handler
+        # that already ran an out-of-band `tick_once`, the daemon's
+        # very next iteration would otherwise duplicate the pull +
+        # push (Codex review note on #176 — idempotent but wasteful).
+        # Setting this flag asks `_loop` to skip exactly the next
+        # `tick_once` it would have run, then resume the normal
+        # cadence. Mutated only under `_stats_lock` for the same
+        # cross-thread visibility guarantees as the failure counter.
+        self._skip_next_auto_tick = False
         self._thread: Optional[threading.Thread] = None
         self._stats_lock = threading.Lock()
         self._stats = SyncStats()
@@ -154,13 +163,30 @@ class SyncDaemon:
             self._library_path,
         )
 
-    def wake_now(self) -> None:
-        """Wake the daemon thread early, so its next iteration runs
-        as soon as possible. Used by `library.sync_now` after an
-        out-of-band `tick_once` to refresh the daemon's schedule —
-        otherwise the loop would still finish its already-scheduled
-        backoff wait before the next automatic tick fires.
+    def wake_now(self, *, skip_next_tick: bool = True) -> None:
+        """Wake the daemon thread early so its next iteration runs
+        ASAP. Used by `library.sync_now` after an out-of-band
+        `tick_once` to refresh the daemon's schedule — otherwise the
+        loop would still finish its already-scheduled backoff wait
+        before the next automatic tick fires.
+
+        `skip_next_tick=True` (the default for the sync_now path)
+        asks the daemon to skip exactly the next `tick_once` it
+        would have run, because the caller has just done the work
+        out-of-band. Pass `skip_next_tick=False` if the caller MUST
+        have the daemon's next iteration run a real tick — e.g.
+        `library.requeue_all_pending` which fills the queue but
+        does no out-of-band tick of its own.
+
+        **Always overwrites the flag**: a `skip_next_tick=False`
+        call after an earlier `skip_next_tick=True` (before the
+        daemon has consumed the first wake) clears the prior skip,
+        so the latter caller's "I really need a tick" intent wins
+        (Codex review note on #184 R2). The semantics here are
+        "tell the daemon what to do on its NEXT iteration."
         """
+        with self._stats_lock:
+            self._skip_next_auto_tick = bool(skip_next_tick)
         self._wake.set()
 
     def stop(self, *, join_timeout_s: float = 5.0) -> None:
@@ -315,6 +341,16 @@ class SyncDaemon:
             self._wake.clear()
             if self._stop.is_set():
                 break
+            # If `wake_now(skip_next_tick=True)` fired (the default
+            # from `library.sync_now` after an out-of-band
+            # `tick_once`), the work for this iteration has already
+            # been done. Consume the flag and loop back to wait
+            # again — the operator's manual tick is the canonical
+            # source of fresh data here.
+            with self._stats_lock:
+                if self._skip_next_auto_tick:
+                    self._skip_next_auto_tick = False
+                    continue
             try:
                 self.tick_once()
             except SyncError as exc:

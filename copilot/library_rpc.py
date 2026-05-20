@@ -344,10 +344,23 @@ class LibraryRpcHandler:
         confirmation toast ("N tracks queued for sync").
         """
         queued = self._library.requeue_all_for_push()
+        # `skip_next_tick=False` is critical here — unlike sync_now,
+        # this RPC did NOT run an out-of-band `tick_once`, so the
+        # daemon's next iteration is the one that drains the freshly
+        # filled queue. Passing the default `True` would skip that
+        # drain and force operators to wait another full cadence
+        # (Codex review note on #184).
         if self._sync_daemon is not None:
             wake = getattr(self._sync_daemon, "wake_now", None)
             if callable(wake):
-                wake()
+                try:
+                    wake(skip_next_tick=False)
+                except TypeError:
+                    # Older daemon stub (pre-#184) doesn't accept
+                    # the keyword; fall back to the legacy call
+                    # which is equivalent to skip_next_tick=False
+                    # on those builds.
+                    wake()
         return {"queued": int(queued)}
 
     def _list_pending_push(
@@ -405,11 +418,18 @@ class LibraryRpcHandler:
             ) from exc
         # Wake the daemon thread so its next automatic tick fires at
         # the now-reset cadence (post-clean-tick failures=0 → 60s),
-        # not after finishing the prior backoff wait. Optional —
-        # tolerate stub daemons in tests that don't expose `wake_now`.
+        # not after finishing the prior backoff wait. The explicit
+        # `skip_next_tick=True` is the right default for this path —
+        # we just ran a manual `tick_once`, so the daemon's very
+        # next iteration would otherwise duplicate the pull+push
+        # (Codex review note on #176). Tolerate older daemon stubs
+        # that don't accept the keyword.
         wake = getattr(self._sync_daemon, "wake_now", None)
         if callable(wake):
-            wake()
+            try:
+                wake(skip_next_tick=True)
+            except TypeError:
+                wake()
         return self._sync_status(_params)
 
     def _sync_status(self, _params: dict[str, Any]) -> dict[str, Any]:
