@@ -79,7 +79,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "db", nargs="?", default=None,
         help="path to library.db (default: $HYPEHOUSE_LIBRARY_DB "
-        "or ~/.config/hypehouse-live/library.db)",
+        "or ~/.hypehouse-live/library.db)",
     )
     parser.add_argument(
         "--json", action="store_true",
