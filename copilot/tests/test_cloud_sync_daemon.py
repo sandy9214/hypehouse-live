@@ -555,6 +555,69 @@ def test_wake_now_default_skips_redundant_auto_tick(
         daemon.stop()
 
 
+def test_wake_now_false_clears_prior_skip_flag(tmp_path: Path) -> None:
+    """Regression for Codex's #184 R2 finding.
+
+    Scenario: `library.sync_now` fires `wake_now(skip_next_tick=True)`.
+    Before the daemon thread consumes the wake (because it was in a
+    long backoff `_wake.wait`), `library.requeue_all_pending` fires
+    `wake_now(skip_next_tick=False)`. The daemon then wakes once
+    (the event is sticky, so both `.set()` calls coalesce). It MUST
+    run a real tick — the requeue path explicitly asked for it.
+
+    Without this fix, the daemon would see the still-True flag from
+    the first call and skip the very tick that should drain the
+    freshly queued rows.
+    """
+
+    class CountingClient:
+        def __init__(self) -> None:
+            self.list_tracks_calls = 0
+
+        def list_tracks(self, *, since_micros=0):  # noqa: ARG002
+            self.list_tracks_calls += 1
+            return []
+
+        def get_track(self, _id):
+            return None
+
+        def upsert_track(self, _t):
+            return None
+
+        def delete_track(self, _id):
+            return False
+
+    client = CountingClient()
+    daemon = SyncDaemon(client, tmp_path / "lib.db", tick_seconds=60.0)
+    daemon.start()
+    try:
+        # Settle: daemon enters _wake.wait.
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            if daemon.stats().next_sync_micros > 0:
+                break
+            time.sleep(0.01)
+        baseline = client.list_tracks_calls
+
+        # First wake asks to skip the next tick (sync_now path).
+        daemon.wake_now(skip_next_tick=True)
+        # Immediately follow with a wake asking for a real tick
+        # (requeue path). The flag must end up False.
+        daemon.wake_now(skip_next_tick=False)
+
+        # Daemon should now wake and ACTUALLY tick — counter +1.
+        for _ in range(50):
+            if client.list_tracks_calls > baseline:
+                break
+            time.sleep(0.02)
+        assert client.list_tracks_calls == baseline + 1, (
+            "wake_now(False) failed to clear a prior skip — Codex "
+            "#184 R2 regression"
+        )
+    finally:
+        daemon.stop()
+
+
 def test_stop_unblocks_wake_wait(tmp_path: Path) -> None:
     """`stop()` must signal `_wake` too — otherwise the daemon thread
     sits in `_wake.wait(tick)` until the timeout fires even after

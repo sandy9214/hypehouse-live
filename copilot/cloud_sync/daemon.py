@@ -173,13 +173,20 @@ class SyncDaemon:
         `skip_next_tick=True` (the default for the sync_now path)
         asks the daemon to skip exactly the next `tick_once` it
         would have run, because the caller has just done the work
-        out-of-band. Pass `skip_next_tick=False` if the caller only
-        wants to refresh the schedule (e.g. after a stats-only
-        change) without dropping a sync.
+        out-of-band. Pass `skip_next_tick=False` if the caller MUST
+        have the daemon's next iteration run a real tick — e.g.
+        `library.requeue_all_pending` which fills the queue but
+        does no out-of-band tick of its own.
+
+        **Always overwrites the flag**: a `skip_next_tick=False`
+        call after an earlier `skip_next_tick=True` (before the
+        daemon has consumed the first wake) clears the prior skip,
+        so the latter caller's "I really need a tick" intent wins
+        (Codex review note on #184 R2). The semantics here are
+        "tell the daemon what to do on its NEXT iteration."
         """
-        if skip_next_tick:
-            with self._stats_lock:
-                self._skip_next_auto_tick = True
+        with self._stats_lock:
+            self._skip_next_auto_tick = bool(skip_next_tick)
         self._wake.set()
 
     def stop(self, *, join_timeout_s: float = 5.0) -> None:
