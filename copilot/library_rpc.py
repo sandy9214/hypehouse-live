@@ -210,6 +210,7 @@ class LibraryRpcHandler:
         "sync_now",
         "list_pending_push",
         "requeue_all_pending",
+        "stems_status",
     )
     # ``key_match.compute_offset`` lives in a sibling namespace but
     # needs read access to the same library, so we dispatch it through
@@ -312,6 +313,8 @@ class LibraryRpcHandler:
             return self._list_pending_push(params)
         if method == "library.requeue_all_pending":
             return self._requeue_all_pending(params)
+        if method == "library.stems_status":
+            return self._stems_status(params)
         if method == "key_match.compute_offset":
             return self._key_match_compute_offset(params)
         if method == "streaming.search":
@@ -321,6 +324,23 @@ class LibraryRpcHandler:
         raise RpcError(-32601, f"method not found: {method}")
 
     # --- handlers -----------------------------------------------------
+
+    def _stems_status(
+        self, _params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Aggregate counts of tracks by demucs stems-status.
+
+        Returns the four reportable buckets:
+            { "ready": N, "pending": M, "failed": K, "none": L }
+
+        ``"ready"`` is the count operators usually want — tracks that
+        have stem WAVs cached and ready for the stem-deck path.
+        ``"pending"`` is the in-flight set (computation kicked off
+        but not yet finished). ``"failed"`` is the burned set —
+        operator should investigate. ``"none"`` is the un-requested
+        set (never asked, never tried).
+        """
+        return self._library.count_stems_by_status()
 
     def _requeue_all_pending(
         self, _params: dict[str, Any]
