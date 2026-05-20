@@ -1,26 +1,35 @@
 """hypehouse-live cloud library sync — Supabase-backed mirror.
 
-Issue #102 scaffold (slice 1). The runtime client + REST calls are
-behind the `SyncClient` protocol so unit tests can substitute a
-deterministic in-memory fake; the real Supabase wiring lands in the
-follow-up slice with the project's actual URL + anon key.
+Closes issue #102 (full pull + push + daemon + UI surface; see
+``docs/cloud-sync.md`` for the operator setup guide).
 
 Layers
 ------
 
-* :class:`SyncClient` — protocol; one method per remote operation.
+* :class:`SyncClient` — Protocol; one method per remote operation.
 * :class:`InMemorySyncClient` — test fake; used by every unit test in
   this module so we never depend on a live Supabase project for CI.
-* :class:`SupabaseSyncClient` — REST adapter. Slice 2.
+* :class:`SupabaseSyncClient` — PostgREST adapter (stdlib urllib, no
+  third-party SDK). Constructed via :meth:`SupabaseSyncClient.from_env`
+  from ``$SUPABASE_URL`` + ``$SUPABASE_ANON_KEY``.
 * :class:`LibrarySyncer` — orchestration. Pulls remote rows, resolves
-  conflicts, emits local upserts. Pure(ish) — takes a callback for the
-  local apply path so it can be wired into the existing
-  ``copilot.library.Library`` without circular imports.
+  conflicts via last-write-wins, drains the local ``pending_push``
+  queue. Pure(ish) — callbacks for the local apply / clear paths so it
+  composes with :class:`copilot.library.TrackLibrary` without
+  circular imports.
+* :class:`SyncDaemon` — background thread. Calls ``tick_once`` on a
+  fixed cadence (``HYPEHOUSE_SYNC_TICK_SECONDS``, default 60s) with
+  exponential backoff on consecutive failures, capped at
+  :data:`MAX_BACKOFF_SECONDS` (10 min). ``wake_now`` lets RPC handlers
+  short-circuit a long backoff wait after an out-of-band tick (see
+  ``library.sync_now`` and ``library.requeue_all_pending``).
 
 Schema
 ------
 
-Single table ``tracks`` keyed by ``track_id``:
+Single table ``tracks`` keyed by ``track_id``
+(``copilot/cloud_sync/migrations/001_tracks.sql`` — paste into the
+Supabase SQL editor, or use ``make supabase-print | pbcopy``):
 
 * ``track_id TEXT PRIMARY KEY``
 * ``path TEXT NOT NULL``
@@ -33,6 +42,15 @@ Single table ``tracks`` keyed by ``track_id``:
   collapses cleanly through ``int|None``).
 * ``updated_at_micros BIGINT NOT NULL`` — wall-clock micros at write
   time. Used by the syncer for last-write-wins conflict resolution.
+  Indexed (``tracks_updated_at_idx``) so the ``since_micros`` filter
+  on pull is an index range scan.
+
+Local-side schema mirror lives in :mod:`copilot.library`:
+
+* ``tracks.updated_at_micros`` (schema v10) — wall-clock micros so
+  the local row can win a conflict against an older remote.
+* ``pending_push`` table (schema v11) — outbound queue. ``add_track``
+  stamps a row here; the daemon drains it.
 
 Future tables (deferred):
 
@@ -47,9 +65,15 @@ Conflict resolution
 Last-write-wins on ``updated_at_micros``. The syncer never blindly
 overwrites a newer local row; if the local row's recorded
 ``updated_at_micros`` is greater than the remote's, the local row
-wins and the syncer marks the row for an outbound push (slice 2).
+wins and the daemon's next tick drains the row from ``pending_push``
+into the remote.
 
-Slice 1 ships pull-only — the outbound queue is stubbed.
+RLS / multi-user
+----------------
+
+Row-Level Security is OFF in ``001_tracks.sql`` — fine for single-user
+v0.x. Multi-user mode (not yet shipped) needs an ``owner_id`` column
+plus the RLS policy at the bottom of the migration file.
 """
 
 from .client import (
