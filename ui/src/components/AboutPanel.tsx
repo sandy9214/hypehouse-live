@@ -20,6 +20,7 @@ import type { JsonRpcWS } from "../ws/client";
 import {
   formatCountdownMicros,
   formatRelativeMicros,
+  requeueAllPending,
   syncNow,
   useSessionInfo,
   useSyncStatus,
@@ -167,6 +168,34 @@ export const AboutPanel = ({ client }: AboutPanelProps): JSX.Element => {
       setSyncing(false);
     }
   };
+  const [queueAllBusy, setQueueAllBusy] = useState(false);
+  const [queueAllToast, setQueueAllToast] = useState<string>("");
+  // Auto-dismiss the success toast after a short window so a stale
+  // "N queued" message doesn't sit next to a fresh "last sync"
+  // value. Errors land in the persistent sync-error region instead.
+  useEffect((): (() => void) => {
+    if (queueAllToast === "") return (): void => {};
+    const id = window.setTimeout(
+      (): void => setQueueAllToast(""),
+      4000,
+    );
+    return (): void => window.clearTimeout(id);
+  }, [queueAllToast]);
+  const onQueueAll = async (): Promise<void> => {
+    if (queueAllBusy) return;
+    setQueueAllBusy(true);
+    setQueueAllToast("");
+    setSyncError("");
+    try {
+      const queued = await requeueAllPending(client);
+      setQueueAllToast(`${queued} queued for sync`);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      setSyncError(message);
+    } finally {
+      setQueueAllBusy(false);
+    }
+  };
   const deviceLabel =
     info.output_device_substring === ""
       ? "(system default)"
@@ -218,8 +247,24 @@ export const AboutPanel = ({ client }: AboutPanelProps): JSX.Element => {
           >
             {syncing ? "syncing…" : "sync now"}
           </button>
+          <button
+            type="button"
+            data-testid="about-queue-all"
+            onClick={onQueueAll}
+            disabled={queueAllBusy}
+            style={queueAllBusy ? syncButtonBusyStyle : syncButtonStyle}
+            aria-label="Queue every local track for cloud push"
+            title="Queue every local track for cloud push (use after first cloud-sync setup)"
+          >
+            {queueAllBusy ? "queueing…" : "queue all"}
+          </button>
         </span>
       </div>
+      {queueAllToast !== "" ? (
+        <div style={syncCountsStyle} data-testid="about-queue-all-toast">
+          {queueAllToast}
+        </div>
+      ) : null}
       {syncError !== "" ? (
         <div style={syncErrorStyle} data-testid="about-sync-error">
           {syncError}

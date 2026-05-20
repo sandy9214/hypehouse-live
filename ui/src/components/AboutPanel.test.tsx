@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -320,6 +321,142 @@ describe("AboutPanel", () => {
     // Expect roughly "45s" — widen to absorb slow-CI jitter
     // (Codex #174 R1 review note).
     expect(/next in (4[0-9]|5[0-2])s/.test(text)).toBe(true);
+  });
+
+  it("renders 'queue all' button + toast on success", async () => {
+    const call = vi.fn(async (method: string) => {
+      if (method === "engine.session_info") {
+        return {
+          version: "0.1.0",
+          output_device_substring: "",
+          features: {
+            midi_clock_in: false,
+            midi_clock_out: false,
+            ableton_link: false,
+            sentry_telemetry: false,
+            recording_enabled: true,
+            rate_limit_disabled: false,
+            shared_ci_runner: false,
+          },
+        };
+      }
+      if (method === "library.requeue_all_pending") {
+        return { queued: 42 };
+      }
+      return {
+        pending_push_count: 0,
+        library_track_count: 0,
+        last_pull_micros: 0,
+        last_push_micros: 0,
+        last_pull_fetched: 0,
+        last_pull_applied: 0,
+        last_push_pushed: 0,
+        last_tick_error: "",
+        next_sync_micros: 0,
+      };
+    });
+    render(<AboutPanel client={makeClient(call)} />);
+    const btn = screen.getByTestId("about-queue-all");
+    expect(btn.textContent).toBe("queue all");
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(call).toHaveBeenCalledWith("library.requeue_all_pending");
+    });
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("about-queue-all-toast").textContent,
+      ).toBe("42 queued for sync");
+    });
+  });
+
+  it("queue-all toast auto-dismisses after 4s", async () => {
+    vi.useFakeTimers();
+    const call = vi.fn(async (method: string) => {
+      if (method === "engine.session_info") {
+        return {
+          version: "0.1.0",
+          output_device_substring: "",
+          features: {
+            midi_clock_in: false,
+            midi_clock_out: false,
+            ableton_link: false,
+            sentry_telemetry: false,
+            recording_enabled: true,
+            rate_limit_disabled: false,
+            shared_ci_runner: false,
+          },
+        };
+      }
+      if (method === "library.requeue_all_pending") {
+        return { queued: 7 };
+      }
+      return {
+        pending_push_count: 0,
+        library_track_count: 0,
+        last_pull_micros: 0,
+        last_push_micros: 0,
+        last_pull_fetched: 0,
+        last_pull_applied: 0,
+        last_push_pushed: 0,
+        last_tick_error: "",
+        next_sync_micros: 0,
+      };
+    });
+    render(<AboutPanel client={makeClient(call)} />);
+    fireEvent.click(screen.getByTestId("about-queue-all"));
+    // Wait for the toast to appear (real microtask + state update).
+    await vi.waitFor(() => {
+      expect(screen.getByTestId("about-queue-all-toast").textContent).toBe(
+        "7 queued for sync",
+      );
+    });
+    // Advance fake clock past the auto-dismiss window.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4100);
+    });
+    expect(screen.queryByTestId("about-queue-all-toast")).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it("queue-all surfaces errors via the shared sync-error region", async () => {
+    const call = vi.fn(async (method: string) => {
+      if (method === "engine.session_info") {
+        return {
+          version: "0.1.0",
+          output_device_substring: "",
+          features: {
+            midi_clock_in: false,
+            midi_clock_out: false,
+            ableton_link: false,
+            sentry_telemetry: false,
+            recording_enabled: true,
+            rate_limit_disabled: false,
+            shared_ci_runner: false,
+          },
+        };
+      }
+      if (method === "library.requeue_all_pending") {
+        throw new Error("cloud sync not configured");
+      }
+      return {
+        pending_push_count: 0,
+        library_track_count: 0,
+        last_pull_micros: 0,
+        last_push_micros: 0,
+        last_pull_fetched: 0,
+        last_pull_applied: 0,
+        last_push_pushed: 0,
+        last_tick_error: "",
+        next_sync_micros: 0,
+      };
+    });
+    render(<AboutPanel client={makeClient(call)} />);
+    fireEvent.click(screen.getByTestId("about-queue-all"));
+    await waitFor(() => {
+      expect(screen.getByTestId("about-sync-error").textContent).toBe(
+        "cloud sync not configured",
+      );
+    });
   });
 
   it("hides sync counts row when all tick counters are zero", () => {
