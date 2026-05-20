@@ -116,6 +116,8 @@ export const __resetLibraryStore = (): void => {
  * Seed the store with a result — used by tests + by the search-tracks
  * action which writes the matching subset into the cache.
  */
+export const __getLibrarySnapshot = (): LibraryStoreState => current;
+
 export const __setLibraryTracks = (
   tracks: ReadonlyArray<LibraryTrack>,
   total: number,
@@ -391,9 +393,24 @@ export const setHotCues = async (
       "track" in result &&
       isLibraryTrack((result as { track: unknown }).track)
     ) {
-      return hydrateTrack(
+      const hydrated = hydrateTrack(
         (result as { track: LibraryTrack }).track,
       );
+      // Splice the freshly-persisted row into the cache so subsequent
+      // deck reloads don't pick up stale hot_cues from `library.tracks`.
+      // No cacheGeneration / race surface: setHotCues resolves AFTER
+      // the server persisted, so any concurrent `list_tracks` will
+      // already echo back the new cues (see #237).
+      const idx = current.tracks.findIndex(
+        (t: LibraryTrack): boolean => t.id === hydrated.id,
+      );
+      if (idx >= 0) {
+        const next = current.tracks.slice();
+        next[idx] = hydrated;
+        current = { ...current, tracks: next };
+        notify();
+      }
+      return hydrated;
     }
     return null;
   } catch {

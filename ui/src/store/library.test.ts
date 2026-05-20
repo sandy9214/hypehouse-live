@@ -3,11 +3,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { JsonRpcWS } from "../ws/client";
 import {
+  __getLibrarySnapshot,
   __resetLibraryStore,
   __setLibraryTracks,
   fetchLibrary,
   refetchLibrary,
   searchLibrary,
+  setHotCues,
   type LibraryTrack,
 } from "./library";
 
@@ -140,6 +142,39 @@ describe("library store", () => {
     await fetchLibrary(client);
     await fetchLibrary(client);
     expect(call).toHaveBeenCalledTimes(1);
+  });
+
+  it("setHotCues splices the updated row into the cache (closes #237)", async (): Promise<void> => {
+    __setLibraryTracks([makeTrack("t1"), makeTrack("t2")], 2);
+    const updated: LibraryTrack = {
+      ...makeTrack("t1"),
+      hot_cues: [0, 1500, 3000, null, null, null, null, null],
+    };
+    const call = vi.fn().mockResolvedValue({ track: updated });
+    const client = { call } as unknown as JsonRpcWS;
+    const result = await setHotCues(client, "t1", updated.hot_cues);
+    expect(result?.hot_cues).toEqual(updated.hot_cues);
+    const snap = __getLibrarySnapshot();
+    const t1 = snap.tracks.find((t) => t.id === "t1");
+    expect(t1?.hot_cues).toEqual(updated.hot_cues);
+    // t2 untouched.
+    const t2 = snap.tracks.find((t) => t.id === "t2");
+    expect(t2?.hot_cues).toEqual(makeTrack("t2").hot_cues);
+  });
+
+  it("setHotCues on a track not in the cache is a defensive no-op", async (): Promise<void> => {
+    __setLibraryTracks([makeTrack("t1")], 1);
+    const before = __getLibrarySnapshot();
+    const ghost: LibraryTrack = {
+      ...makeTrack("ghost"),
+      hot_cues: [0, null, null, null, null, null, null, null],
+    };
+    const call = vi.fn().mockResolvedValue({ track: ghost });
+    const client = { call } as unknown as JsonRpcWS;
+    const result = await setHotCues(client, "ghost", ghost.hot_cues);
+    expect(result?.id).toBe("ghost");
+    // Cache unchanged — ghost wasn't there, don't insert.
+    expect(__getLibrarySnapshot().tracks).toEqual(before.tracks);
   });
 
   it("refetchLibrary forces a fresh list_tracks call even when loaded", async (): Promise<void> => {
