@@ -129,8 +129,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] — 2026-05-19
 
-## [0.1.0] — 2026-05-19
-
 ### Added — Engine (Rust)
 - **`engine.session_info` WS RPC** — read-only snapshot of version +
   active output-device substring + 7 feature flags (MIDI clock IN/OUT,
