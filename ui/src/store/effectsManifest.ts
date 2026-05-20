@@ -83,6 +83,21 @@ const isListEffectsResult = (v: unknown): v is ListEffectsResult => {
  * Fetch manifest from the engine if it hasn't been loaded yet. Multiple
  * concurrent calls are deduped via the `fetchInFlight` flag.
  */
+/**
+ * Force a re-fetch even if the cache is warm. Used by the WS
+ * reconnect path (`client.onOpen(...)`) so the dropdown reflects
+ * the engine's *current* effects manifest after a restart (e.g. a
+ * dev rebuild added a new effect since the UI session started).
+ * Parallels `refetchSessionInfo` (#207) +
+ * `refetchOutputDevices` (#210).
+ */
+export const refetchEffectsManifest = async (
+  client: JsonRpcWS,
+): Promise<EffectManifest> => {
+  fetchedOnce = false;
+  return fetchEffectsManifest(client);
+};
+
 export const fetchEffectsManifest = async (
   client: JsonRpcWS,
 ): Promise<EffectManifest> => {
@@ -115,9 +130,21 @@ export const fetchEffectsManifest = async (
  */
 export const useEffectsManifest = (client: JsonRpcWS): EffectManifest => {
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
-  useEffect((): void => {
+  useEffect((): (() => void) | void => {
     // Fire-and-forget; the store update inside resolves notifies us.
     void fetchEffectsManifest(client);
+    // Refresh on every WS reconnect — an engine restart (or a dev
+    // rebuild) may have changed the available effects list. Same
+    // `onOpen` hook + typeof-tolerance pattern as `useSessionInfo`
+    // (#207) and `useOutputDevices` (#210).
+    const ow = (
+      client as { onOpen?: (cb: () => void) => () => void }
+    ).onOpen;
+    if (typeof ow !== "function") return;
+    const unsub = ow.call(client, (): void => {
+      void refetchEffectsManifest(client);
+    });
+    return unsub;
   }, [client]);
   return snapshot;
 };
