@@ -27,6 +27,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Operator wiring: set `SUPABASE_URL` + `SUPABASE_ANON_KEY` in
     copilot env; run `copilot/cloud_sync/migrations/001_tracks.sql`
     in the Supabase SQL editor; restart copilot.
+- **`library.sync_status` RPC + daemon stats fold-in** — folds
+  `last_pull_micros` / `last_push_micros` / `last_pull_fetched` /
+  `last_pull_applied` / `last_push_pushed` / `last_tick_error` from
+  the daemon into the JSON-RPC surface so the UI can render
+  freshness + activity without polling the cloud (#155, #157).
+- **`library.sync_now` RPC** — operator-driven force tick. Calls
+  `SyncDaemon.tick_once()` out-of-band and returns the post-tick
+  status payload. Missing-daemon → `-32000`; SyncError /
+  `sqlite3.Error` → `-32603` with message (#161).
+- **`library.list_pending_push` RPC** — returns `{"ids": [...]}` of
+  tracks awaiting cloud push; UI uses this for the per-row chip
+  (#165).
+- **Exponential backoff on consecutive sync failures** — daemon
+  doubles its sleep on each transport / DB / unexpected error,
+  capped at `MAX_BACKOFF_SECONDS` (10 min). Resets on first clean
+  tick. Lock-protected counter — safe under `sync_now` from the RPC
+  thread + daemon loop from its own thread (#169).
+
+### Added — UI (TypeScript)
+- **AboutPanel "Library" row** — shows `N tracks · M pending sync`
+  via the new `useSyncStatus(client)` hook (#155).
+- **AboutPanel "Last sync" row** — relative-time string
+  (`Xs/m/h/d ago`) backed by `last_pull_micros`. Tick-error suffix
+  when the daemon reports a fault. `formatRelativeMicros` helper
+  pure-tested across all bands incl. clock-skew (#159).
+- **AboutPanel "sync now" button** — fires the new `library.sync_now`
+  RPC and refreshes status; disabled while in-flight; surfaces RPC
+  errors inline (#161).
+- **AboutPanel tick-counts line** — when any of fetched / applied /
+  pushed > 0, renders `↓ N fetched · M applied · ↑ K pushed`
+  briefly so the operator can see what just synced (#163).
+- **Per-row pending-sync chip** — TrackRow renders a small
+  `⟳ pending` chip next to titles whose IDs are in the pending-push
+  set. Library.tsx joins via the new `usePendingPushIds` hook
+  (#167).
+
+### Changed
+- `SyncDaemon` exception handling narrowed: `SyncError` /
+  `sqlite3.Error` at WARN, everything else still escalated to ERROR
+  with `exc_info` (#156).
+
+### Docs
+- New **docs/cloud-sync.md** — operator setup, verification surface,
+  RLS / anon-key caveats (#171).
+- New `make supabase-print` + `scripts/print_supabase_migrations.py`
+  helper for operators without the supabase CLI (#171).
 
 ## [0.1.0] — 2026-05-19
 
