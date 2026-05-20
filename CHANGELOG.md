@@ -109,6 +109,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Listener exceptions caught + logged so a flaky subscriber can't
   break auth or other listeners. Tolerates older WS clients
   lacking `onOpen` via the same typeof check as `wake_now` (#207).
+- **Output devices refetch on WS reconnect** — same `onOpen`
+  pattern applied to `useOutputDevices` + new
+  `refetchOutputDevices(client)` helper. An operator plugging in a
+  USB audio interface mid-session, followed by an engine bounce,
+  now sees the new device in the dropdown without a page reload.
+  New `outputDevices.test.ts` covers cache / refetch /
+  failed-refetch-clears-stale (3 cases). #210.
 
 ### Added — Tooling / scripts
 - **`scripts/cloud_sync_status.py`** — stdlib-only ops-monitoring
