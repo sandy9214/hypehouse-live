@@ -22,6 +22,7 @@ import {
 } from "../store/library";
 import { LibraryFilters } from "./LibraryFilters";
 import { TrackRow } from "./TrackRow";
+import { usePendingPushIds } from "../store/sessionInfo";
 
 export interface LibraryProps {
   client: JsonRpcWS;
@@ -115,6 +116,7 @@ export const Library = ({
 }: LibraryProps): JSX.Element => {
   const lib = useLibrary(client);
   const filters = useLibraryFilters();
+  const pendingPush = usePendingPushIds(client);
   const [query, setQuery] = useState<string>("");
   const [searchResults, setSearchResults] = useState<
     ReadonlyArray<LibraryTrack> | null
@@ -241,7 +243,12 @@ export const Library = ({
         )}
         {visible.map(
           (t: LibraryTrack): JSX.Element => (
-            <TrackRow key={t.id} track={t} client={client} />
+            <TrackRow
+              key={t.id}
+              track={t}
+              client={client}
+              pendingSync={pendingPush.has(t.id)}
+            />
           ),
         )}
       </div>

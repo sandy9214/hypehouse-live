@@ -39,6 +39,11 @@ export interface TrackRowProps {
   /** Recency gate for repeat hovers — re-hover within this window
    * skips the RPC and re-uses any cached peaks. */
   rehoverCacheMs?: number;
+  /** When true, render a small `⟳ pending` chip next to the title —
+   * the local DB has this track marked for cloud push and the
+   * daemon hasn't drained it yet. Sourced from
+   * `library.list_pending_push` via `usePendingPushIds`. */
+  pendingSync?: boolean;
 }
 
 const HOVER_DEBOUNCE_MS_DEFAULT = 200;
@@ -73,6 +78,17 @@ const previewStyle: CSSProperties = { padding: "2px 8px 4px 8px", background: "#
 const cellStyle: CSSProperties = {
   overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
 };
+const pendingChipStyle: CSSProperties = {
+  background: "#3a2e10",
+  color: "#e2c46e",
+  border: "1px solid #5a4818",
+  borderRadius: 3,
+  padding: "0 4px",
+  marginLeft: 6,
+  fontSize: 10,
+  letterSpacing: 0.5,
+};
+
 const btnStyle: CSSProperties = {
   background: "#222", color: "#fff", border: "1px solid #444",
   borderRadius: 4, padding: "2px 6px", cursor: "pointer",
@@ -116,6 +132,7 @@ export const TrackRow = ({
   hoverDebounceMs = HOVER_DEBOUNCE_MS_DEFAULT,
   longPressMs = LONG_PRESS_MS_DEFAULT,
   rehoverCacheMs = REHOVER_CACHE_MS_DEFAULT,
+  pendingSync = false,
 }: TrackRowProps): JSX.Element => {
   const [previewPeaks, setPreviewPeaks] = useState<Int8Array | null>(null);
   const [previewOpen, setPreviewOpen] = useState<boolean>(false);
@@ -203,8 +220,21 @@ export const TrackRow = ({
         onTouchCancel={closePreview}
         style={rowStyle}
       >
-        <span style={cellStyle} title={titleOf(track)}>
-          {titleOf(track)}
+        <span
+          style={{ ...cellStyle, display: "flex", alignItems: "center" }}
+          title={titleOf(track)}
+        >
+          <span style={cellStyle}>{titleOf(track)}</span>
+          {pendingSync ? (
+            <span
+              style={pendingChipStyle}
+              data-testid={`track-row-pending-${track.id}`}
+              title="awaiting cloud push"
+              aria-label="awaiting cloud push"
+            >
+              ⟳ pending
+            </span>
+          ) : null}
         </span>
         <span style={cellStyle} title={track.id}>
           {track.id}
