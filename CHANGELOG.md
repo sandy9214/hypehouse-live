@@ -88,6 +88,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SyncDaemon` exception handling narrowed: `SyncError` /
   `sqlite3.Error` at WARN, everything else still escalated to ERROR
   with `exc_info` (#156).
+- `SyncDaemon.wake_now(*, skip_next_tick=True)` — `library.sync_now`
+  signals the daemon to skip its next automatic `tick_once` (the
+  RPC already ran one out-of-band), avoiding the duplicate pull +
+  push Codex flagged on #176. `library.requeue_all_pending` passes
+  `skip_next_tick=False` so its freshly filled queue gets drained
+  on the daemon's next iteration. Flag overwrites on every call so
+  the latest caller's intent wins (#184).
 
 ### Docs
 - New **docs/cloud-sync.md** — operator setup, verification surface,
