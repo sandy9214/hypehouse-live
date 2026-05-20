@@ -87,6 +87,18 @@ let current: LibraryStoreState = {
   error: null,
 };
 
+// Monotonic generation counter. Mutations (`setHotCues` success)
+// bump before writing the cache; `fetchLibrary` snapshots the
+// generation at RPC start and discards its response on mismatch.
+// Same shape as `presets.ts` (#231 R1 P1). Codex caught the
+// equivalent race for library on #238 R1: setHotCues + a stale
+// in-flight list_tracks could otherwise restore old hot_cues.
+let cacheGeneration = 0;
+const bumpGeneration = (): number => {
+  cacheGeneration += 1;
+  return cacheGeneration;
+};
+
 const notify = (): void => {
   for (const l of listeners) l();
 };
@@ -109,6 +121,7 @@ export const __resetLibraryStore = (): void => {
     loading: false,
     error: null,
   };
+  cacheGeneration = 0;
   notify();
 };
 
@@ -213,6 +226,9 @@ export const fetchLibrary = async (
 ): Promise<LibraryStoreState> => {
   if (current.loading) return current;
   if (current.loaded && !opts.force) return current;
+  // Snapshot generation at RPC start so a setHotCues that lands
+  // mid-flight invalidates this list — see `cacheGeneration` block.
+  const fetchGen = cacheGeneration;
   current = { ...current, loading: true };
   notify();
   const limit = opts.limit ?? 100;
@@ -222,6 +238,14 @@ export const fetchLibrary = async (
       limit,
       offset,
     });
+    if (cacheGeneration !== fetchGen) {
+      // A mutation completed mid-flight; the cache it produced is
+      // truthier than our list snapshot. Clear loading without
+      // touching tracks / total / loaded.
+      current = { ...current, loading: false };
+      notify();
+      return current;
+    }
     if (isListResult(result)) {
       current = {
         tracks: result.tracks.map(hydrateTrack),
@@ -240,6 +264,11 @@ export const fetchLibrary = async (
       };
     }
   } catch (err) {
+    if (cacheGeneration !== fetchGen) {
+      current = { ...current, loading: false };
+      notify();
+      return current;
+    }
     current = {
       ...current,
       loading: false,
@@ -405,6 +434,9 @@ export const setHotCues = async (
         (t: LibraryTrack): boolean => t.id === hydrated.id,
       );
       if (idx >= 0) {
+        // Bump generation BEFORE the cache write so any in-flight
+        // fetchLibrary discards on return (Codex #238 R1 P1).
+        bumpGeneration();
         const next = current.tracks.slice();
         next[idx] = hydrated;
         current = { ...current, tracks: next };
