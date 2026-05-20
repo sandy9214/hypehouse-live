@@ -426,10 +426,12 @@ export const setHotCues = async (
         (result as { track: LibraryTrack }).track,
       );
       // Splice the freshly-persisted row into the cache so subsequent
-      // deck reloads don't pick up stale hot_cues from `library.tracks`.
-      // No cacheGeneration / race surface: setHotCues resolves AFTER
-      // the server persisted, so any concurrent `list_tracks` will
-      // already echo back the new cues (see #237).
+      // deck reloads don't pick up stale hot_cues from `library.tracks`
+      // (#237). Bumps `cacheGeneration` first so a stale in-flight
+      // `list_tracks` discards on return — even though set_hot_cues
+      // is server-persisted by the time we get here, the server may
+      // have answered an earlier list_tracks against pre-persist
+      // state (Codex #238 R1 P1).
       const idx = current.tracks.findIndex(
         (t: LibraryTrack): boolean => t.id === hydrated.id,
       );
