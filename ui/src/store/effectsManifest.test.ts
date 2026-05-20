@@ -55,12 +55,15 @@ describe("effectsManifest store", () => {
     let calls = 0;
     const call = vi.fn(async (): Promise<unknown> => {
       calls += 1;
+      // Match the real wire shape declared by EffectManifestEntry:
+      // `{ id, name, params }` (NOT `display_name`). A future
+      // stricter type guard would reject the wrong-shape variant.
       return {
         effects: calls === 1
-          ? [{ id: "lowpass", display_name: "Lowpass", params: [] }]
+          ? [{ id: "lowpass", name: "Lowpass", params: [] }]
           : [
-              { id: "lowpass", display_name: "Lowpass", params: [] },
-              { id: "reverb", display_name: "Reverb", params: [] },
+              { id: "lowpass", name: "Lowpass", params: [] },
+              { id: "reverb", name: "Reverb", params: [] },
             ],
       };
     });
