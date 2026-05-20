@@ -251,22 +251,32 @@ export const fetchLibrary = async (
  *    with..." picker. `null` = no harmonic filter. The copilot
  *    resolves this to a Camelot key and post-filters candidates by
  *    `camelot_distance ≤ 2` (= mashup-friendly envelope).
+ * `pendingSyncOnly`: client-side toggle that narrows the visible
+ *    rows to tracks still awaiting cloud push. Applied in
+ *    `Library.tsx` against the `usePendingPushIds` set — the
+ *    server-side `searchLibrary` RPC has no knowledge of this
+ *    state (intentionally — it lives on the UI's polling layer).
  */
 export interface LibraryFilters {
   readonly bpmMin: number | null;
   readonly bpmMax: number | null;
   readonly compatibleWithTrackId: string | null;
+  readonly pendingSyncOnly: boolean;
 }
 
 export const EMPTY_FILTERS: LibraryFilters = {
   bpmMin: null,
   bpmMax: null,
   compatibleWithTrackId: null,
+  pendingSyncOnly: false,
 };
 
 /** Quick predicate: are any filters actively narrowing the result? */
 export const hasActiveFilters = (f: LibraryFilters): boolean =>
-  f.bpmMin !== null || f.bpmMax !== null || f.compatibleWithTrackId !== null;
+  f.bpmMin !== null ||
+  f.bpmMax !== null ||
+  f.compatibleWithTrackId !== null ||
+  f.pendingSyncOnly;
 
 // --- filter state (module-singleton, mirrors the tracks cache) ----
 // Active filters live in a separate slice from `current` so a search

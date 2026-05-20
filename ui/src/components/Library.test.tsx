@@ -16,8 +16,13 @@ import type { JsonRpcWS } from "../ws/client";
 import {
   __resetLibraryFilters,
   __resetLibraryStore,
+  setLibraryFilters,
   type LibraryTrack,
 } from "../store/library";
+import {
+  __resetPendingPushIds,
+  __setPendingPushIds,
+} from "../store/sessionInfo";
 
 const makeTrack = (id: string, extra: Partial<LibraryTrack> = {}): LibraryTrack => ({
   id,
@@ -52,11 +57,13 @@ describe("Library", () => {
   beforeEach((): void => {
     __resetLibraryStore();
     __resetLibraryFilters();
+    __resetPendingPushIds();
   });
   afterEach((): void => {
     cleanup();
     __resetLibraryStore();
     __resetLibraryFilters();
+    __resetPendingPushIds();
     vi.useRealTimers();
   });
 
@@ -234,6 +241,47 @@ describe("Library", () => {
         DeckLoad: { hot_cues: ReadonlyArray<number | null> };
       };
       expect(payload.DeckLoad.hot_cues).toEqual(cues);
+    });
+  });
+
+  it("pendingSyncOnly filter narrows visible rows to the pending set", async (): Promise<void> => {
+    const tracks = [
+      makeTrack("alpha"),
+      makeTrack("bravo"),
+      makeTrack("charlie"),
+    ];
+    const client = { call: vi.fn<Call>(async (m: string) => {
+      if (m === "library.list_tracks") {
+        return { tracks, total: tracks.length, limit: 100, offset: 0 };
+      }
+      if (m === "library.list_pending_push") {
+        return { ids: ["bravo"] };
+      }
+      return null;
+    }) } as unknown as JsonRpcWS;
+    render(<Library client={client} />);
+    // All three rows visible before the filter is on.
+    await waitFor((): void => {
+      for (const id of ["alpha", "bravo", "charlie"]) {
+        expect(screen.getByTestId(`track-row-${id}`)).toBeTruthy();
+      }
+    });
+    // Seed the pending-push set directly (the polling refetch can
+    // race; this is the deterministic shortcut).
+    act((): void => {
+      __setPendingPushIds(["bravo"]);
+      setLibraryFilters({
+        bpmMin: null,
+        bpmMax: null,
+        compatibleWithTrackId: null,
+        pendingSyncOnly: true,
+      });
+    });
+    // Now only bravo renders.
+    await waitFor((): void => {
+      expect(screen.getByTestId("track-row-bravo")).toBeTruthy();
+      expect(screen.queryByTestId("track-row-alpha")).toBeNull();
+      expect(screen.queryByTestId("track-row-charlie")).toBeNull();
     });
   });
 

@@ -148,6 +148,7 @@ describe("LibraryFilters", () => {
       bpmMin: 124,
       bpmMax: 130,
       compatibleWithTrackId: "alpha",
+      pendingSyncOnly: false,
     });
     render(<LibraryFilters client={client} />);
     expect(screen.getByTestId("library-filter-chip-bpm")).toBeTruthy();
@@ -169,6 +170,7 @@ describe("LibraryFilters", () => {
       bpmMin: 120,
       bpmMax: 128,
       compatibleWithTrackId: "ref-track",
+      pendingSyncOnly: false,
     });
     const { unmount } = render(<LibraryFilters client={client} />);
     expect(screen.getByTestId("library-filter-chip-bpm")).toBeTruthy();
@@ -286,6 +288,28 @@ describe("LibraryFilters — wired into Library", () => {
     __resetLibraryStore();
     __resetLibraryFilters();
     vi.useRealTimers();
+  });
+
+  it("pending-sync-only toggle drives the filter chip + store state", (): void => {
+    const { client } = makeClient({});
+    render(<LibraryFilters client={client} />);
+    // No chip before the toggle is clicked.
+    expect(screen.queryByTestId("library-filter-chip-pending")).toBeNull();
+    const toggle = screen.getByTestId(
+      "library-filter-pending-toggle",
+    ) as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+    // Click → chip appears + checkbox shows checked.
+    fireEvent.click(toggle);
+    expect(toggle.checked).toBe(true);
+    expect(screen.getByTestId("library-filter-chip-pending")).toBeTruthy();
+    // Click the chip's × to remove the filter — checkbox + chip
+    // both unwind.
+    fireEvent.click(
+      screen.getByTestId("library-filter-chip-pending-clear"),
+    );
+    expect(toggle.checked).toBe(false);
+    expect(screen.queryByTestId("library-filter-chip-pending")).toBeNull();
   });
 
   it("LibraryFilters is rendered above the track list inside Library", async (): Promise<void> => {
