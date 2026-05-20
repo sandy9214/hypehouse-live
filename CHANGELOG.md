@@ -304,6 +304,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-flight could be clobbered by the older response. R2 mirrored
   the `cacheGeneration` counter pattern — `setHotCues` bumps,
   `fetchLibrary` snapshots and discards on mismatch (#238).
+- Documented the **`presets.*` RPC namespace** in
+  `docs/api/ws-protocol.md` — four sections (`presets.list` /
+  `save` / `load` / `delete`) covering params, result envelope,
+  `PresetDeckState` wire shape (3 effect slots, EQ + pitch +
+  tempo), optional `crossfader_curve` enum, error codes, and the
+  cache-and-refetch-on-reconnect contract with a forward
+  reference to #231's `cacheGeneration` race fix. Codex R1
+  caught two wire-shape inaccuracies (3-slot effects, optional
+  crossfader_curve) and an R2 P3 (empty-slot `wet_dry` default
+  0.5, not 0.0) — all three corrected before merge (#240).
 
 ## [0.1.0] — 2026-05-19
 
