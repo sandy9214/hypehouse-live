@@ -67,6 +67,18 @@ let current: PresetsStoreState = {
   error: null,
 };
 
+// Monotonic generation counter. Every mutation (`savePreset` success,
+// `deletePreset` success) bumps this BEFORE updating `current`, so an
+// in-flight `presets.list` whose response arrives later discards
+// itself instead of replacing the cache with a stale list — i.e. it
+// avoids "just-saved preset disappears" / "just-deleted preset
+// re-appears" races (Codex #231 R1 finding).
+let cacheGeneration = 0;
+const bumpGeneration = (): number => {
+  cacheGeneration += 1;
+  return cacheGeneration;
+};
+
 const notify = (): void => {
   for (const l of listeners) l();
 };
@@ -83,6 +95,7 @@ const getSnapshot = (): PresetsStoreState => current;
 /** Test/internal hook — reset to empty state. */
 export const __resetPresetsStore = (): void => {
   current = { presets: [], loaded: false, loading: false, error: null };
+  cacheGeneration = 0;
   notify();
 };
 
@@ -124,15 +137,35 @@ const isPreset = (v: unknown): v is Preset => {
  * Fetch the full list from `presets.list`. Dedup'd via `loading` flag.
  * Returns the post-call state so callers (the panel mount effect) can
  * react inline without a second hook tick.
+ *
+ * `opts.force = true` is reserved for the reconnect-refetch path —
+ * see `refetchPresets`. It bypasses the `loaded` check (which lets
+ * cached state stay) but still respects the `loading` dedupe so a
+ * reconnect that fires mid-flight doesn't double-call.
  */
 export const fetchPresets = async (
   client: JsonRpcWS,
+  opts: { force?: boolean } = {},
 ): Promise<PresetsStoreState> => {
   if (current.loading) return current;
+  if (!opts.force && current.loaded) return current;
+  // Snapshot the generation at the start of the RPC. If a save /
+  // delete mutation runs before our response lands, the generations
+  // diverge and we drop the now-stale list rather than clobbering
+  // the optimistic update. (Codex #231 R1 P1.)
+  const fetchGen = cacheGeneration;
   current = { ...current, loading: true };
   notify();
   try {
     const raw = await client.call<unknown>("presets.list", {});
+    if (cacheGeneration !== fetchGen) {
+      // A mutation completed mid-flight; the cache it produced is
+      // truthier than our list snapshot. Drop loading flag without
+      // touching `presets` / `loaded`.
+      current = { ...current, loading: false };
+      notify();
+      return current;
+    }
     if (
       raw &&
       typeof raw === "object" &&
@@ -155,6 +188,13 @@ export const fetchPresets = async (
       };
     }
   } catch (err) {
+    if (cacheGeneration !== fetchGen) {
+      // Mutation landed during a failing fetch — keep the new cache;
+      // don't surface the stale error.
+      current = { ...current, loading: false };
+      notify();
+      return current;
+    }
     current = {
       ...current,
       loading: false,
@@ -165,6 +205,17 @@ export const fetchPresets = async (
   notify();
   return current;
 };
+
+/**
+ * Force-refresh the cached preset list, bypassing the `loaded` guard.
+ * Used by the WS reconnect subscriber: server-side presets may have
+ * been added / deleted / renamed via another client (cloud sync, a
+ * second window) during the gap, so the cache is stale-by-default
+ * after a reconnect.
+ */
+export const refetchPresets = (
+  client: JsonRpcWS,
+): Promise<PresetsStoreState> => fetchPresets(client, { force: true });
 
 /**
  * Save a new preset. On success the cache is refreshed in-place so the
@@ -196,6 +247,9 @@ export const savePreset = async (
         created_at: saved.created_at,
       };
       // Optimistic prepend — the next fetchPresets re-orders by recency.
+      // Bump generation so any in-flight `presets.list` discards its
+      // stale response on return instead of erasing this new row.
+      bumpGeneration();
       current = {
         ...current,
         presets: [summary, ...current.presets.filter((p) => p.id !== saved.id)],
@@ -250,6 +304,9 @@ export const deletePreset = async (
 ): Promise<boolean> => {
   try {
     await client.call<unknown>("presets.delete", { id });
+    // Bump generation so any in-flight presets.list discards on
+    // return instead of resurrecting the deleted row.
+    bumpGeneration();
     current = {
       ...current,
       presets: current.presets.filter((p) => p.id !== id),
@@ -261,13 +318,37 @@ export const deletePreset = async (
   }
 };
 
+// Module-level WeakSet of clients we've already wired an onOpen
+// subscriber for. Mirrors the pattern in `sessions.ts` (PR #224 R1
+// fix) so a reconnect that fires while the presets panel is hidden
+// still triggers a fresh `presets.list` against the new socket. The
+// WeakSet doesn't pin the client — runtime GC reclaims both
+// together.
+const presetsClientsSubscribed: WeakSet<JsonRpcWS> = new WeakSet();
+
+const ensurePresetsOpenSubscribed = (client: JsonRpcWS): void => {
+  if (presetsClientsSubscribed.has(client)) return;
+  const ow = (
+    client as { onOpen?: (cb: () => void) => () => void }
+  ).onOpen;
+  if (typeof ow !== "function") return;
+  presetsClientsSubscribed.add(client);
+  ow.call(client, (): void => {
+    void refetchPresets(client);
+  });
+};
+
 /**
  * React hook returning the cached preset list. Auto-fetches on first
- * mount when the cache is empty and not yet in flight.
+ * mount when the cache is empty and not yet in flight. Idempotently
+ * wires a module-level WS-reconnect subscriber so the cache
+ * self-refreshes after a socket bounce even while the panel is
+ * unmounted.
  */
 export const usePresets = (client: JsonRpcWS): PresetsStoreState => {
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   useEffect((): void => {
+    ensurePresetsOpenSubscribed(client);
     if (!snapshot.loaded && !snapshot.loading) {
       void fetchPresets(client);
     }
