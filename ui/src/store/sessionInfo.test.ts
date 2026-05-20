@@ -4,11 +4,14 @@
 // `formatRelativeMicros` formatting contract so future engine-side
 // changes to micros precision don't silently break the UI label.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  __resetStemsStatus,
+  fetchStemsStatus,
   formatCountdownMicros,
   formatRelativeMicros,
 } from "./sessionInfo";
+import type { JsonRpcWS } from "../ws/client";
 
 const MS = 1_000;
 const MICROS_PER_MS = 1_000;
@@ -127,5 +130,64 @@ describe("formatCountdownMicros", () => {
     expect(
       formatCountdownMicros((now + 600_000) * MICROS_PER_MS, now),
     ).toBe("10m");
+  });
+});
+
+const makeClient = (
+  responder: (method: string) => Promise<unknown>,
+): JsonRpcWS =>
+  ({ call: vi.fn(responder) }) as unknown as JsonRpcWS;
+
+describe("fetchStemsStatus", () => {
+  it("parses a well-formed payload into the StemsStatus store", async () => {
+    __resetStemsStatus();
+    const client = makeClient(async (m: string) => {
+      if (m === "library.stems_status") {
+        return { ready: 7, pending: 3, failed: 1, none: 22 };
+      }
+      throw new Error("unmocked");
+    });
+    const status = await fetchStemsStatus(client);
+    expect(status).toEqual({
+      ready: 7,
+      pending: 3,
+      failed: 1,
+      none: 22,
+    });
+  });
+
+  it("falls back to all-zero defaults on RPC throw", async () => {
+    __resetStemsStatus();
+    const client = makeClient(async () => {
+      throw new Error("WS hangup");
+    });
+    const status = await fetchStemsStatus(client);
+    expect(status).toEqual({ ready: 0, pending: 0, failed: 0, none: 0 });
+  });
+
+  it("falls back to defaults when the wire shape is missing a key", async () => {
+    __resetStemsStatus();
+    const client = makeClient(async () => ({
+      // Missing `none` — typeof guard must reject the whole payload
+      // rather than silently filling 0 (the wire contract is "all 4
+      // keys always present"; partial responses are bugs).
+      ready: 5,
+      pending: 0,
+      failed: 0,
+    }));
+    const status = await fetchStemsStatus(client);
+    expect(status).toEqual({ ready: 0, pending: 0, failed: 0, none: 0 });
+  });
+
+  it("falls back to defaults when a value is non-numeric", async () => {
+    __resetStemsStatus();
+    const client = makeClient(async () => ({
+      ready: "7", // string, not number
+      pending: 0,
+      failed: 0,
+      none: 0,
+    }));
+    const status = await fetchStemsStatus(client);
+    expect(status).toEqual({ ready: 0, pending: 0, failed: 0, none: 0 });
   });
 });
