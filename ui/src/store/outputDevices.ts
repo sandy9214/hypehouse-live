@@ -70,6 +70,20 @@ export const __resetOutputDevices = (): void => {
   notify();
 };
 
+/**
+ * Force a re-fetch even if the cache is warm. Used by the WS
+ * reconnect path (`client.onOpen(...)`) so the dropdown reflects
+ * the engine's *current* device list after a restart (e.g. operator
+ * plugged in a new USB interface mid-session). Parallels
+ * `refetchSessionInfo` from #207.
+ */
+export const refetchOutputDevices = async (
+  client: JsonRpcWS,
+): Promise<OutputDeviceList> => {
+  fetchedOnce = false;
+  return fetchOutputDevices(client);
+};
+
 /** Fetch the device list (deduped — safe to call from multiple hooks). */
 export const fetchOutputDevices = async (
   client: JsonRpcWS,
@@ -100,6 +114,18 @@ export const useOutputDevices = (client: JsonRpcWS): OutputDeviceList => {
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   useEffect(() => {
     void fetchOutputDevices(client);
+    // Refresh on every WS reconnect — an engine restart (or a
+    // mid-session audio-interface plug/unplug followed by an engine
+    // bounce) changes the device list, and the one-shot cache would
+    // otherwise hide that until the page reloads. Same `onOpen`
+    // hook + typeof-tolerance pattern as `useSessionInfo` (#207).
+    const ow = (client as { onOpen?: (cb: () => void) => () => void })
+      .onOpen;
+    if (typeof ow !== "function") return;
+    const unsub = ow.call(client, (): void => {
+      void refetchOutputDevices(client);
+    });
+    return unsub;
   }, [client]);
   return snapshot;
 };
