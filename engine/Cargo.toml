@@ -28,16 +28,16 @@ ableton-link = []
 
 [dependencies]
 # Audio I/O — cpal gives us a lock-free callback into the audio thread.
-cpal = "0.16"
+cpal = "0.17"
 
 # Decode any common container (mp3, m4a, wav, flac, ogg) — symphonia is pure-Rust + no FFI.
-symphonia = { version = "0.5", features = ["all"] }
+symphonia = { version = "0.6", features = ["all"] }
 
 # High-quality time-stretch (independent of pitch) — rubato sits behind a sample-rate-converter API.
-rubato = "0.16"
+rubato = "3.0"
 
 # MIDI input — native ALSA / CoreMIDI / WinMM via a single crate.
-midir = "0.10"
+midir = "0.11"
 
 # Event-sourced state needs serialization.
 serde = { version = "1", features = ["derive"] }
